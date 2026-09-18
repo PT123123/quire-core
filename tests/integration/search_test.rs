@@ -353,12 +353,14 @@ fn a_v1_database_is_backfilled_on_upgrade() {
         let repo = SqliteRepository::open(&path).unwrap();
         seed(&repo);
     }
-    // pretend the file predates M7: drop the index and claim version 1
+    // pretend the file predates M7: drop everything added after v1 and
+    // claim version 1 (the marks table is v3, also dropped)
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "DROP TABLE search_pages;
              DROP TABLE search_blocks;
+             DROP TABLE marks;
              PRAGMA user_version = 1;",
         )
         .unwrap();

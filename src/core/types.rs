@@ -110,6 +110,59 @@ impl BlockKind {
     }
 }
 
+/// Inline mark styling (M6). Offsets are byte offsets into the block's
+/// UTF-8 text (char boundaries — the caret model guarantees it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+    Link,
+}
+
+impl MarkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarkKind::Bold => "bold",
+            MarkKind::Italic => "italic",
+            MarkKind::Strike => "strike",
+            MarkKind::Code => "code",
+            MarkKind::Link => "link",
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<MarkKind> {
+        match s {
+            "bold" => Some(MarkKind::Bold),
+            "italic" => Some(MarkKind::Italic),
+            "strike" => Some(MarkKind::Strike),
+            "code" => Some(MarkKind::Code),
+            "link" => Some(MarkKind::Link),
+            _ => None,
+        }
+    }
+}
+
+/// One styled range. `url` is only meaningful for `MarkKind::Link`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub start: usize,
+    pub end: usize,
+    pub kind: MarkKind,
+    pub url: String,
+}
+
+impl Mark {
+    pub fn covers(&self, start: usize, end: usize) -> bool {
+        self.start <= start && self.end >= end
+    }
+
+    pub fn intersects(&self, start: usize, end: usize) -> bool {
+        self.start < end && self.end > start
+    }
+}
+
 /// One block. Belongs to exactly one page; `parent` points inside the same
 /// page (`None` = top level). Siblings are ordered by `order`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +175,8 @@ pub struct Block {
     pub text: String,
     /// Todo checkbox state; meaningless for other kinds.
     pub checked: bool,
+    /// Inline marks (M6), non-overlapping per kind.
+    pub marks: Vec<Mark>,
 }
 
 /// One page of the workspace tree.

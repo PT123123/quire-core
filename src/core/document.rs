@@ -124,6 +124,11 @@ impl Document {
                         b.checked = *checked;
                     }
                 }
+                Change::BlockMarksSet { id, marks } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.marks = marks.clone();
+                    }
+                }
                 Change::BlockMoved { id, parent, order } => {
                     let page = self.page_of(*id);
                     if let (Some(page), Some(b)) = (page, self.block_mut(*id)) {
@@ -170,6 +175,7 @@ mod tests {
             kind: BlockKind::Paragraph,
             text: text.into(),
             checked: false,
+            marks: Vec::new(),
         }
     }
 

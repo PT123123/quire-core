@@ -5,7 +5,7 @@
 use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
-use super::types::{Block, BlockId, BlockKind, OrderKey, PageId};
+use super::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, PageId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -26,6 +26,10 @@ pub enum Command {
     ToggleTodoChecked { id: BlockId },
     /// Move one slot up (-1) / down (+1) among the page's blocks.
     MoveBlock { id: BlockId, delta: i32 },
+    /// Toggle an inline mark over `[start..end]` (byte offsets): a same-kind
+    /// mark covering the range is removed, otherwise intersecting same-kind
+    /// marks are replaced by one new mark (M6).
+    ToggleMark { id: BlockId, start: usize, end: usize, kind: MarkKind, url: String },
 }
 
 /// Snap a caret to a valid char boundary (<= given offset).
@@ -149,6 +153,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 kind,
                 text,
                 checked: false,
+                marks: Vec::new(),
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
@@ -190,6 +195,40 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry {
                 apply: vec![Change::BlockCheckedSet { id, checked }],
                 revert: vec![Change::BlockCheckedSet { id, checked: !checked }],
+            })
+        }
+
+        Command::ToggleMark { id, start, end, kind, url } => {
+            let b = doc.block(id)?;
+            let (start, end) = (start.min(end), end.max(start));
+            let end = end.min(b.text.len());
+            let start = start.min(end);
+            if start == end {
+                return None;
+            }
+            let mut new_marks: Vec<Mark> = Vec::new();
+            let mut was_covered = false;
+            for m in &b.marks {
+                if m.kind == kind {
+                    if m.covers(start, end) {
+                        was_covered = true; // toggle off: drop it
+                    }
+                    if m.intersects(start, end) {
+                        continue; // replaced by the new range
+                    }
+                }
+                new_marks.push(m.clone());
+            }
+            if !was_covered {
+                new_marks.push(Mark { start, end, kind, url });
+                new_marks.sort_by_key(|m| (m.start, m.end));
+            }
+            if new_marks == b.marks {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::BlockMarksSet { id, marks: new_marks }],
+                revert: vec![Change::BlockMarksSet { id, marks: b.marks.clone() }],
             })
         }
 
@@ -290,6 +329,7 @@ mod tests {
                 kind: BlockKind::Paragraph,
                 text: t.into(),
                 checked: false,
+                marks: Vec::new(),
             });
             doc.set_page_blocks(page, v);
             prev = Some(order);
@@ -421,6 +461,62 @@ mod tests {
         let last = doc.page_blocks(page).last().unwrap();
         assert_eq!(last.kind, BlockKind::Code);
         assert_eq!(last.text, "println!(\"hi\");");
+    }
+
+    #[test]
+    fn toggle_mark_adds_then_removes() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let f = ids[0]; // "first": bytes 0..5
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new() },
+        )
+        .unwrap();
+        assert_eq!(doc.block(f).unwrap().marks.len(), 1);
+        // toggle again removes it
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new() },
+        )
+        .unwrap();
+        assert!(doc.block(f).unwrap().marks.is_empty());
+    }
+
+    #[test]
+    fn toggle_mark_replaces_intersecting_same_kind() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let f = ids[0];
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ToggleMark { id: f, start: 0, end: 2, kind: MarkKind::Bold, url: String::new() },
+        )
+        .unwrap();
+        // overlapping range replaces the old mark instead of stacking
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Bold, url: String::new() },
+        )
+        .unwrap();
+        let marks = doc.block(f).unwrap().marks.clone();
+        assert_eq!(marks.len(), 1);
+        assert_eq!((marks[0].start, marks[0].end), (1, 5));
+        // different kinds coexist
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Italic, url: String::new() },
+        )
+        .unwrap();
+        assert_eq!(doc.block(f).unwrap().marks.len(), 2);
     }
 
     #[test]

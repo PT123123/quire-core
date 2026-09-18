@@ -11,5 +11,5 @@ pub use command::{exec, plan, redo, undo, Command};
 pub use document::Document;
 pub use history::History;
 pub use persistence::{Change, Repository, StorageError};
-pub use types::{Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState};
+pub use types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
 

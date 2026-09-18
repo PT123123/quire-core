@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 2;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`.
@@ -66,6 +66,24 @@ CREATE INDEX idx_blocks_page      ON blocks(page);
 CREATE INDEX idx_block_children_p ON block_children(parent);
 
 INSERT INTO workspaces (id, name) VALUES (1, 'Workspace');
+"#,
+},
+Migration {
+    version: 2,
+    label: "inline marks (M6)",
+    sql: r#"
+-- One row per styled range; ranges are byte offsets into the block text.
+-- Non-overlapping per (block, kind) is an app-layer invariant.
+CREATE TABLE marks (
+    block INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    start INTEGER NOT NULL,
+    end   INTEGER NOT NULL,
+    kind  TEXT NOT NULL,
+    url   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (block, start, kind)
+);
+
+CREATE INDEX idx_marks_block ON marks(block);
 "#,
 }];
 

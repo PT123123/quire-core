@@ -35,6 +35,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         kind: BlockKind::Paragraph,
         text: text.into(),
         checked: false,
+                marks: Vec::new(),
     }
 }
 
@@ -57,6 +58,7 @@ fn sample_state() -> PersistedState {
             Block {
                 kind: BlockKind::Todo,
                 checked: true,
+                marks: Vec::new(),
                 ..block(12, 1, Some(10), 110, "child todo")
             },
             Block {

@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::types::{Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState};
+use super::types::{Block, BlockId, BlockKind, Mark, OrderKey, Page, PageId, PersistedState};
 
 /// Ordered list of persisted mutations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub enum Change {
     BlockTextSet { id: BlockId, text: String },
     BlockKindSet { id: BlockId, kind: BlockKind },
     BlockCheckedSet { id: BlockId, checked: bool },
+    /// Replace the block's whole inline-mark list (M6).
+    BlockMarksSet { id: BlockId, marks: Vec<Mark> },
     BlockMoved { id: BlockId, parent: Option<BlockId>, order: OrderKey },
     /// Storage deletes the block and (recursively) its children; undo
     /// replays the captured subtree as `BlockInserted`s.

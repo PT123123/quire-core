@@ -8,7 +8,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, Transaction};
 
 use crate::core::persistence::{Change, Repository, StorageError};
-use crate::core::types::{Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState};
+use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
 
 use super::database::{ord_from_db, ord_to_db, Database};
 
@@ -122,7 +122,47 @@ impl Repository for SqliteRepository {
                     kind,
                     text,
                     checked: db_to_bool(checked),
+                    marks: Vec::new(),
                 });
+            }
+        }
+
+        // inline marks (M6), grouped per block
+        {
+            let mut stmt = conn
+                .prepare("SELECT block, start, end, kind, url FROM marks ORDER BY block, start")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(sql)?;
+            let mut marks_by_block: std::collections::HashMap<i64, Vec<Mark>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let (block, start, end, kind, url) = row.map_err(sql)?;
+                let Some(kind) = MarkKind::try_from_str(&kind) else {
+                    return Err(StorageError::Corrupt(format!(
+                        "mark on block {block} has unknown kind {kind:?}"
+                    )));
+                };
+                marks_by_block.entry(block).or_default().push(Mark {
+                    start: start as usize,
+                    end: end as usize,
+                    kind,
+                    url,
+                });
+            }
+            for b in &mut blocks {
+                if let Some(marks) = marks_by_block.remove(&(b.id.as_u64() as i64)) {
+                    b.marks = marks;
+                }
             }
         }
 
@@ -295,6 +335,19 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
         ],
     )
     .map_err(sql)?;
+    for m in &block.marks {
+        tx.execute(
+            "INSERT INTO marks (block, start, end, kind, url) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                block.id.as_u64() as i64,
+                m.start as i64,
+                m.end as i64,
+                m.kind.as_str(),
+                m.url,
+            ],
+        )
+        .map_err(sql)?;
+    }
     Ok(())
 }
 
@@ -371,6 +424,34 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
         }
 
         Change::BlockInserted(block) => insert_block(tx, block),
+        Change::BlockMarksSet { id, marks } => {
+            tx.execute("DELETE FROM marks WHERE block = ?1", params![id.as_u64() as i64])
+                .map_err(sql)?;
+            let block = Block {
+                id: *id,
+                page: PageId(0),
+                parent: None,
+                order: OrderKey(0),
+                kind: crate::core::BlockKind::Paragraph,
+                text: String::new(),
+                checked: false,
+                marks: marks.clone(),
+            };
+            for m in &block.marks {
+                tx.execute(
+                    "INSERT INTO marks (block, start, end, kind, url) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        block.id.as_u64() as i64,
+                        m.start as i64,
+                        m.end as i64,
+                        m.kind.as_str(),
+                        m.url,
+                    ],
+                )
+                .map_err(sql)?;
+            }
+            Ok(())
+        }
         Change::BlockTextSet { id, text } => {
             let n = tx
                 .execute(

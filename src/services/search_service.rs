@@ -41,6 +41,11 @@ impl SearchService {
         SearchService { repo }
     }
 
+    /// Arc constructor for the app layer (Track A wiring).
+    pub fn new_arc(repo: Arc<SqliteRepository>) -> Arc<Self> {
+        Arc::new(SearchService::new(repo))
+    }
+
     /// Whole-workspace query by plain text (blocking; for tests and tools).
     pub fn query(&self, text: &str) -> Result<Vec<Hit>, StorageError> {
         self.search(&SearchRequest::new(text))

@@ -404,6 +404,11 @@ fn killed_writer_leaves_confirmed_data_intact() {
     );
     // the aborted transaction's rows may never surface
     assert!(
+        !state.pages.iter().any(|p| p.id == PageId(777)),
+        "in-flight page became visible: {:?}",
+        state.pages
+    );
+    assert!(
         !state.blocks.iter().any(|b| b.text.contains("never committed")),
         "partial write became visible: {:?}",
         state.blocks
@@ -435,28 +440,94 @@ fn crash_writer_child() {
     stream.write_all(b"committed\n").unwrap();
     stream.flush().unwrap();
 
-    // A large in-flight transaction with synchronous=FULL: slow enough
-    // that the parent's kill lands mid-write, and it is never committed.
-    let big = "x".repeat(64 * 1024);
-    let mut batch = vec![Change::BlockInserted(block(
-        3,
-        1,
-        None,
-        30,
-        &format!("never committed {big}"),
-    ))];
-    for id in 100..600u64 {
-        batch.push(Change::BlockInserted(block(id, 1, None, 1000 + id, &big)));
-    }
-    let _ = repo.apply(&batch);
+    // Leave a transaction permanently in flight: BEGIN + rows, never
+    // committed. The parent's kill is then deterministic — SQLite WAL
+    // recovery must discard exactly these rows on the next open.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT INTO pages (id, title, parent, ord, favorite, expanded)
+             VALUES (777, 'in flight', NULL, 1, 0, 0);
+         INSERT INTO blocks (id, page, kind, text, checked)
+             VALUES (777, 777, 'paragraph', 'never committed', 0);
+         INSERT INTO block_children (block, parent, ord) VALUES (777, NULL, 1);",
+    )
+    .unwrap();
 
-    // If the kill ever loses the race, hang so the parent kills us anyway.
-    loop {
+    // Sit inside the transaction until killed; self-terminate after two
+    // minutes in case the parent ever dies before reaching kill().
+    for _ in 0..120 {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+    std::process::exit(0x7F);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+
+/// Manual latency probe for docs/PERFORMANCE.md:
+/// `cargo test --test storage -- --ignored --nocapture save_latency`
+#[test]
+#[ignore = "measurement probe, not an assertion"]
+fn save_latency() {
+    use std::time::Instant;
+
+    let dir = tempfile();
+    let path = dir.join("latency.db");
+    let repo = SqliteRepository::open(&path).unwrap();
+
+    let mut seed = sample_state();
+    for id in 2..=1000u64 {
+        seed.pages.push(page(id, "latency page", None, id * 10));
+        for b in 0..10 {
+            seed.blocks.push(block(
+                id * 1000 + b,
+                id,
+                None,
+                (b + 1) * 100,
+                "the quick brown fox jumps over the lazy dog 中文内容",
+            ));
+        }
+    }
+    let t = Instant::now();
+    repo.replace_all(&seed).unwrap();
+    println!("startup load side:");
+    let tl = Instant::now();
+    let n = repo.load().unwrap();
+    println!("  load {} blocks + {} pages: {:?}", n.blocks.len(), n.pages.len(), tl.elapsed());
+    println!("bulk replace_all ({} blocks): {:?}", seed.blocks.len(), t.elapsed());
+
+    // a typical debounced burst: 30 text updates of one page + a setting
+    let mut batch: Vec<Change> = (0..30)
+        .map(|i| Change::BlockTextSet {
+            id: BlockId(2_001),
+            text: format!("typed up to {i} — 输入内容"),
+        })
+        .collect();
+    batch.push(Change::SettingSet {
+        key: "last_draft".into(),
+        value: "1".into(),
+    });
+    let times: Vec<std::time::Duration> = (0..20)
+        .map(|_| {
+            let t = Instant::now();
+            repo.apply(&batch).unwrap();
+            t.elapsed()
+        })
+        .collect();
+    let total: std::time::Duration = times.iter().sum();
+    println!(
+        "apply 32-change batch (WAL, synchronous=FULL): min {:?} median {:?} mean {:?} max {:?}",
+        times.iter().min().unwrap(),
+        {
+            let mut s = times.clone();
+            s.sort();
+            s[s.len() / 2]
+        },
+        total / times.len() as u32,
+        times.iter().max().unwrap()
+    );
+}
 
 fn tempfile() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(

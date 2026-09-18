@@ -203,6 +203,7 @@ fn a_recovered_database_is_searchable_straight_away() {
                 kind: BlockKind::Paragraph,
                 text: "字体回退与行高".into(),
                 checked: false,
+            marks: Vec::new(),
             }),
         ])
         .unwrap();
@@ -299,6 +300,7 @@ fn snapshot_cost() {
             kind: BlockKind::Paragraph,
             text: format!("block {i} carrying a little text to index"),
             checked: false,
+            marks: Vec::new(),
         })
         .collect();
     {

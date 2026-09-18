@@ -343,6 +343,7 @@ mod tests {
             kind: BlockKind::Paragraph,
             text: "hello".into(),
             checked: false,
+            marks: Vec::new(),
         });
         state.pages.push(Page {
             id: PageId(1),

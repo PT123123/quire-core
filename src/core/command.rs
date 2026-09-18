@@ -18,8 +18,10 @@ pub enum Command {
     /// Backspace at caret 0: merge this block into the previous one.
     MergeBackward { id: BlockId },
     DeleteBlock { id: BlockId },
-    /// Empty block of `kind` directly after `id`.
-    InsertBlockAfter { id: BlockId, kind: BlockKind },
+    /// Block of `kind` with initial `text` directly after `id`.
+    InsertBlockAfter { id: BlockId, kind: BlockKind, text: String },
+    /// Deep copy of one block (flat model: no subtree) right after it.
+    DuplicateBlock { id: BlockId },
     SetBlockType { id: BlockId, kind: BlockKind },
     ToggleTodoChecked { id: BlockId },
     /// Move one slot up (-1) / down (+1) among the page's blocks.
@@ -134,7 +136,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             })
         }
 
-        Command::InsertBlockAfter { id, kind } => {
+        Command::InsertBlockAfter { id, kind, text } => {
             let idx = doc.index_of(page, id)?;
             doc.page_blocks(page).get(idx)?;
             let order = key_after(doc, page, idx)?;
@@ -145,11 +147,25 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 parent: None,
                 order,
                 kind,
-                text: String::new(),
+                text,
                 checked: false,
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
+                revert: vec![Change::BlockDeleted { id: new_id }],
+            })
+        }
+
+        Command::DuplicateBlock { id } => {
+            let idx = doc.index_of(page, id)?;
+            let src = doc.page_blocks(page).get(idx)?.clone();
+            let order = key_after(doc, page, idx)?;
+            let new_id = doc.alloc_block_id();
+            let mut copy = src.clone();
+            copy.id = new_id;
+            copy.order = order;
+            Some(Entry {
+                apply: vec![Change::BlockInserted(copy)],
                 revert: vec![Change::BlockDeleted { id: new_id }],
             })
         }
@@ -209,6 +225,30 @@ pub fn exec(doc: &mut Document, hist: &mut History, page: PageId, cmd: Command) 
     doc.apply(&entry.apply);
     hist.push(page, entry.clone());
     Some(entry.apply)
+}
+
+/// Plan several commands against the pre-state and apply them as ONE
+/// history entry (single undo step) — for compound UI actions like the
+/// slash menu (replace text + set type). Commands must be independent
+/// (none may depend on the applied result of an earlier one).
+pub fn exec_all(
+    doc: &mut Document,
+    hist: &mut History,
+    page: PageId,
+    cmds: Vec<Command>,
+) -> Option<Vec<Change>> {
+    let mut apply = Vec::new();
+    let mut revert = Vec::new();
+    for cmd in cmds {
+        let entry = plan(doc, page, cmd)?;
+        apply.extend(entry.apply);
+        revert.extend(entry.revert);
+    }
+    revert.reverse();
+    doc.apply(&apply);
+    let entry = Entry { apply: apply.clone(), revert };
+    hist.push(page, entry);
+    Some(apply)
 }
 
 /// Undo the last command on `page`; returns the changes now in effect (the
@@ -328,6 +368,59 @@ mod tests {
         }
         // capped history: at most 100 undo steps, never panics
         assert!(undo(&mut doc, &mut hist, page).is_none());
+    }
+
+    #[test]
+    fn duplicate_copies_block_after_original() {
+        let (mut doc, mut hist, page, ids) = setup();
+        exec(&mut doc, &mut hist, page, Command::DuplicateBlock { id: ids[0] }).unwrap();
+        let texts: Vec<&str> = doc.page_blocks(page).iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["first", "first", "second", "third"]);
+        undo(&mut doc, &mut hist, page);
+        let texts: Vec<&str> = doc.page_blocks(page).iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn exec_all_is_one_undo_step() {
+        let (mut doc, mut hist, page, ids) = setup();
+        exec_all(
+            &mut doc,
+            &mut hist,
+            page,
+            vec![
+                Command::ReplaceText { id: ids[0], text: "retitled".into() },
+                Command::SetBlockType { id: ids[0], kind: BlockKind::Heading1 },
+            ],
+        )
+        .unwrap();
+        let b = doc.block(ids[0]).unwrap();
+        assert_eq!(b.text, "retitled");
+        assert_eq!(b.kind, BlockKind::Heading1);
+        // one undo reverts BOTH
+        undo(&mut doc, &mut hist, page);
+        let b = doc.block(ids[0]).unwrap();
+        assert_eq!(b.text, "first");
+        assert_eq!(b.kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn insert_block_after_carries_text() {
+        let (mut doc, mut hist, page, ids) = setup();
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertBlockAfter {
+                id: ids[2],
+                kind: BlockKind::Code,
+                text: "println!(\"hi\");".into(),
+            },
+        )
+        .unwrap();
+        let last = doc.page_blocks(page).last().unwrap();
+        assert_eq!(last.kind, BlockKind::Code);
+        assert_eq!(last.text, "println!(\"hi\");");
     }
 
     #[test]

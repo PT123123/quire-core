@@ -11,6 +11,7 @@ use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
 
 use super::database::{ord_from_db, ord_to_db, Database};
+use super::search_index::{self, Match, SearchRequest};
 
 pub struct SqliteRepository {
     db: Database,
@@ -46,6 +47,13 @@ impl SqliteRepository {
 
     pub fn database(&self) -> &Database {
         &self.db
+    }
+
+    /// Ranked full-text matches (SPEC §二十). Deliberately *not* on the
+    /// `Repository` trait: search is an implementation capability of the
+    /// SQLite backend, and the change contract stays untouched (ADR-0014).
+    pub fn search(&self, req: &SearchRequest) -> Result<Vec<Match>, StorageError> {
+        search_index::matches(&self.db.conn(), req)
     }
 }
 
@@ -188,6 +196,11 @@ impl Repository for SqliteRepository {
         for change in changes {
             apply_one(&tx, change)?;
         }
+        // Deletes cascade through FKs without telling the index, so one
+        // orphan sweep per batch that removed anything.
+        if changes.iter().any(is_delete) {
+            search_index::prune(&tx)?;
+        }
         tx.commit().map_err(sql)?;
         Ok(())
     }
@@ -204,6 +217,10 @@ impl Repository for SqliteRepository {
         tx.execute("DELETE FROM pages", []).map_err(sql)?; // cascades child pages + blocks
         tx.execute("DELETE FROM metadata", []).map_err(sql)?;
         tx.execute("DELETE FROM settings", []).map_err(sql)?;
+        // FTS5 tables have no FKs, so the mirror is cleared by hand; the
+        // inserts below re-index every row.
+        tx.execute("DELETE FROM search_blocks", []).map_err(sql)?;
+        tx.execute("DELETE FROM search_pages", []).map_err(sql)?;
         // A→B→A parent references satisfy FK rules but would spin the
         // sidebar tree forever, so the bulk path validates acyclicity.
         detect_cycle(
@@ -311,7 +328,7 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
         ],
     )
     .map_err(sql)?;
-    Ok(())
+    search_index::index_page_title(tx, page.id, &page.title)
 }
 
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
@@ -348,7 +365,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
         )
         .map_err(sql)?;
     }
-    Ok(())
+    search_index::upsert_block(tx, block.id, &block.text)
 }
 
 /// Fail loudly when a mutation targets an id that is not there: silently
@@ -361,6 +378,13 @@ fn require_hit(affected: usize, what: &str, id: u64) -> Result<(), StorageError>
     }
 }
 
+fn is_delete(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::PageDeleted { .. } | Change::BlockDeleted { .. }
+    )
+}
+
 fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
     match change {
         Change::PageCreated(page) => insert_page(tx, page),
@@ -371,7 +395,8 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                     params![id.as_u64() as i64, title],
                 )
                 .map_err(sql)?;
-            require_hit(n, "PageTitleSet", id.as_u64())
+            require_hit(n, "PageTitleSet", id.as_u64())?;
+            search_index::index_page_title(tx, *id, title)
         }
         Change::PageMoved { id, parent, order } => {
             let n = tx
@@ -459,7 +484,8 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                     params![id.as_u64() as i64, text],
                 )
                 .map_err(sql)?;
-            require_hit(n, "BlockTextSet", id.as_u64())
+            require_hit(n, "BlockTextSet", id.as_u64())?;
+            search_index::upsert_block(tx, *id, text)
         }
         Change::BlockKindSet { id, kind } => {
             let n = tx

@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, Transaction};
 use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
 
+use super::backup;
 use super::database::{ord_from_db, ord_to_db, Database};
 use super::search_index::{self, Match, SearchRequest};
 
@@ -31,10 +32,13 @@ fn db_to_bool(value: i64) -> bool {
 
 impl SqliteRepository {
     /// Open (or create) the database at `path`, migrate, and run the
-    /// startup integrity check before returning (SPEC §二十五).
+    /// startup integrity check before returning (SPEC §二十五). A main file
+    /// that fails that check is restored from the newest readable `.bak<N>`
+    /// snapshot, and every successful open rotates the snapshot family
+    /// (ADR-0015).
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         Ok(SqliteRepository {
-            db: Database::open(path)?,
+            db: backup::open_with_recovery(path)?,
         })
     }
 

@@ -2,6 +2,7 @@
 // Implements `core::persistence::Repository`; nothing here may know about
 // Slint (docs/ARCHITECTURE.md hard rule 2).
 
+pub mod backup;
 pub mod database;
 pub mod migrations;
 pub mod repository;

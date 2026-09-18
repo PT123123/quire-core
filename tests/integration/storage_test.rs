@@ -12,6 +12,7 @@ use quire::core::persistence::{Change, Repository, StorageError};
 use quire::core::types::{
     Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState,
 };
+use quire::storage::backup;
 use quire::storage::migrations;
 use quire::storage::SqliteRepository;
 
@@ -295,6 +296,11 @@ fn corrupt_database_is_reported_at_startup() {
         *b = 0x5A;
     }
     std::fs::write(&path, &bytes).unwrap();
+    // the opening above also wrote a snapshot family; without it there is
+    // nothing to fall back to. Recovery itself is covered by backup_test.
+    for index in 1..=backup::KEEP {
+        let _ = std::fs::remove_file(backup::slot(&path, index));
+    }
     let err = match SqliteRepository::open(&path) {
         Ok(_) => panic!("a corrupt database must not open"),
         Err(e) => e,

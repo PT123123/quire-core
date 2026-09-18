@@ -477,7 +477,7 @@ fn save_latency() {
     let repo = SqliteRepository::open(&path).unwrap();
 
     let mut seed = sample_state();
-    for id in 2..=1000u64 {
+    for id in 5..=1004u64 {
         seed.pages.push(page(id, "latency page", None, id * 10));
         for b in 0..10 {
             seed.blocks.push(block(
@@ -500,7 +500,7 @@ fn save_latency() {
     // a typical debounced burst: 30 text updates of one page + a setting
     let mut batch: Vec<Change> = (0..30)
         .map(|i| Change::BlockTextSet {
-            id: BlockId(2_001),
+            id: BlockId(5_001),
             text: format!("typed up to {i} — 输入内容"),
         })
         .collect();

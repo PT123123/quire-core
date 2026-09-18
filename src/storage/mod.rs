@@ -5,6 +5,7 @@
 pub mod database;
 pub mod migrations;
 pub mod repository;
+pub mod search_index;
 
 pub use database::Database;
 pub use repository::SqliteRepository;

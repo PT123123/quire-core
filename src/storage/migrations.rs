@@ -7,19 +7,22 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 2;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
-/// `version - 1` and bumps `user_version` to `version`.
+/// `version - 1` and bumps `user_version` to `version`. `backfill`, when
+/// present, runs right after the step commits (it needs its own transaction).
 struct Migration {
     version: i32,
     label: &'static str,
     sql: &'static str,
+    backfill: Option<fn(&mut Connection) -> Result<(), StorageError>>,
 }
 
 const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     label: "initial",
+    backfill: None,
     sql: r#"
 CREATE TABLE workspaces (
     id   INTEGER PRIMARY KEY,
@@ -67,6 +70,25 @@ CREATE INDEX idx_block_children_p ON block_children(parent);
 
 INSERT INTO workspaces (id, name) VALUES (1, 'Workspace');
 "#,
+}, Migration {
+    version: 2,
+    label: "search-index",
+    // Full-text search (SPEC §二十, ADR-0014). `unicode61` alone cannot match
+    // Chinese: the index stores a segmented copy of the text (see
+    // storage/search_index.rs), so the tokenizer needs no custom table here.
+    sql: r#"
+CREATE VIRTUAL TABLE search_pages USING fts5(
+    title,
+    tokenize = 'unicode61'
+);
+
+CREATE VIRTUAL TABLE search_blocks USING fts5(
+    page_id UNINDEXED,
+    text,
+    tokenize = 'unicode61'
+);
+"#,
+    backfill: Some(super::search_index::rebuild),
 }];
 
 pub fn user_version(conn: &Connection) -> Result<i32, StorageError> {
@@ -99,19 +121,25 @@ pub fn ensure_current(conn: &mut Connection) -> Result<(), StorageError> {
             .map_err(|e| StorageError::Sql(e.to_string()))?;
         tx.commit()
             .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if let Some(backfill) = migration.backfill {
+            backfill(conn)
+                .map_err(|e| StorageError::Sql(format!("migration {} backfill: {e}", migration.label)))?;
+        }
     }
     Ok(())
 }
 
 /// True when every table the current schema needs is present.
 pub fn check_schema(conn: &Connection) -> Result<(), StorageError> {
-    const TABLES: [&str; 6] = [
+    const TABLES: [&str; 8] = [
         "workspaces",
         "pages",
         "blocks",
         "block_children",
         "metadata",
         "settings",
+        "search_pages",
+        "search_blocks",
     ];
     for table in TABLES {
         let found: Option<String> = conn

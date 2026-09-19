@@ -36,6 +36,17 @@ impl Document {
         id
     }
 
+    /// Reserve `n` consecutive ids and return the first (the id-range
+    /// counterpart of `alloc_block_id`, for bulk copies like page
+    /// duplication — M8_FEEDBACK #2: the allocator is the single id
+    /// authority, and a caller that mints ids without reserving them
+    /// collides with the next allocation).
+    pub fn reserve_block_ids(&mut self, n: u64) -> u64 {
+        let start = self.next_id;
+        self.next_id += n;
+        start
+    }
+
     /// Next id that would be allocated (used to hand fresh ids to copies).
     pub fn next_id_value(&self) -> u64 {
         self.next_id

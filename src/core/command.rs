@@ -26,6 +26,10 @@ pub enum Command {
     ToggleTodoChecked { id: BlockId },
     /// Move one slot up (-1) / down (+1) among the page's blocks.
     MoveBlock { id: BlockId, delta: i32 },
+    /// Drag-reorder: land `id` directly above flat position `index`
+    /// (0..=len) of the page's display order. Parent never changes; the
+    /// landing must not split another block's subtree.
+    MoveBlockTo { id: BlockId, index: i32 },
     /// Toggle an inline mark over `[start..end]` (byte offsets): a same-kind
     /// mark covering the range is removed, otherwise intersecting same-kind
     /// marks are replaced by one new mark (M6).
@@ -91,6 +95,42 @@ fn key_after(doc: &mut Document, page: PageId, idx: usize) -> Option<OrderKey> {
     let before = doc.page_blocks(page).get(idx)?.order;
     let after = doc.page_blocks(page).get(idx + 1).map(|b| b.order);
     OrderKey::between(Some(before), after)
+}
+
+/// Does landing at slot `p` (flat insert-above position in the CURRENT
+/// order, 0..=len) keep the model well-formed for the block at `s`?
+///
+/// - Top-level: must not split another block's subtree — the block that
+///   follows the landing slot must be top-level (children always directly
+///   follow their parent's subtree in the flat order).
+/// - Nested (parent P): must stay adjacent to P's sibling run, i.e. touch a
+///   sibling, P itself, or the run boundary.
+fn move_landing_ok(blocks: &[Block], s: usize, p: usize) -> bool {
+    let q = if s < p { p - 1 } else { p };
+    let orig = |r: usize| if r < s { r } else { r + 1 };
+    let parent = blocks[s].parent;
+    let next = if q >= blocks.len() - 1 { None } else { Some(&blocks[orig(q)]) };
+    let prev = if q == 0 { None } else { Some(&blocks[orig(q - 1)]) };
+    match parent {
+        None => next.map_or(true, |b| b.parent.is_none()),
+        Some(p_id) => {
+            let prev_ok = prev.is_some_and(|b| b.parent == Some(p_id) || b.id == p_id);
+            let next_ok = next.is_some_and(|b| b.parent == Some(p_id));
+            prev_ok || next_ok
+        }
+    }
+}
+
+/// Read-only validity check for a drag landing (hover feedback must not
+/// mutate the document, so this skips the order-gap/renumber step).
+pub fn can_move_block_to(doc: &Document, page: PageId, id: BlockId, index: i32) -> bool {
+    let Some(idx) = doc.index_of(page, id) else { return false };
+    let blocks = doc.page_blocks(page);
+    let Ok(p) = usize::try_from(index) else { return false };
+    if p > blocks.len() || p == idx || p == idx + 1 {
+        return false;
+    }
+    move_landing_ok(blocks, idx, p)
 }
 
 /// Plan `cmd` against the current document. Returns `None` for no-ops
@@ -373,16 +413,58 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             if this.parent != neighbor.parent {
                 return None; // reordering stays within a sibling run
             }
-            // swapping keys keeps both unique and flips the order
+            // swapping keys keeps both unique and flips the order; the
+            // parent is re-set to the same value so nested items stay nested
             Some(Entry {
                 apply: vec![
-                    Change::BlockMoved { id: this.id, parent: None, order: neighbor.order },
-                    Change::BlockMoved { id: neighbor.id, parent: None, order: this.order },
+                    Change::BlockMoved { id: this.id, parent: this.parent, order: neighbor.order },
+                    Change::BlockMoved { id: neighbor.id, parent: this.parent, order: this.order },
                 ],
                 revert: vec![
-                    Change::BlockMoved { id: this.id, parent: None, order: this.order },
-                    Change::BlockMoved { id: neighbor.id, parent: None, order: neighbor.order },
+                    Change::BlockMoved { id: this.id, parent: this.parent, order: this.order },
+                    Change::BlockMoved { id: neighbor.id, parent: this.parent, order: neighbor.order },
                 ],
+            })
+        }
+
+        Command::MoveBlockTo { id, index } => {
+            let idx = doc.index_of(page, id)?;
+            let blocks = doc.page_blocks(page);
+            let len = blocks.len();
+            let Ok(p) = usize::try_from(index) else { return None };
+            if p > len {
+                return None;
+            }
+            if p == idx || p == idx + 1 {
+                return None; // dropping on itself (or right below it): no-op
+            }
+            if !move_landing_ok(blocks, idx, p) {
+                return None;
+            }
+            let this = blocks[idx].clone();
+            // insertion slot `q` in the source-removed list; neighbors are
+            // mapped back to original indices via orig()
+            let q = if idx < p { p - 1 } else { p };
+            let orig = |r: usize| if r < idx { r } else { r + 1 };
+            let neighbors = |blocks: &[Block]| {
+                (
+                    if q == 0 { None } else { Some(blocks[orig(q - 1)].order) },
+                    if q >= len - 1 { None } else { Some(blocks[orig(q)].order) },
+                )
+            };
+            let (prev, next) = neighbors(blocks);
+            let order = match OrderKey::between(prev, next) {
+                Some(k) => k,
+                None => {
+                    doc.renumber_page(page); // relative order preserved: orig() stays valid
+                    let blocks = doc.page_blocks(page);
+                    let (prev, next) = neighbors(blocks);
+                    OrderKey::between(prev, next)?
+                }
+            };
+            Some(Entry {
+                apply: vec![Change::BlockMoved { id, parent: this.parent, order }],
+                revert: vec![Change::BlockMoved { id, parent: this.parent, order: this.order }],
             })
         }
     }
@@ -523,6 +605,108 @@ mod tests {
         assert_eq!(texts, ["second", "first", "third"]);
         // edge: moving the first block up is a no-op
         assert!(plan(&mut doc, page, Command::MoveBlock { id: ids[1], delta: -1 }).is_none());
+    }
+
+    #[test]
+    fn move_to_lands_at_flat_position_and_undoes() {
+        let (mut doc, mut hist, page, ids) = setup();
+        exec(&mut doc, &mut hist, page, Command::MoveBlockTo { id: ids[2], index: 0 }).unwrap();
+        let texts: Vec<&str> = doc.page_blocks(page).iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["third", "first", "second"]);
+        undo(&mut doc, &mut hist, page);
+        let texts: Vec<&str> = doc.page_blocks(page).iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn move_to_edge_cases() {
+        let (mut doc, mut hist, page, ids) = setup();
+        // dropping on itself or directly below itself: no-op
+        assert!(plan(&mut doc, page, Command::MoveBlockTo { id: ids[1], index: 1 }).is_none());
+        assert!(plan(&mut doc, page, Command::MoveBlockTo { id: ids[1], index: 2 }).is_none());
+        // append after the last block
+        exec(&mut doc, &mut hist, page, Command::MoveBlockTo { id: ids[0], index: 3 }).unwrap();
+        let texts: Vec<&str> = doc.page_blocks(page).iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["second", "third", "first"]);
+    }
+
+    #[test]
+    fn move_to_keeps_parent_structure() {
+        let mut doc = Document::new(1000);
+        let mut hist = History::default();
+        let page = PageId(1);
+        let p1 = doc.alloc_block_id();
+        let mk = |id: BlockId, text: &str, order: u64, parent: Option<BlockId>| Block {
+            id,
+            page,
+            parent,
+            order: OrderKey(order),
+            kind: BlockKind::Paragraph,
+            text: text.into(),
+            checked: false,
+            marks: Vec::new(),
+        };
+        let c1 = doc.alloc_block_id();
+        let c2 = doc.alloc_block_id();
+        let p2 = doc.alloc_block_id();
+        doc.set_page_blocks(
+            page,
+            vec![
+                mk(p1, "p1", 10, None),
+                mk(c1, "c1", 12, Some(p1)),
+                mk(c2, "c2", 14, Some(p1)),
+                mk(p2, "p2", 16, None),
+            ],
+        );
+        let ids: Vec<BlockId> = doc.page_blocks(page).iter().map(|b| b.id).collect();
+
+        // a top-level block cannot land inside p1's subtree (between p1 and c1)
+        assert!(plan(&mut doc, page, Command::MoveBlockTo { id: ids[3], index: 1 }).is_none());
+        // ... nor between the two children
+        assert!(plan(&mut doc, page, Command::MoveBlockTo { id: ids[3], index: 2 }).is_none());
+        // ... but the top of the page is fine
+        assert!(plan(&mut doc, page, Command::MoveBlockTo { id: ids[3], index: 0 }).is_some());
+        // a nested item cannot leave its sibling run
+        assert!(plan(&mut doc, page, Command::MoveBlockTo { id: ids[1], index: 0 }).is_none());
+        // ... but can reorder within it (c2 above c1, keeping its parent)
+        exec(&mut doc, &mut hist, page, Command::MoveBlockTo { id: ids[2], index: 1 }).unwrap();
+        let rows = doc.page_blocks(page);
+        let texts: Vec<&str> = rows.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["p1", "c2", "c1", "p2"]);
+        assert_eq!(rows[1].parent, Some(p1));
+        // hover-side validity check agrees, read-only
+        assert!(can_move_block_to(&doc, page, ids[3], 0));
+        assert!(!can_move_block_to(&doc, page, ids[3], 1));
+        assert!(!can_move_block_to(&doc, page, ids[3], 4)); // p == s+1
+    }
+
+    #[test]
+    fn move_to_renumbers_when_gap_exhausted() {
+        let mut doc = Document::new(1000);
+        let mut hist = History::default();
+        let page = PageId(1);
+        let mk = |id: BlockId, text: &str, order: u64| Block {
+            id,
+            page,
+            parent: None,
+            order: OrderKey(order),
+            kind: BlockKind::Paragraph,
+            text: text.into(),
+            checked: false,
+            marks: Vec::new(),
+        };
+        let a = doc.alloc_block_id();
+        let b = doc.alloc_block_id();
+        let c = doc.alloc_block_id();
+        doc.set_page_blocks(
+            page,
+            vec![mk(a, "a", 1), mk(b, "b", 2), mk(c, "c", 3)],
+        );
+        let ids: Vec<BlockId> = doc.page_blocks(page).iter().map(|b| b.id).collect();
+        // a(1) above c(3): the b..c gap is exhausted, the silent renumber kicks in
+        exec(&mut doc, &mut hist, page, Command::MoveBlockTo { id: ids[0], index: 2 }).unwrap();
+        let texts: Vec<&str> = doc.page_blocks(page).iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["b", "a", "c"]);
     }
 
     #[test]

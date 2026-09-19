@@ -32,6 +32,8 @@ fn block(id: u64, page_id: u64, text: &str) -> Block {
         text: text.into(),
         checked: false,
         marks: Vec::new(),
+        color: quire::core::ColorKind::Default,
+        background: quire::core::ColorKind::Default,
     }
 }
 

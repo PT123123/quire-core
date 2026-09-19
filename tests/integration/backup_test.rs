@@ -312,6 +312,8 @@ fn a_recovered_database_is_searchable_straight_away() {
                 text: "字体回退与行高".into(),
                 checked: false,
             marks: Vec::new(),
+        color: quire::core::ColorKind::Default,
+        background: quire::core::ColorKind::Default,
             }),
         ])
         .unwrap();
@@ -463,6 +465,8 @@ fn snapshot_cost() {
             text: format!("block {i} carrying a little text to index"),
             checked: false,
             marks: Vec::new(),
+        color: quire::core::ColorKind::Default,
+        background: quire::core::ColorKind::Default,
         })
         .collect();
     {

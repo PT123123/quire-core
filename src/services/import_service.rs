@@ -22,7 +22,7 @@
 //   generator, services never invent them (ADR-0012)
 
 use crate::core::persistence::Change;
-use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page};
+use crate::core::types::{Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page};
 
 /// One parsed block, before ids and order keys exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +99,8 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
             text: parsed.text,
             checked: parsed.checked,
             marks: parsed.marks,
+            color: ColorKind::Default,
+            background: ColorKind::Default,
         }));
     }
     changes

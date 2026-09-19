@@ -139,6 +139,34 @@ impl Document {
                         }
                     }
                 }
+                Change::BlockMovedToPage { id, page, parent, order } => {
+                    // re-key while the block still sits in its old vec (vec
+                    // membership is what `page_of` reports), snapshot it,
+                    // and only then move the snapshot across
+                    if let Some(b) = self.block_mut(*id) {
+                        b.page = *page;
+                        b.parent = *parent;
+                        b.order = *order;
+                    }
+                    let moved = self.block(*id).cloned();
+                    let from = self.page_of(*id);
+                    if let Some(from) = from {
+                        if let Some(vec) = self.pages.get_mut(&from) {
+                            vec.retain(|b| b.id != *id);
+                        }
+                    }
+                    let vec = self.pages.entry(*page).or_default();
+                    if let Some(b) = moved {
+                        vec.push(b);
+                    }
+                    vec.sort_by_key(|b| b.order);
+                }
+                Change::BlockColorSet { id, color, background } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.color = *color;
+                        b.background = *background;
+                    }
+                }
                 _ => {}
             }
         }
@@ -176,8 +204,12 @@ mod tests {
             text: text.into(),
             checked: false,
             marks: Vec::new(),
+            color: ColorKind::Default,
+            background: ColorKind::Default,
         }
     }
+
+    use super::super::types::ColorKind;
 
     use super::super::types::OrderKey;
 

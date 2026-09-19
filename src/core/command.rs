@@ -5,7 +5,7 @@
 use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
-use super::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, PageId};
+use super::types::{Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, PageId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -39,6 +39,11 @@ pub enum Command {
     /// Shift+Tab on a nested list item: promote it back to top level,
     /// landing after its parent's whole subtree.
     OutdentList { id: BlockId },
+    /// Block-level color pair (text + row background).
+    SetBlockColor { id: BlockId, color: ColorKind, background: ColorKind },
+    /// Move a block (and its whole subtree) to the end of another page.
+    /// The target page must differ from the block's current one.
+    MoveBlockToPage { id: BlockId, page: PageId },
 }
 
 fn is_list_kind(kind: BlockKind) -> bool {
@@ -231,6 +236,8 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 text,
                 checked: false,
                 marks: Vec::new(),
+                color: ColorKind::Default,
+                background: ColorKind::Default,
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
@@ -467,6 +474,88 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 revert: vec![Change::BlockMoved { id, parent: this.parent, order: this.order }],
             })
         }
+
+        Command::SetBlockColor { id, color, background } => {
+            let b = doc.block(id)?;
+            if b.color == color && b.background == background {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::BlockColorSet { id, color, background }],
+                revert: vec![Change::BlockColorSet { id, color: b.color, background: b.background }],
+            })
+        }
+
+        Command::MoveBlockToPage { id, page: target } => {
+            if target == page {
+                return None; // same-page moves are MoveBlockTo's job
+            }
+            let idx = doc.index_of(page, id)?;
+            let this = doc.page_blocks(page).get(idx)?.clone();
+            // capture the whole subtree in display order (children follow
+            // their parent in the flat order)
+            let blocks = doc.page_blocks(page);
+            let mut subtree: Vec<Block> = vec![this.clone()];
+            loop {
+                let before = subtree.len();
+                for b in blocks {
+                    if subtree.iter().any(|s| Some(s.id) == b.parent)
+                        && !subtree.iter().any(|s| s.id == b.id)
+                    {
+                        subtree.push(b.clone());
+                    }
+                }
+                if subtree.len() == before {
+                    break;
+                }
+            }
+            // the root lands as the last top-level block of the target page
+            let append_key = |doc: &mut Document, page: PageId| -> Option<OrderKey> {
+                let max = doc
+                    .page_blocks(page)
+                    .iter()
+                    .filter(|b| b.parent.is_none())
+                    .map(|b| b.order)
+                    .max();
+                match OrderKey::between(max, None) {
+                    Some(k) => Some(k),
+                    None => {
+                        doc.renumber_page(page);
+                        let max = doc
+                            .page_blocks(page)
+                            .iter()
+                            .filter(|b| b.parent.is_none())
+                            .map(|b| b.order)
+                            .max();
+                        OrderKey::between(max, None)
+                    }
+                }
+            };
+            let root_order = append_key(doc, target)?;
+            let mut apply = Vec::new();
+            let mut revert = Vec::new();
+            for (i, b) in subtree.iter().enumerate() {
+                let (parent, order) = if i == 0 {
+                    (None, root_order)
+                } else {
+                    (b.parent, b.order)
+                };
+                apply.push(Change::BlockMovedToPage {
+                    id: b.id,
+                    page: target,
+                    parent,
+                    order,
+                });
+                revert.push(Change::BlockMovedToPage {
+                    id: b.id,
+                    page: b.page,
+                    parent: b.parent,
+                    order: b.order,
+                });
+            }
+            revert.reverse();
+            Some(Entry { apply, revert })
+        }
     }
 }
 
@@ -547,6 +636,8 @@ mod tests {
                 text: t.into(),
                 checked: false,
                 marks: Vec::new(),
+                color: ColorKind::Default,
+                background: ColorKind::Default,
             });
             doc.set_page_blocks(page, v);
             prev = Some(order);
@@ -649,6 +740,8 @@ mod tests {
             text: text.into(),
             checked: false,
             marks: Vec::new(),
+            color: ColorKind::Default,
+            background: ColorKind::Default,
         };
         let c1 = doc.alloc_block_id();
         let c2 = doc.alloc_block_id();
@@ -698,6 +791,8 @@ mod tests {
             text: text.into(),
             checked: false,
             marks: Vec::new(),
+            color: ColorKind::Default,
+            background: ColorKind::Default,
         };
         let a = doc.alloc_block_id();
         let b = doc.alloc_block_id();
@@ -893,5 +988,97 @@ mod tests {
         exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: ids[0] }).unwrap();
         assert!(undo(&mut doc, &mut hist, page2).is_none(), "page2 has no history");
         assert!(undo(&mut doc, &mut hist, page).is_some());
+    }
+
+    #[test]
+    fn set_block_color_round_trips_through_undo() {
+        let (mut doc, mut hist, page, ids) = setup();
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::SetBlockColor {
+                id: ids[0],
+                color: ColorKind::Red,
+                background: ColorKind::Blue,
+            },
+        )
+        .unwrap();
+        let b = doc.block(ids[0]).unwrap();
+        assert_eq!((b.color, b.background), (ColorKind::Red, ColorKind::Blue));
+        // the same pick is a no-op
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::SetBlockColor {
+                    id: ids[0],
+                    color: ColorKind::Red,
+                    background: ColorKind::Blue,
+                }
+            )
+            .is_none()
+        );
+        undo(&mut doc, &mut hist, page);
+        let b = doc.block(ids[0]).unwrap();
+        assert_eq!(
+            (b.color, b.background),
+            (ColorKind::Default, ColorKind::Default)
+        );
+    }
+
+    #[test]
+    fn move_block_to_page_carries_subtree_and_undo_restores() {
+        let mut doc = Document::new(1000);
+        let mut hist = History::default();
+        let source = PageId(1);
+        let target = PageId(2);
+        let mk = |doc: &mut Document, page: PageId, text: &str, order: u64, parent: Option<BlockId>| Block {
+            id: doc.alloc_block_id(),
+            page,
+            parent,
+            order: OrderKey(order),
+            kind: BlockKind::Paragraph,
+            text: text.into(),
+            checked: false,
+            marks: Vec::new(),
+            color: ColorKind::Default,
+            background: ColorKind::Default,
+        };
+        let p = mk(&mut doc, source, "p", 10, None);
+        let c = mk(&mut doc, source, "c", 12, Some(p.id));
+        let t = mk(&mut doc, target, "t", 10, None);
+        doc.set_page_blocks(source, vec![p.clone(), c.clone()]);
+        doc.set_page_blocks(target, vec![t.clone()]);
+
+        exec(
+            &mut doc,
+            &mut hist,
+            source,
+            Command::MoveBlockToPage { id: p.id, page: target },
+        )
+        .unwrap();
+        // the source page is empty; the subtree sits at the end of the target
+        assert!(doc.page_blocks(source).is_empty());
+        let rows = doc.page_blocks(target);
+        let texts: Vec<&str> = rows.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["t", "p", "c"]);
+        assert_eq!(rows[1].parent, None);
+        assert_eq!(rows[2].parent, Some(p.id));
+        assert!(rows[1].order > rows[0].order);
+
+        undo(&mut doc, &mut hist, source);
+        let rows = doc.page_blocks(source);
+        let texts: Vec<&str> = rows.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["p", "c"]);
+        assert_eq!(rows[0].order, p.order);
+        assert_eq!(rows[1].parent, Some(p.id));
+        assert_eq!(doc.page_blocks(target)[0].text, "t");
+    }
+
+    #[test]
+    fn move_block_to_page_refuses_the_same_page() {
+        let (mut doc, _hist, page, ids) = setup();
+        assert!(plan(&mut doc, page, Command::MoveBlockToPage { id: ids[0], page }).is_none());
     }
 }

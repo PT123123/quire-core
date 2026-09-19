@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 3;
+pub const CURRENT_VERSION: i32 = 4;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -108,7 +108,40 @@ CREATE TABLE IF NOT EXISTS marks (
 CREATE INDEX IF NOT EXISTS idx_marks_block ON marks(block);
 "#,
     backfill: None,
+}, Migration {
+    version: 4,
+    label: "block colors",
+    // Block-level color pair (ADR-0023): '' = theme default. Two flat
+    // columns instead of a color table — the palette is closed and the
+    // values are opaque strings to SQL. SQLite has no `ADD COLUMN IF NOT
+    // EXISTS`, so the columns are added conditionally in code: a file that
+    // was hand-downgraded (the migration test does exactly that) or
+    // restored from a newer snapshot may already carry them.
+    sql: "",
+    backfill: Some(add_color_columns),
 }];
+
+/// Migration 4 body: add each color column only when it is missing.
+fn add_color_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    const COLUMNS: [(&str, &str); 2] = [
+        ("color", "ALTER TABLE blocks ADD COLUMN color TEXT NOT NULL DEFAULT ''"),
+        ("bg", "ALTER TABLE blocks ADD COLUMN bg TEXT NOT NULL DEFAULT ''"),
+    ];
+    for (name, ddl) in COLUMNS {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if present == 0 {
+            conn.execute(ddl, [])
+                .map_err(|e| StorageError::Sql(format!("add {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
 
 pub fn user_version(conn: &Connection) -> Result<i32, StorageError> {
     conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))

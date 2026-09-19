@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, Transaction};
 
 use crate::core::persistence::{Change, Repository, StorageError};
-use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
+use crate::core::types::{
+    Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState,
+};
 
 use super::backup::{self, OpenReport};
 use super::data_location;
@@ -143,7 +145,8 @@ impl Repository for SqliteRepository {
         {
             let mut stmt = conn
                 .prepare(
-                    "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked
+                    "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
+                            b.color, b.bg
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -158,11 +161,13 @@ impl Repository for SqliteRepository {
                         r.get::<_, String>(4)?,
                         r.get::<_, String>(5)?,
                         r.get::<_, i64>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, String>(8)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
-                let (id, page, parent, ord, kind, text, checked) = row.map_err(sql)?;
+                let (id, page, parent, ord, kind, text, checked, color, bg) = row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
                     // string means the file was tampered with or truncated.
@@ -170,6 +175,8 @@ impl Repository for SqliteRepository {
                         "block {id} has unknown kind {kind:?}"
                     )));
                 };
+                // An unrecognized color string falls back to the theme
+                // default rather than failing the load: colors are cosmetic.
                 blocks.push(Block {
                     id: BlockId(id as u64),
                     page: PageId(page as u64),
@@ -179,6 +186,8 @@ impl Repository for SqliteRepository {
                     text,
                     checked: db_to_bool(checked),
                     marks: Vec::new(),
+                    color: ColorKind::try_from_str(&color).unwrap_or(ColorKind::Default),
+                    background: ColorKind::try_from_str(&bg).unwrap_or(ColorKind::Default),
                 });
             }
         }
@@ -381,13 +390,16 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO blocks (id, page, kind, text, checked) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO blocks (id, page, kind, text, checked, color, bg)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
             block.kind.as_str(),
             block.text,
             bool_to_db(block.checked),
+            block.color.as_str(),
+            block.background.as_str(),
         ],
     )
     .map_err(sql)?;
@@ -509,6 +521,8 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 text: String::new(),
                 checked: false,
                 marks: marks.clone(),
+                color: ColorKind::Default,
+                background: ColorKind::Default,
             };
             for m in &block.marks {
                 tx.execute(
@@ -565,6 +579,39 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockMoved", id.as_u64())
+        }
+        Change::BlockMovedToPage { id, page, parent, order } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET page = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, page.as_u64() as i64],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockMovedToPage", id.as_u64())?;
+            let n = tx
+                .execute(
+                    "UPDATE block_children SET parent = ?2, ord = ?3 WHERE block = ?1",
+                    params![
+                        id.as_u64() as i64,
+                        parent.map(|p| p.as_u64() as i64),
+                        ord_to_db(order.0)
+                    ],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockMovedToPage(children)", id.as_u64())
+        }
+        Change::BlockColorSet { id, color, background } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET color = ?2, bg = ?3 WHERE id = ?1",
+                    params![
+                        id.as_u64() as i64,
+                        color.as_str(),
+                        background.as_str(),
+                    ],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockColorSet", id.as_u64())
         }
         Change::BlockDeleted { id } => {
             let n = tx

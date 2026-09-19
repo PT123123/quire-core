@@ -225,7 +225,7 @@ mod tests {
     use crate::core::persistence::Repository;
     use crate::services::lan_client::pull_workspace;
     use std::io::Read;
-    use crate::core::types::{Block, BlockKind, Mark, OrderKey, Page};
+    use crate::core::types::{Block, BlockKind, ColorKind, Mark, OrderKey};
     use std::collections::HashMap;
 
     fn seeded_repo() -> Arc<SqliteRepository> {
@@ -249,6 +249,8 @@ mod tests {
             text: "hello from the lan".into(),
             checked: false,
             marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
+            color: ColorKind::Default,
+            background: ColorKind::Default,
         });
         state.settings.insert("theme".into(), "dark".into());
         repo.replace_all(&state).unwrap();

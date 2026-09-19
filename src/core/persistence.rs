@@ -9,7 +9,9 @@
 
 use std::fmt;
 
-use super::types::{Block, BlockId, BlockKind, Mark, OrderKey, Page, PageId, PersistedState};
+use super::types::{
+    Block, BlockId, BlockKind, ColorKind, Mark, OrderKey, Page, PageId, PersistedState,
+};
 
 /// Ordered list of persisted mutations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,13 @@ pub enum Change {
     /// Replace the block's whole inline-mark list (M6).
     BlockMarksSet { id: BlockId, marks: Vec<Mark> },
     BlockMoved { id: BlockId, parent: Option<BlockId>, order: OrderKey },
+    /// Cross-page move of one block (the whole subtree moves as a list of
+    /// these, one per block; `parent`/`order` keep every child attached to
+    /// its moved parent, so the subtree arrives intact).
+    BlockMovedToPage { id: BlockId, page: PageId, parent: Option<BlockId>, order: OrderKey },
+    /// Block-level color pair (text + row background). Both travel together
+    /// so one change covers a "Text: Red" or "Background: Blue" pick.
+    BlockColorSet { id: BlockId, color: ColorKind, background: ColorKind },
     /// Storage deletes the block and (recursively) its children; undo
     /// replays the captured subtree as `BlockInserted`s.
     BlockDeleted { id: BlockId },

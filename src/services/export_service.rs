@@ -87,6 +87,12 @@ fn render(block: &Block, number: &mut usize) -> String {
             *number = 0;
             prefix_lines("> ", text)
         }
+        // Markdown has no callout shape; a quote keeps the emphasis and the
+        // text. (Notion itself degrades callouts the same way.)
+        BlockKind::Callout => {
+            *number = 0;
+            prefix_lines("> ", text)
+        }
         BlockKind::Code => {
             *number = 0;
             format!("```\n{text}\n```")

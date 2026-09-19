@@ -74,10 +74,11 @@ pub enum BlockKind {
     Quote,
     Code,
     Divider,
+    Callout,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 10] = [
+    pub const ALL: [BlockKind; 11] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -88,6 +89,7 @@ impl BlockKind {
         BlockKind::Quote,
         BlockKind::Code,
         BlockKind::Divider,
+        BlockKind::Callout,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -102,11 +104,79 @@ impl BlockKind {
             BlockKind::Quote => "quote",
             BlockKind::Code => "code",
             BlockKind::Divider => "divider",
+            BlockKind::Callout => "callout",
         }
     }
 
     pub fn try_from_str(s: &str) -> Option<BlockKind> {
         BlockKind::ALL.iter().copied().find(|k| k.as_str() == s)
+    }
+}
+
+/// Block-level color (Notion-style). Applies to the block's text and, for
+/// `background`, to the row behind it. `Default` means "inherit the theme".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColorKind {
+    Default,
+    Gray,
+    Brown,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+    Pink,
+    Red,
+}
+
+impl ColorKind {
+    pub const ALL: [ColorKind; 10] = [
+        ColorKind::Default,
+        ColorKind::Gray,
+        ColorKind::Brown,
+        ColorKind::Orange,
+        ColorKind::Yellow,
+        ColorKind::Green,
+        ColorKind::Blue,
+        ColorKind::Purple,
+        ColorKind::Pink,
+        ColorKind::Red,
+    ];
+
+    /// Palette slot for the UI (0 = default, 1.. = gray..red). The Slint
+    /// side maps the slot to theme-aware colors.
+    pub fn slot(self) -> i32 {
+        self as u32 as i32
+    }
+
+    pub fn from_slot(slot: i32) -> Option<ColorKind> {
+        if (0..ColorKind::ALL.len() as i32).contains(&slot) {
+            Some(ColorKind::ALL[slot as usize])
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ColorKind::Default => "",
+            ColorKind::Gray => "gray",
+            ColorKind::Brown => "brown",
+            ColorKind::Orange => "orange",
+            ColorKind::Yellow => "yellow",
+            ColorKind::Green => "green",
+            ColorKind::Blue => "blue",
+            ColorKind::Purple => "purple",
+            ColorKind::Pink => "pink",
+            ColorKind::Red => "red",
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<ColorKind> {
+        ColorKind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.as_str() == s)
     }
 }
 
@@ -177,6 +247,10 @@ pub struct Block {
     pub checked: bool,
     /// Inline marks (M6), non-overlapping per kind.
     pub marks: Vec<Mark>,
+    /// Text color of the block; `Default` inherits the theme.
+    pub color: ColorKind,
+    /// Row background tint behind the block; `Default` is transparent.
+    pub background: ColorKind,
 }
 
 /// One page of the workspace tree.
@@ -234,6 +308,19 @@ mod tests {
             assert_eq!(BlockKind::try_from_str(kind.as_str()), Some(kind));
         }
         assert_eq!(BlockKind::try_from_str("nope"), None);
+    }
+
+    #[test]
+    fn color_slots_and_strings_round_trip() {
+        for (i, kind) in ColorKind::ALL.iter().enumerate() {
+            assert_eq!(kind.slot(), i as i32);
+            assert_eq!(ColorKind::from_slot(i as i32), Some(*kind));
+            // "" (Default) and every named color survive the DB round-trip
+            assert_eq!(ColorKind::try_from_str(kind.as_str()), Some(*kind));
+        }
+        assert_eq!(ColorKind::from_slot(10), None);
+        assert_eq!(ColorKind::try_from_str("nope"), None);
+        assert_eq!(ColorKind::try_from_str(""), Some(ColorKind::Default));
     }
 
     #[test]

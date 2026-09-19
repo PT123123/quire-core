@@ -36,7 +36,9 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         kind: BlockKind::Paragraph,
         text: text.into(),
         checked: false,
-                marks: Vec::new(),
+        marks: Vec::new(),
+        color: quire::core::ColorKind::Default,
+        background: quire::core::ColorKind::Default,
     }
 }
 
@@ -548,3 +550,48 @@ fn tempfile() -> std::path::PathBuf {
 }
 
 static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ── block colors + cross-page moves (schema v4, ADR-0023) ───────────
+
+#[test]
+fn block_colors_and_page_moves_round_trip() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.apply(&[
+        Change::PageCreated(page(1, "One", None, 1 << 32)),
+        Change::PageCreated(page(2, "Two", None, (1 << 32) + 2)),
+        Change::BlockInserted(block(10, 1, None, 100, "colored")),
+        Change::BlockInserted(block(11, 1, None, 120, "plain")),
+    ])
+    .unwrap();
+
+    // text + background color land in the database...
+    repo.apply(&[Change::BlockColorSet {
+        id: BlockId(10),
+        color: quire::core::ColorKind::Red,
+        background: quire::core::ColorKind::Yellow,
+    }])
+    .unwrap();
+    // ...and survive a full reload
+    let state = repo.load().unwrap();
+    let b = state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap();
+    assert_eq!(b.color, quire::core::ColorKind::Red);
+    assert_eq!(b.background, quire::core::ColorKind::Yellow);
+    let b = state.blocks.iter().find(|b| b.id == BlockId(11)).unwrap();
+    assert_eq!(b.color, quire::core::ColorKind::Default);
+
+    // a cross-page move re-homes the row and its tree position
+    repo.apply(&[Change::BlockMovedToPage {
+        id: BlockId(10),
+        page: PageId(2),
+        parent: None,
+        order: OrderKey(200),
+    }])
+    .unwrap();
+    let state = repo.load().unwrap();
+    let moved = state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap();
+    assert_eq!(moved.page, PageId(2));
+    assert_eq!(moved.order, OrderKey(200));
+    // the color rode along
+    assert_eq!(moved.color, quire::core::ColorKind::Red);
+    assert!(state.blocks.iter().all(|b| b.id != BlockId(10) || b.page == PageId(2)));
+}

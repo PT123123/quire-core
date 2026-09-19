@@ -11,6 +11,7 @@ use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
 
 use super::backup::{self, OpenReport};
+use super::data_location;
 use super::database::{ord_from_db, ord_to_db, Database};
 use super::search_index::{self, Match, SearchRequest};
 
@@ -40,6 +41,11 @@ impl SqliteRepository {
     /// snapshot, and every successful open rotates the snapshot family
     /// (ADR-0015).
     ///
+    /// `path` is taken literally unless it is the pre-D12 default
+    /// (`appdata/quire.db`, relative to the working directory): that one is
+    /// resolved to the per-user library, carrying the old one across on the
+    /// way (ADR-0020). `Self::path` reports where the data actually ended up.
+    ///
     /// Use [`Self::open_with_report`] when the caller needs to say out loud
     /// that data rolled back or that no snapshot could be written.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
@@ -48,11 +54,12 @@ impl SqliteRepository {
 
     /// `open`, plus the recovery facts of this particular startup.
     pub fn open_with_report(path: &Path) -> Result<(Self, OpenReport), StorageError> {
-        let (db, report) = backup::open_with_recovery(path)?;
+        let path = data_location::effective_path(path);
+        let (db, report) = backup::open_with_recovery(&path)?;
         Ok((
             SqliteRepository {
                 db,
-                path: Some(path.to_path_buf()),
+                path: Some(path),
             },
             report,
         ))

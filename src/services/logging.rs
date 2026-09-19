@@ -43,10 +43,13 @@ pub const MAX_BYTES: u64 = 1024 * 1024;
 /// that ended the previous session.
 pub const KEY_SESSION_ABORTED: &str = "last_session_aborted";
 
-/// `appdata/` beside the working directory — where the database has lived all
-/// along, and what `storage::data_location` (D12) replaces.
+/// Where the session's data lives, which is where the log goes: the log is
+/// meant to be found beside the database, and since D12 `storage::data_location`
+/// owns that answer — the per-user library, unless `--db` or `--portable` says
+/// otherwise. Resolving it is what carries an old `appdata/` library across,
+/// log included.
 pub fn data_dir() -> PathBuf {
-    PathBuf::from("appdata")
+    crate::storage::data_location::data_dir()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

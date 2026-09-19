@@ -3,6 +3,7 @@
 // Slint (docs/ARCHITECTURE.md hard rule 2).
 
 pub mod backup;
+pub mod data_location;
 pub mod database;
 pub mod migrations;
 pub mod repository;

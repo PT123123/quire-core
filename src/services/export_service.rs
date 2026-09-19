@@ -113,6 +113,15 @@ fn render(block: &Block, number: &mut usize) -> String {
             *number += 1;
             format!("{}. {text}", *number)
         }
+        // Markdown has no page-embed shape; an in-app link keeps the target
+        // openable after re-import (the app resolves quire://page links).
+        BlockKind::Page => {
+            *number = 0;
+            match block.page_ref {
+                Some(p) => format!("[{text}](quire://page/{})", p.as_u64()),
+                None => text.to_string(),
+            }
+        }
     }
 }
 

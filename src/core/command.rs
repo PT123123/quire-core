@@ -238,6 +238,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 marks: Vec::new(),
                 color: ColorKind::Default,
                 background: ColorKind::Default,
+                page_ref: None,
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
@@ -638,6 +639,7 @@ mod tests {
                 marks: Vec::new(),
                 color: ColorKind::Default,
                 background: ColorKind::Default,
+                page_ref: None,
             });
             doc.set_page_blocks(page, v);
             prev = Some(order);
@@ -742,6 +744,7 @@ mod tests {
             marks: Vec::new(),
             color: ColorKind::Default,
             background: ColorKind::Default,
+            page_ref: None,
         };
         let c1 = doc.alloc_block_id();
         let c2 = doc.alloc_block_id();
@@ -793,6 +796,7 @@ mod tests {
             marks: Vec::new(),
             color: ColorKind::Default,
             background: ColorKind::Default,
+            page_ref: None,
         };
         let a = doc.alloc_block_id();
         let b = doc.alloc_block_id();
@@ -1044,6 +1048,7 @@ mod tests {
             marks: Vec::new(),
             color: ColorKind::Default,
             background: ColorKind::Default,
+            page_ref: None,
         };
         let p = mk(&mut doc, source, "p", 10, None);
         let c = mk(&mut doc, source, "c", 12, Some(p.id));

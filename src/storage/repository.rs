@@ -146,7 +146,7 @@ impl Repository for SqliteRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
-                            b.color, b.bg
+                            b.color, b.bg, b.page_ref
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -163,11 +163,13 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(6)?,
                         r.get::<_, String>(7)?,
                         r.get::<_, String>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
-                let (id, page, parent, ord, kind, text, checked, color, bg) = row.map_err(sql)?;
+                let (id, page, parent, ord, kind, text, checked, color, bg, page_ref) =
+                    row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
                     // string means the file was tampered with or truncated.
@@ -188,6 +190,7 @@ impl Repository for SqliteRepository {
                     marks: Vec::new(),
                     color: ColorKind::try_from_str(&color).unwrap_or(ColorKind::Default),
                     background: ColorKind::try_from_str(&bg).unwrap_or(ColorKind::Default),
+                    page_ref: page_ref.map(|p| PageId(p as u64)),
                 });
             }
         }
@@ -390,8 +393,8 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO blocks (id, page, kind, text, checked, color, bg)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
@@ -400,6 +403,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
             bool_to_db(block.checked),
             block.color.as_str(),
             block.background.as_str(),
+            block.page_ref.map(|p| p.as_u64() as i64),
         ],
     )
     .map_err(sql)?;
@@ -523,6 +527,7 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 marks: marks.clone(),
                 color: ColorKind::Default,
                 background: ColorKind::Default,
+                page_ref: None,
             };
             for m in &block.marks {
                 tx.execute(
@@ -612,6 +617,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockColorSet", id.as_u64())
+        }
+        Change::BlockRefSet { id, page } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET page_ref = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, page.map(|p| p.as_u64() as i64)],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockRefSet", id.as_u64())
         }
         Change::BlockDeleted { id } => {
             let n = tx

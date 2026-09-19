@@ -38,6 +38,10 @@ pub enum Change {
     /// Block-level color pair (text + row background). Both travel together
     /// so one change covers a "Text: Red" or "Background: Blue" pick.
     BlockColorSet { id: BlockId, color: ColorKind, background: ColorKind },
+    /// Point a `Page`-kind block at a page (`None` clears it). The page
+    /// itself is created/destroyed by the surrounding `PageCreated` /
+    /// `PageDeleted` changes in the same batch, not here.
+    BlockRefSet { id: BlockId, page: Option<PageId> },
     /// Storage deletes the block and (recursively) its children; undo
     /// replays the captured subtree as `BlockInserted`s.
     BlockDeleted { id: BlockId },

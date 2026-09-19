@@ -314,6 +314,7 @@ fn a_recovered_database_is_searchable_straight_away() {
             marks: Vec::new(),
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
+        page_ref: None,
             }),
         ])
         .unwrap();
@@ -466,6 +467,7 @@ fn snapshot_cost() {
             marks: Vec::new(),
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
+        page_ref: None,
         })
         .collect();
     {

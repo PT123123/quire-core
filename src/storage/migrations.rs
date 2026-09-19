@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 4;
+pub const CURRENT_VERSION: i32 = 5;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -119,6 +119,14 @@ CREATE INDEX IF NOT EXISTS idx_marks_block ON marks(block);
     // restored from a newer snapshot may already carry them.
     sql: "",
     backfill: Some(add_color_columns),
+}, Migration {
+    version: 5,
+    label: "page-block reference",
+    // `blocks.page_ref` — the page a Page-kind block opens (NULL = none).
+    // Nullable INTEGER, added conditionally like the color columns: a
+    // hand-downgraded or snapshot-restored file may already carry it.
+    sql: "",
+    backfill: Some(add_page_ref_column),
 }];
 
 /// Migration 4 body: add each color column only when it is missing.
@@ -139,6 +147,22 @@ fn add_color_columns(conn: &mut Connection) -> Result<(), StorageError> {
             conn.execute(ddl, [])
                 .map_err(|e| StorageError::Sql(format!("add {name}: {e}")))?;
         }
+    }
+    Ok(())
+}
+
+/// Migration 5 body: add `blocks.page_ref` only when it is missing.
+fn add_page_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'page_ref'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute("ALTER TABLE blocks ADD COLUMN page_ref INTEGER", [])
+            .map_err(|e| StorageError::Sql(format!("add page_ref: {e}")))?;
     }
     Ok(())
 }

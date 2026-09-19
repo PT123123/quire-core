@@ -101,6 +101,7 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
             marks: parsed.marks,
             color: ColorKind::Default,
             background: ColorKind::Default,
+            page_ref: None,
         }));
     }
     changes

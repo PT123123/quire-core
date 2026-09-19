@@ -360,6 +360,7 @@ mod tests {
             marks: Vec::new(),
             color: ColorKind::Default,
             background: ColorKind::Default,
+            page_ref: None,
         });
         state.pages.push(Page {
             id: PageId(1),

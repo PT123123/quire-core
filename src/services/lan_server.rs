@@ -251,6 +251,7 @@ mod tests {
             marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
             color: ColorKind::Default,
             background: ColorKind::Default,
+            page_ref: None,
         });
         state.settings.insert("theme".into(), "dark".into());
         repo.replace_all(&state).unwrap();

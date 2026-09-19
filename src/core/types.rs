@@ -75,10 +75,12 @@ pub enum BlockKind {
     Code,
     Divider,
     Callout,
+    /// An embedded sub-page: `page_ref` names the child page it opens.
+    Page,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 11] = [
+    pub const ALL: [BlockKind; 12] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -90,6 +92,7 @@ impl BlockKind {
         BlockKind::Code,
         BlockKind::Divider,
         BlockKind::Callout,
+        BlockKind::Page,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -105,6 +108,7 @@ impl BlockKind {
             BlockKind::Code => "code",
             BlockKind::Divider => "divider",
             BlockKind::Callout => "callout",
+            BlockKind::Page => "page",
         }
     }
 
@@ -251,6 +255,9 @@ pub struct Block {
     pub color: ColorKind,
     /// Row background tint behind the block; `Default` is transparent.
     pub background: ColorKind,
+    /// The page a `Page` block opens (a child page the block owns).
+    /// Meaningless for every other kind; `None` renders as a missing page.
+    pub page_ref: Option<PageId>,
 }
 
 /// One page of the workspace tree.

@@ -39,6 +39,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         marks: Vec::new(),
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
+        page_ref: None,
     }
 }
 

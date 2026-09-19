@@ -77,12 +77,12 @@ INSERT INTO workspaces (id, name) VALUES (1, 'Workspace');
     // Chinese: the index stores a segmented copy of the text (see
     // storage/search_index.rs), so the tokenizer needs no custom table here.
     sql: r#"
-CREATE VIRTUAL TABLE search_pages USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS search_pages USING fts5(
     title,
     tokenize = 'unicode61'
 );
 
-CREATE VIRTUAL TABLE search_blocks USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS search_blocks USING fts5(
     page_id UNINDEXED,
     text,
     tokenize = 'unicode61'
@@ -96,7 +96,7 @@ Migration {
     // One row per styled range; ranges are byte offsets into the block text.
     // Non-overlapping per (block, kind) is an app-layer invariant.
     sql: r#"
-CREATE TABLE marks (
+CREATE TABLE IF NOT EXISTS marks (
     block INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
     start INTEGER NOT NULL,
     end   INTEGER NOT NULL,
@@ -105,7 +105,7 @@ CREATE TABLE marks (
     PRIMARY KEY (block, start, kind)
 );
 
-CREATE INDEX idx_marks_block ON marks(block);
+CREATE INDEX IF NOT EXISTS idx_marks_block ON marks(block);
 "#,
     backfill: None,
 }];

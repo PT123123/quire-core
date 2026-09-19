@@ -3,7 +3,7 @@
 // atomic — an intermediate state is never observable (SPEC §十八).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, Transaction};
 
@@ -16,6 +16,9 @@ use super::search_index::{self, Match, SearchRequest};
 
 pub struct SqliteRepository {
     db: Database,
+    /// Where `db` lives, for the callers that snapshot it again after open
+    /// (`Self::snapshot`). `None` for the in-memory test database.
+    path: Option<PathBuf>,
 }
 
 fn sql(e: rusqlite::Error) -> StorageError {
@@ -46,18 +49,45 @@ impl SqliteRepository {
     /// `open`, plus the recovery facts of this particular startup.
     pub fn open_with_report(path: &Path) -> Result<(Self, OpenReport), StorageError> {
         let (db, report) = backup::open_with_recovery(path)?;
-        Ok((SqliteRepository { db }, report))
+        Ok((
+            SqliteRepository {
+                db,
+                path: Some(path.to_path_buf()),
+            },
+            report,
+        ))
     }
 
     /// Disposable repository for tests; same schema, no journal.
     pub fn in_memory() -> Result<Self, StorageError> {
         Ok(SqliteRepository {
             db: Database::open_in_memory()?,
+            path: None,
         })
     }
 
     pub fn database(&self) -> &Database {
         &self.db
+    }
+
+    /// The file behind this repository, or `None` for an in-memory one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Write another snapshot into the rotating family (ADR-0019). Startup
+    /// already did one; this is the mid-session one the debounced flush rides
+    /// on, so a corruption costs the edits since the last tick rather than
+    /// since the launch. An in-memory database has nothing to snapshot, and
+    /// saying so is not an error.
+    ///
+    /// Takes the same lock every write takes, so the snapshot is one
+    /// consistent point in the change stream.
+    pub fn snapshot(&self) -> Result<(), StorageError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        backup::snapshot(&self.db, path)
     }
 
     /// Ranked full-text matches (SPEC §二十). Deliberately *not* on the

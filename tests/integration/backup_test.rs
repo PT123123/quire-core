@@ -1,10 +1,12 @@
 // M8 crash-recovery acceptance tests (SPEC §二十五): the rotating `.bak<N>`
-// family written at every open, and the startup path that restores a corrupt
+// family written at every open, its retention windows (D10 — newest `KEEP`
+// generations and `MAX_AGE`), and the startup path that restores a corrupt
 // main file from the newest snapshot that still opens.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use quire::core::persistence::{Change, Repository, StorageError};
 use quire::core::types::{Block, BlockId, BlockKind, OrderKey, Page, PageId};
@@ -23,6 +25,17 @@ fn tempdir() -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Write a file's modified time, which is the only clock `prune` can read: a
+/// retention test that waited out the age window would take a week.
+fn set_modified(path: &Path, when: SystemTime) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
 }
 
 /// Overwrite the body of a database file, keeping the header recognizable —
@@ -72,11 +85,14 @@ fn marker_in(repo: &SqliteRepository) -> Option<String> {
 fn every_open_rotates_the_snapshot_family() {
     let dir = tempdir();
     let path = dir.join("workspace.db");
-    for session in 1..=4 {
+    // One session more than the family holds: the oldest marker has to have
+    // been shifted into the last generation, and nothing beyond it.
+    let sessions = KEEP + 1;
+    for session in 1..=sessions {
         let repo = SqliteRepository::open(&path).unwrap();
         // the snapshot is taken before this session writes, so `.bak1` on the
         // next open holds exactly the previous sessions
-        if session < 4 {
+        if session < sessions {
             repo.apply(&[Change::SettingSet {
                 key: "marker".into(),
                 value: format!("session-{session}"),
@@ -85,12 +101,104 @@ fn every_open_rotates_the_snapshot_family() {
         }
         drop(repo);
     }
-    assert_eq!(Some("session-3"), marker_at(&backup::slot(&path, 1)).as_deref());
-    assert_eq!(Some("session-2"), marker_at(&backup::slot(&path, 2)).as_deref());
-    assert_eq!(Some("session-1"), marker_at(&backup::slot(&path, KEEP)).as_deref());
+    for index in 1..=KEEP {
+        let expected = format!("session-{}", sessions - index);
+        assert_eq!(
+            Some(expected.as_str()),
+            marker_at(&backup::slot(&path, index)).as_deref(),
+            "generation {index}"
+        );
+    }
     assert!(
         !backup::slot(&path, KEEP + 1).exists(),
         "the family stays bounded at {KEEP} generations"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Age out the middle of the family and prune must drop exactly that
+/// generation: the count window alone would keep it, and deleting a snapshot
+/// a weekly-open user still needs would be worse than leaving one behind.
+#[test]
+fn prune_drops_a_generation_older_than_the_age_window() {
+    let dir = tempdir();
+    let path = dir.join("workspace.db");
+    write_marker(&path, "content"); // this open writes `.bak1`
+
+    let now = SystemTime::now();
+    let week_old = now - Duration::from_secs(8 * 24 * 60 * 60);
+    let mut aged = Vec::new();
+    for index in [2usize, 4] {
+        let file = backup::slot(&path, index);
+        std::fs::write(&file, b"snapshot").unwrap();
+        set_modified(&file, week_old);
+        aged.push(file);
+    }
+    let fresh: Vec<PathBuf> = [1usize, 3, 5]
+        .iter()
+        .map(|index| backup::slot(&path, *index))
+        .collect();
+    for file in &fresh {
+        if !file.exists() {
+            std::fs::write(file, b"snapshot").unwrap();
+        }
+    }
+
+    let removed = backup::prune(&path, now).unwrap();
+    assert_eq!(aged, removed);
+    for file in &fresh {
+        assert!(file.exists(), "{file:?} is inside both windows");
+    }
+
+    // and the next open rewrites the family it just trimmed
+    write_marker(&path, "content");
+    assert!(backup::slot(&path, 1).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn prune_bounds_a_family_an_older_setting_left_behind() {
+    let dir = tempdir();
+    let path = dir.join("workspace.db");
+    for index in 1..=KEEP + 2 {
+        std::fs::write(backup::slot(&path, index), b"snapshot").unwrap();
+    }
+    let removed = backup::prune(&path, SystemTime::now()).unwrap();
+    assert_eq!(
+        vec![backup::slot(&path, KEEP + 1), backup::slot(&path, KEEP + 2)],
+        removed,
+        "everything from 1..=KEEP is insurance recover still walks"
+    );
+    // a second pass is quiet: nothing left to say, nothing to delete
+    assert!(backup::prune(&path, SystemTime::now()).unwrap().is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_snapshot_of_a_workspace_with_old_snapshots_keeps_the_new_window() {
+    // The retention policy runs from inside `snapshot`, so a normal session
+    // cannot leave both windows open at once: the aged generation is dropped
+    // while the fresh `.bak1` and its younger neighbours stay.
+    let dir = tempdir();
+    let path = dir.join("workspace.db");
+    write_marker(&path, "one"); // .bak1 = the empty first database
+    write_marker(&path, "two"); // .bak1 = "one", .bak2 = empty
+    // rotation renames, so the aged file lands one generation down
+    let aged = backup::slot(&path, 2);
+    let when = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    set_modified(&aged, when);
+
+    write_marker(&path, "three");
+    assert_eq!(
+        Some("three"),
+        marker_at(&path).as_deref(),
+        "pruning the family must leave the main database alone"
+    );
+    assert_eq!(Some("two"), marker_at(&backup::slot(&path, 1)).as_deref());
+    assert_eq!(Some("one"), marker_at(&backup::slot(&path, 2)).as_deref());
+    assert!(
+        !backup::slot(&path, 3).exists(),
+        "the aged generation is gone"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

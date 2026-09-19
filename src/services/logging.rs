@@ -15,6 +15,14 @@
 // die at any moment, so it only does the cheap write, while the read-modify-
 // write of a metadata file runs on a thread known to be healthy.
 //
+// A panic is also the only unclean end that can write its own evidence. For
+// the rest — a kill, an access violation, power loss — the signal is the
+// absence of the clean-exit record: `main` notes `END_RECORD` after the final
+// flush, and the next `start()` that finds neither a panic report nor that
+// record as the newest one of the family (it may have rotated into `.1`)
+// blames the kill the same way. A family with no record at all is a first
+// run, which is a clean start by definition.
+//
 // `session.meta` is the file-backed twin of the database `metadata` table
 // (`Change::MetaSet`): the logger runs before any database is open, so it
 // cannot use that one. `meta_entries()` hands the entries to whoever opens the
@@ -39,9 +47,21 @@ pub const KEEP: usize = 3;
 /// Rotate once the active file reaches this size (≈2 500 lines).
 pub const MAX_BYTES: u64 = 1024 * 1024;
 
-/// The one metadata key this module writes: a one-line summary of the panic
-/// that ended the previous session.
+/// The one metadata key this module writes: a one-line summary of the unclean
+/// end of the previous session — a panic, stored verbatim from its report, or
+/// the missing clean-exit record (see `UNCLEAN_END_SUMMARY`).
 pub const KEY_SESSION_ABORTED: &str = "last_session_aborted";
+
+/// The record a clean exit writes last: `main` notes it after the final
+/// flush, so a session that ended any other way — killed, crashed natively,
+/// lost power — leaves the newest record something else (M8_FEEDBACK #10).
+pub const END_RECORD: &str = "session ended";
+
+/// What `last_session_aborted` says when the end-record is missing. Worded so
+/// it cannot be mistaken for a panic, which is stored verbatim from its
+/// report and starts "panicked at …".
+const UNCLEAN_END_SUMMARY: &str =
+    "did not shut down cleanly (killed, crashed natively, or lost power)";
 
 /// Where the session's data lives, which is where the log goes: the log is
 /// meant to be found beside the database, and since D12 `storage::data_location`
@@ -156,6 +176,13 @@ fn flatten(text: &str) -> String {
     text.trim_end().replace('\n', "\\n")
 }
 
+/// The message of a record line (`<utc> [level] message`): what follows the
+/// level bracket. A line without one is not a record — a write torn by the
+/// very kill this module exists to catch — and yields `None`.
+fn record_message(line: &str) -> Option<&str> {
+    line.split_once("] ").map(|(_, message)| message)
+}
+
 /// One logger bound to a directory. Files are opened per line: the volume is a
 /// handful of startup lines plus one panic report, so a long-lived handle would
 /// buy nothing and would have to be reopened after every rotation anyway.
@@ -243,11 +270,27 @@ impl Logger {
         Ok(out)
     }
 
+    /// The newest record of the family, as its raw line. Generations shift
+    /// whole (active → `.1` → `.2`), so the lowest-index file that holds any
+    /// line holds the newest records, and its last line is the newest one —
+    /// an end-record that rotated into `.1` is still found. `None` when no
+    /// file in the family holds a record, which is a first-ever run.
+    fn newest_record(&self) -> Option<String> {
+        for index in 0..self.keep.max(1) {
+            if let Ok(text) = std::fs::read_to_string(slot(&self.dir, index)) {
+                if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
+                    return Some(line.to_string());
+                }
+            }
+        }
+        None
+    }
+
     /// The session-start ritual: consume the previous run's panic report and
     /// say so in the log. Returns the summary it recorded, so a caller can see
     /// that an abort happened without reading files.
     pub fn start(&self) -> Option<String> {
-        let aborted = match std::fs::read_to_string(self.panic_report_path()) {
+        let mut aborted = match std::fs::read_to_string(self.panic_report_path()) {
             Ok(text) => {
                 let _ = std::fs::remove_file(self.panic_report_path());
                 // Stored raw: `set_meta` is the one place that escapes, so a
@@ -256,6 +299,24 @@ impl Logger {
             }
             Err(_) => None,
         };
+        if aborted.is_none() {
+            // No panic report: the end-record is the only other signal a
+            // clean exit leaves (main notes it after the final flush), so the
+            // newest record of the family says how the previous session ended.
+            // The check runs before the "session started" line below is
+            // written, so what gets read here is still the previous session's
+            // tail — including one that rotated into `.1`, which
+            // `newest_record` follows. No record at all is a first run, not a
+            // kill; a report takes precedence and skips this entirely, so a
+            // panic is never reported twice.
+            let ended = match self.newest_record() {
+                Some(line) => record_message(&line) == Some(END_RECORD),
+                None => true,
+            };
+            if !ended {
+                aborted = Some(UNCLEAN_END_SUMMARY.to_string());
+            }
+        }
         if let Some(summary) = &aborted {
             let _ = self.set_meta(KEY_SESSION_ABORTED, summary);
             let _ = self.log(Level::Warn, &format!("the previous session aborted: {summary}"));
@@ -604,5 +665,108 @@ mod tests {
         );
         let text = std::fs::read_to_string(slot(&dir, 0)).unwrap();
         assert!(!text.contains("x0"), "old content survived: {text}");
+    }
+
+    #[test]
+    fn an_end_record_makes_the_next_start_clean() {
+        let logger = scratch_logger(MAX_BYTES, KEEP);
+        logger.start();
+        logger.log(Level::Info, END_RECORD).unwrap();
+
+        let next = Logger::new(logger.dir());
+        assert!(
+            next.start().is_none(),
+            "a session whose last record is the end-record ended cleanly"
+        );
+        assert!(next.meta(KEY_SESSION_ABORTED).is_none());
+    }
+
+    #[test]
+    fn a_session_killed_without_the_end_record_is_reported() {
+        let logger = scratch_logger(MAX_BYTES, KEEP);
+        logger.start();
+        logger.log(Level::Info, "mid-session work").unwrap();
+        // …and here the process dies: no panic report, no end-record
+
+        let next = Logger::new(logger.dir());
+        let aborted = next.start().expect("the kill must be reported");
+        assert_eq!(aborted, UNCLEAN_END_SUMMARY, "worded apart from a panic");
+        assert_eq!(
+            next.meta(KEY_SESSION_ABORTED).as_deref(),
+            Some(UNCLEAN_END_SUMMARY)
+        );
+        assert!(next.contents().unwrap().contains(
+            "[warn] the previous session aborted: did not shut down cleanly"
+        ));
+
+        // a session that got no further than its start line is a kill too:
+        // its own start line must not read as a clean end
+        let only_started = scratch_logger(MAX_BYTES, KEEP);
+        only_started.start();
+        let next = Logger::new(only_started.dir());
+        assert!(
+            next.start().is_some(),
+            "the start line of the killed session is not an end-record"
+        );
+    }
+
+    #[test]
+    fn a_panic_report_beats_the_missing_end_record() {
+        let logger = scratch_logger(MAX_BYTES, KEEP);
+        logger.start();
+        // the panicking session writes no end-record either: the report wins,
+        // and the end-record path must not add a second summary
+        logger.report_panic("called `unwrap()` on a `None` value", "src/app/x.rs:7:1");
+
+        let next = Logger::new(logger.dir());
+        let aborted = next.start().expect("the panic is the abort");
+        assert!(aborted.contains("None"), "got {aborted}");
+        assert!(
+            !aborted.contains("did not shut down cleanly"),
+            "the end-record must not double-report: {aborted}"
+        );
+        let all = next.contents().unwrap();
+        assert_eq!(
+            all.matches("the previous session aborted").count(),
+            1,
+            "exactly one abort line: {all}"
+        );
+    }
+
+    #[test]
+    fn an_end_record_that_rotated_still_reads_as_clean() {
+        let logger = scratch_logger(MAX_BYTES, KEEP);
+        logger.start();
+        logger.log(Level::Info, END_RECORD).unwrap();
+        // the next launch rotated the family and died before its first append:
+        // the end-record is now the newest record of the family, and it sits
+        // in `.1` under a missing active file
+        rotate(logger.dir(), KEEP).unwrap();
+        assert!(!slot(logger.dir(), 0).exists(), "setup: the family shifted");
+
+        let next = Logger::new(logger.dir());
+        assert!(next.start().is_none(), "the end-record survives the shift");
+        assert!(next.meta(KEY_SESSION_ABORTED).is_none());
+
+        // the same shift with no end-record is still a kill: the dead
+        // session's records sit in `.1` and say so
+        let killed = scratch_logger(MAX_BYTES, KEEP);
+        killed.start();
+        killed.log(Level::Info, "mid-session work").unwrap();
+        rotate(killed.dir(), KEEP).unwrap();
+        let next = Logger::new(killed.dir());
+        assert!(
+            next.start().is_some(),
+            "a rotated tail without the end-record aborts"
+        );
+    }
+
+    #[test]
+    fn an_empty_log_is_a_first_run_not_an_abort() {
+        let dir = scratch("empty-log");
+        std::fs::write(slot(&dir, 0), "").unwrap();
+        let logger = Logger::new(&dir);
+        assert!(logger.start().is_none());
+        assert!(logger.meta(KEY_SESSION_ABORTED).is_none());
     }
 }

@@ -115,7 +115,9 @@ fn render(block: &Block, number: &mut usize) -> String {
         }
         // Markdown has no page-embed shape; an in-app link keeps the target
         // openable after re-import (the app resolves quire://page links).
-        BlockKind::Page => {
+        // Page (owned child) and Link (unowned reference) export alike —
+        // the ownership difference does not survive Markdown.
+        BlockKind::Page | BlockKind::Link => {
             *number = 0;
             match block.page_ref {
                 Some(p) => format!("[{text}](quire://page/{})", p.as_u64()),

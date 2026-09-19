@@ -77,10 +77,13 @@ pub enum BlockKind {
     Callout,
     /// An embedded sub-page: `page_ref` names the child page it opens.
     Page,
+    /// A link to an existing page: `page_ref` names the target, which the
+    /// block does NOT own — deleting the block leaves the page alone.
+    Link,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 12] = [
+    pub const ALL: [BlockKind; 13] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -93,6 +96,7 @@ impl BlockKind {
         BlockKind::Divider,
         BlockKind::Callout,
         BlockKind::Page,
+        BlockKind::Link,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -109,6 +113,7 @@ impl BlockKind {
             BlockKind::Divider => "divider",
             BlockKind::Callout => "callout",
             BlockKind::Page => "page",
+            BlockKind::Link => "link_to_page",
         }
     }
 

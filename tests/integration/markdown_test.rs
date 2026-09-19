@@ -152,13 +152,24 @@ fn export_covers_every_block_kind() {
 #[test]
 fn export_page_block_writes_an_in_app_link() {
     // a Page block exports as a quire://page link, so re-import keeps the
-    // target openable (the app resolves quire:// links in place)
+    // target openable (the app resolves quire://page links in place). A
+    // Link-to-page block exports the same way — the ownership difference
+    // does not survive Markdown.
     let mut child = block(2, BlockKind::Page, "Project Atlas");
     child.page_ref = Some(PageId(9));
-    let md = export_page(&[block(1, BlockKind::Paragraph, "before"), child]);
-    assert_eq!(md, "before\n\n[Project Atlas](quire://page/9)\n");
+    let mut link = block(3, BlockKind::Link, "Research Notes");
+    link.page_ref = Some(PageId(3));
+    let md = export_page(&[
+        block(1, BlockKind::Paragraph, "before"),
+        child,
+        link,
+    ]);
+    assert_eq!(
+        md,
+        "before\n\n[Project Atlas](quire://page/9)\n\n[Research Notes](quire://page/3)\n"
+    );
     // a dangling reference degrades to plain text
-    let md = export_page(&[block(3, BlockKind::Page, "Ghost")]);
+    let md = export_page(&[block(4, BlockKind::Page, "Ghost")]);
     assert_eq!(md, "Ghost\n");
 }
 

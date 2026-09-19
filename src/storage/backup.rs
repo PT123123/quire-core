@@ -10,20 +10,39 @@
 // the live connection, so it sees committed-into-WAL pages too, and it writes
 // the destination as one self-contained file (no `-wal` to carry along).
 //
-// Loss window: `.bak1` is the database as of the most recent successful open,
-// so a corruption that arrives mid-session costs the edits made since startup.
-// Widening that window (a periodic snapshot during long sessions) is a
-// deliberate omission — see ADR-0015.
+// Retention (D10) is two windows, whichever closes first: the newest `KEEP`
+// generations, and `MAX_AGE`. Count alone keeps a five-year-old `.bak5` alive
+// for a user who opens the app once a week; age alone keeps five copies of a
+// workspace the size of scene D. Age is measured from the file's own modified
+// time, which is when the snapshot was taken.
+//
+// Loss window: `.bak1` is the database as of the most recent snapshot, and a
+// long session now takes one every `PersistenceService`'s period (default ten
+// minutes, services/persistence.rs) instead of only at open — so a corruption
+// that arrives mid-session costs the edits made since the last tick, not since
+// startup. See ADR-0015 for the open-time design and ADR-0019 for this change.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::core::StorageError;
 
 use super::database::Database;
 
-/// How many snapshots to keep. Three answers "the last two opens were both
-/// bad" without doubling the startup write cost.
-pub const KEEP: usize = 3;
+/// How many snapshots to keep. Five answers "the last four opens were all
+/// bad" while the age window below keeps the family from being five copies of
+/// the workspace forever.
+pub const KEEP: usize = 5;
+
+/// A snapshot older than this is dropped even when the family is not full.
+/// Seven days is one working week: the point is to be able to roll back past
+/// "the bad edit I made this morning", not to be a time machine.
+pub const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Generations scanned past `KEEP`, so slots left by an older, larger `KEEP`
+/// cannot survive unbounded: `recover` only walks `1..=KEEP`, so anything
+/// outside that window is unreadable weight.
+const STALE_SLOTS: usize = 2;
 
 /// What an open actually did, so the app can tell the user instead of the
 /// fact dying in a log line (M8_FEEDBACK #4). Both fields describe this open:
@@ -87,7 +106,9 @@ fn io(e: std::io::Error, what: &str) -> StorageError {
     StorageError::Open(format!("{what}: {e}"))
 }
 
-/// Shift the family by one and write the current database into `.bak1`.
+/// Shift the family by one and write the current database into `.bak1`, then
+/// drop what the retention policy no longer wants (`KEEP` generations,
+/// `MAX_AGE` old).
 ///
 /// Takes the same lock every repository write takes, so the snapshot is one
 /// consistent point in the change stream rather than a torn read.
@@ -115,9 +136,44 @@ pub fn snapshot(db: &Database, path: &Path) -> Result<(), StorageError> {
         eprintln!("quire: could not restore synchronous=FULL ({e})");
     }
     match vacuum {
-        Ok(_) | Err(rusqlite::Error::ExecuteReturnedResults) => Ok(()),
+        Ok(_) | Err(rusqlite::Error::ExecuteReturnedResults) => {
+            // Retention is housekeeping, not part of the insurance: a locked
+            // or vanished old generation must not turn a good snapshot into a
+            // reported failure, so the next snapshot tries the cleanup again.
+            let _ = prune(path, SystemTime::now());
+            Ok(())
+        }
         Err(e) => Err(StorageError::Sql(format!("backup to {target:?}: {e}"))),
     }
+}
+
+/// Apply the retention policy and report what went away: generations past
+/// `KEEP` (including any an older, larger `KEEP` left behind), and any inside
+/// the window whose modified time is older than `MAX_AGE` at `now`.
+///
+/// `now` is the caller's clock for the same reason the debounce window takes
+/// one: a test can age a file it just wrote instead of waiting a week.
+pub fn prune(path: &Path, now: SystemTime) -> Result<Vec<PathBuf>, StorageError> {
+    let mut removed = Vec::new();
+    for index in 1..=KEEP + STALE_SLOTS {
+        let file = slot(path, index);
+        let Ok(meta) = file.metadata() else {
+            continue; // no such generation (yet, or consumed by a restore)
+        };
+        let past_count = index > KEEP;
+        // A file that will not say when it changed, or a clock that went
+        // backwards, keeps it: dropping insurance is the worse mistake.
+        let past_age = meta.modified().ok().is_some_and(|when| {
+            now.duration_since(when)
+                .is_ok_and(|age| age > MAX_AGE)
+        });
+        if past_count || past_age {
+            std::fs::remove_file(&file)
+                .map_err(|e| io(e, &format!("prune backup slot {index}")))?;
+            removed.push(file);
+        }
+    }
+    Ok(removed)
 }
 
 /// Move `.bak1` → `.bak2` → … and drop the oldest generation. A missing

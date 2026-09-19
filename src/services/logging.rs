@@ -67,9 +67,9 @@ const UNCLEAN_END_SUMMARY: &str =
 /// meant to be found beside the database, and since D12 `storage::data_location`
 /// owns that answer — the per-user library, unless `--db` or `--portable` says
 /// otherwise. Resolving it is what carries an old `appdata/` library across,
-/// log included.
-pub fn data_dir() -> PathBuf {
-    crate::storage::data_location::data_dir()
+/// log included. `main.rs` hands in what its argument parser read.
+pub fn data_dir(options: &crate::storage::data_location::LaunchOptions) -> PathBuf {
+    crate::storage::data_location::data_dir(options)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -401,10 +401,12 @@ static CURRENT: Mutex<Option<Arc<Logger>>> = Mutex::new(None);
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Install the process logger and the panic hook, and write the startup record.
-/// Called from `main` as one line. A directory we cannot write to is printed and
-/// otherwise ignored: logging is not a reason to refuse to start.
-pub fn init() {
-    install(Logger::new(data_dir()));
+/// Called from `main` as one line, right after the launch flags are parsed —
+/// the log directory is where those flags say the library lives. A directory we
+/// cannot write to is printed and otherwise ignored: logging is not a reason to
+/// refuse to start.
+pub fn init(options: &crate::storage::data_location::LaunchOptions) {
+    install(Logger::new(data_dir(options)));
 }
 
 /// `init` for a chosen directory, returning the logger.

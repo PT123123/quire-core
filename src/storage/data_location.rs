@@ -10,19 +10,22 @@
 // first start that resolves it carries the old library across whole: the main
 // file, its snapshots, its sidecars.
 //
-// Two escape hatches stay, both read from the command line:
+// Two escape hatches stay, both parsed into [`LaunchOptions`] by `main.rs` and
+// handed to this module as data:
 //   --db <path>   use exactly this file (no migration, no per-user directory) —
 //                 what the benchmark harness uses to keep out of real notes;
 //   --portable    the pre-D12 behavior — a library beside the working
 //                 directory. That is what a stick install wants.
+// Together: `--db` wins. The override names the file and everything beside it
+// (log included), so it suppresses the migration; `--portable` then only
+// matters when a run wants the default-shaped library kept in place.
 //
-// The seam is [`effective_path`], which `SqliteRepository::open_with_report`
-// calls. It only ever redirects the *default* path: a caller that named a file
-// for itself is taken at its word, so no test or tool can be rerouted by an
-// environment variable. `main.rs` (off-limits this round) passes the default
-// when it sees no `--db`, which is why the two flags are read here as well;
-// docs/M8_FEEDBACK.md records the lines that would make that reading
-// unnecessary.
+// The module reads no process state: the seam
+// [`effective_path(requested, options)`] is called with what the command line
+// said, so a caller that named a file for itself is taken at its word and no
+// test or tool can be rerouted by an environment variable. `main.rs` resolves
+// once through [`migration`] — which is where it learns to report the move —
+// and hands the finished path to `SqliteRepository::open_at` (M8_FEEDBACK #13).
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -45,6 +48,27 @@ const SNAPSHOT_SLOTS: usize = 8;
 /// The log family, whose owner is `services::logging` (its own `KEEP`). Spelled
 /// out rather than imported: storage must not depend on services.
 const LOG_FILES: [&str; 3] = ["quire.log", "quire.log.1", "quire.log.2"];
+
+/// The launch flags that steer placement, as data rather than as a command
+/// line. `main.rs`'s `parse_launch_args` fills both fields; nothing in this
+/// module looks at `std::env::args()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    /// `--db <path>`: the file to open, whatever the placement rules say.
+    pub db_override: Option<PathBuf>,
+    /// `--portable`: keep the library beside the working directory.
+    pub portable: bool,
+}
+
+impl LaunchOptions {
+    /// Read the two flags off an argument list. The binary's own parser is the
+    /// production caller; this exists so the tests (and anything holding a raw
+    /// argv, like a future CLI wrapper) can state a case as flags.
+    pub fn from_args(argv: &[String]) -> Self {
+        let (db_override, portable) = scan(argv);
+        LaunchOptions { db_override, portable }
+    }
+}
 
 /// What the command line and the environment say about where the library goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +132,8 @@ fn is_default(path: &Path) -> bool {
 }
 
 /// The value of `--db <path>` / `--db=<path>`, and whether `--portable`
-/// appears anywhere in the argument list.
+/// appears anywhere in the argument list — the parsing behind
+/// [`LaunchOptions::from_args`].
 fn scan(args: &[String]) -> (Option<PathBuf>, bool) {
     let mut db = None;
     let mut portable = false;
@@ -130,19 +155,22 @@ fn scan(args: &[String]) -> (Option<PathBuf>, bool) {
     (db, portable)
 }
 
-/// Decide, from an argument list and the per-user library directory (what
+/// Decide, from the launch flags and the per-user library directory (what
 /// [`roaming_root`] returns; `None` when the environment has none), where the
 /// library is. Pure, so the whole policy is testable without touching process
 /// state.
-pub fn decide(args: &[String], requested: &Path, per_user: Option<&Path>) -> Placement {
+///
+/// An explicit `--db` beats everything, including `--portable` and a caller
+/// that was handed a path of its own instead of the default — the override is
+/// the file and the folder beside it, no migration involved.
+pub fn decide(options: &LaunchOptions, requested: &Path, per_user: Option<&Path>) -> Placement {
+    if let Some(path) = &options.db_override {
+        return Placement::Fixed(path.clone());
+    }
     if !is_default(requested) {
         return Placement::Fixed(requested.to_path_buf());
     }
-    let (explicit_db, portable) = scan(args);
-    if let Some(path) = explicit_db {
-        return Placement::Fixed(path);
-    }
-    if portable {
+    if options.portable {
         return Placement::Portable(requested.to_path_buf());
     }
     match per_user {
@@ -155,36 +183,29 @@ pub fn decide(args: &[String], requested: &Path, per_user: Option<&Path>) -> Pla
     }
 }
 
-/// The path `SqliteRepository::open_with_report` should really open: the
-/// caller's, unless it is the default — in which case the placement rules
-/// apply and the legacy library is carried over first.
-pub fn effective_path(requested: &Path) -> PathBuf {
-    let args: Vec<String> = std::env::args().collect();
-    resolve(&args, requested, roaming_root().as_deref())
+/// Where the library is after the placement rules ran: the file to open, plus
+/// the folder it was carried from when a move happened (the old path only stays
+/// in the report while it still names files that travelled — an
+/// already-migrated or empty legacy folder reports `None`).
+pub struct Migration {
+    pub path: PathBuf,
+    pub from: Option<PathBuf>,
 }
 
-/// The directory the session's files live in — the database and the log beside
-/// it (`services::logging`, D9, keeps `quire.log` next to the data). Resolving
-/// it performs the move, because the log is part of the library.
-pub fn data_dir() -> PathBuf {
-    let path = effective_path(&legacy_db());
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    }
+/// [`decide`], plus the one-time move and its report.
+pub fn migration(options: &LaunchOptions, requested: &Path, per_user: Option<&Path>) -> Migration {
+    migrate_placement(&decide(options, requested, per_user))
 }
 
-/// [`effective_path`] with the process state handed in, so the whole policy is
-/// testable without touching the real environment or the real command line.
-/// `per_user` is the directory [`decide`] would move the library into.
+/// The move half of [`migration`], split out so a test can drive it with a
+/// fixture-shaped [`Placement`] no command line would produce.
 ///
 /// A move that fails does not redirect the caller to an empty per-user
 /// library; that would read as "my notes vanished". The old path comes back,
 /// with the reason on stderr, so the session opens the data it can reach.
-pub fn resolve(args: &[String], requested: &Path, per_user: Option<&Path>) -> PathBuf {
-    let placement = decide(args, requested, per_user);
+fn migrate_placement(placement: &Placement) -> Migration {
     let Some(legacy) = placement.legacy().map(Path::to_path_buf) else {
-        return placement.path().to_path_buf();
+        return Migration { path: placement.path().to_path_buf(), from: None };
     };
     let target = placement.path().to_path_buf();
     if let Some(parent) = target.parent() {
@@ -201,7 +222,7 @@ pub fn resolve(args: &[String], requested: &Path, per_user: Option<&Path>) -> Pa
                     moved.len()
                 );
             }
-            target
+            Migration { path: target, from: (!moved.is_empty()).then_some(legacy) }
         }
         Err(e) => {
             eprintln!(
@@ -209,8 +230,25 @@ pub fn resolve(args: &[String], requested: &Path, per_user: Option<&Path>) -> Pa
                 target.display(),
                 legacy.display()
             );
-            legacy
+            Migration { path: legacy, from: None }
         }
+    }
+}
+
+/// The path to really open for `requested`: the caller's, unless it is the
+/// default — in which case the placement rules apply and the legacy library is
+/// carried over first.
+pub fn effective_path(options: &LaunchOptions, requested: &Path) -> PathBuf {
+    migration(options, requested, roaming_root().as_deref()).path
+}
+
+/// The directory the session's files live in — the database and the log beside
+/// it (`services::logging`, D9, keeps `quire.log` next to the data). Resolving
+/// it performs the move, because the log is part of the library.
+pub fn data_dir(options: &LaunchOptions) -> PathBuf {
+    match effective_path(options, &legacy_db()).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
     }
 }
 
@@ -382,6 +420,12 @@ mod tests {
         out
     }
 
+    /// The same case the flags would spell, as [`LaunchOptions`] — production
+    /// parses the command line in `main.rs`; storage only ever sees this.
+    fn options(values: &[&str]) -> LaunchOptions {
+        LaunchOptions::from_args(&args(values))
+    }
+
     fn temp(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -403,8 +447,8 @@ mod tests {
 
     /// The per-user directory, standing in for `%APPDATA%\Quire`.
     ///
-    /// Nothing here may hand the *default-shaped* relative path to `resolve` or
-    /// `migrate_legacy`: those two are the only ones that act on the working
+    /// Nothing here may hand the *default-shaped* relative path to `migration`
+    /// or `migrate_legacy`: those two are the only ones that act on the working
     /// directory, and the crate root has a real `appdata/quire.db` to move.
     fn per_user_dir(tag: &str) -> PathBuf {
         app_data(&temp(tag)).unwrap()
@@ -413,7 +457,7 @@ mod tests {
     #[test]
     fn the_default_now_resolves_to_the_per_user_library() {
         let per_user = per_user_dir("appdata");
-        let placement = decide(&args(&[]), &legacy_db(), Some(&per_user));
+        let placement = decide(&options(&[]), &legacy_db(), Some(&per_user));
         assert_eq!(
             Placement::Roaming {
                 path: per_user.join("quire.db"),
@@ -428,13 +472,17 @@ mod tests {
     #[test]
     fn portable_mode_keeps_the_library_beside_the_working_directory() {
         let per_user = per_user_dir("appdata2");
-        let placement = decide(&args(&["--portable"]), &legacy_db(), Some(&per_user));
+        let placement = decide(&options(&["--portable"]), &legacy_db(), Some(&per_user));
         assert_eq!(Placement::Portable(legacy_db()), placement);
         assert_eq!(None, placement.legacy());
         // a portable run resolves to the same file it was asked for, twice over
         assert_eq!(
             legacy_db(),
-            resolve(&args(&["--portable"]), &legacy_db(), Some(&per_user))
+            migration(&options(&["--portable"]), &legacy_db(), Some(&per_user)).path
+        );
+        assert_eq!(
+            legacy_db(),
+            migration(&options(&["--portable"]), &legacy_db(), Some(&per_user)).path
         );
         let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
@@ -445,12 +493,17 @@ mod tests {
         let chosen = temp("chosen").join("notes.db");
         let flag = format!("--db={}", chosen.display());
         for spell in [
-            args(&["--portable", "--db", &chosen.display().to_string()]),
-            args(&["--portable", flag.as_str()]),
+            options(&["--portable", "--db", &chosen.display().to_string()]),
+            options(&["--portable", flag.as_str()]),
         ] {
             assert_eq!(Placement::Fixed(chosen.clone()), decide(&spell, &legacy_db(), Some(&per_user)));
-            // and `resolve` opens exactly that file, nothing else
-            assert_eq!(chosen, resolve(&spell, &legacy_db(), Some(&per_user)));
+            // and the resolution opens exactly that file, nothing else — twice,
+            // because the run must be idempotent
+            for _ in 0..2 {
+                let run = migration(&spell, &legacy_db(), Some(&per_user));
+                assert_eq!(chosen, run.path);
+                assert_eq!(None, run.from, "--db never migrates anything");
+            }
         }
         let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
@@ -459,10 +512,10 @@ mod tests {
     fn a_caller_that_named_its_own_file_is_never_rerouted() {
         let per_user = per_user_dir("appdata4");
         let mine = temp("mine").join("quire.db");
-        // even with --portable in the argv, an explicit path is taken literally
+        // even with --portable in the launch flags, an explicit path is taken literally
         assert_eq!(
             Placement::Fixed(mine.clone()),
-            decide(&args(&["--portable"]), &mine, Some(&per_user))
+            decide(&options(&["--portable"]), &mine, Some(&per_user))
         );
         // the default is recognised with or without the leading "./"
         assert!(is_default(Path::new("./appdata/quire.db")));
@@ -476,13 +529,51 @@ mod tests {
     fn nowhere_to_move_means_no_move() {
         assert_eq!(
             Placement::Portable(legacy_db()),
-            decide(&args(&[]), &legacy_db(), None)
+            decide(&options(&[]), &legacy_db(), None)
         );
         assert_eq!(None, app_data(Path::new("")));
         assert_eq!(
             PathBuf::from("R:/Roaming/Quire"),
             app_data(Path::new("R:/Roaming")).unwrap()
         );
+    }
+
+    #[test]
+    fn the_first_default_run_moves_once_and_reports_where_from() {
+        let legacy = temp("legacy7");
+        let per_user = temp("per-user7").join("Quire");
+        let db = legacy.join("quire.db");
+        make_db(&db);
+        let placement = Placement::Roaming {
+            path: per_user.join("quire.db"),
+            legacy: db.clone(),
+        };
+
+        let run = migrate_placement(&placement);
+        assert_eq!(per_user.join("quire.db"), run.path);
+        assert_eq!(Some(db.clone()), run.from, "the notice names what moved");
+        // the second run has nothing left to carry
+        let run = migrate_placement(&placement);
+        assert_eq!(per_user.join("quire.db"), run.path);
+        assert_eq!(None, run.from);
+        let _ = fs::remove_dir_all(legacy);
+        let _ = fs::remove_dir_all(per_user.parent().unwrap());
+    }
+
+    #[test]
+    fn the_launch_flags_are_what_the_command_line_spells() {
+        // main.rs parses its own copy of these; the shape must agree with the
+        // flags as users type them, including the exe path at argv[0].
+        let exe_named_db = vec![
+            "--db".to_string(),
+            "C:\\somewhere\\quire.exe".to_string(),
+            "--db=notes/my.db".to_string(),
+            "--portable".to_string(),
+        ];
+        let parsed = LaunchOptions::from_args(&exe_named_db);
+        assert_eq!(PathBuf::from("notes/my.db"), parsed.db_override.unwrap());
+        assert!(parsed.portable);
+        assert_eq!(LaunchOptions::default(), LaunchOptions::from_args(&args(&[])));
     }
 
     #[test]

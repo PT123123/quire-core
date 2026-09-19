@@ -56,12 +56,25 @@ impl SqliteRepository {
 
     /// `open`, plus the recovery facts of this particular startup.
     pub fn open_with_report(path: &Path) -> Result<(Self, OpenReport), StorageError> {
-        let path = data_location::effective_path(path);
-        let (db, report) = backup::open_with_recovery(&path)?;
+        let path = data_location::effective_path(&data_location::LaunchOptions::default(), path);
+        Self::open_at(&path, None)
+    }
+
+    /// `open_with_report` for a path the caller has already resolved through
+    /// [`data_location::migration`], so the placement rules run exactly once
+    /// per start (M8_FEEDBACK #13). `migrated_from` is the old library folder,
+    /// reported back on the open so the app can tell the user where the data
+    /// now lives.
+    pub fn open_at(
+        path: &Path,
+        migrated_from: Option<PathBuf>,
+    ) -> Result<(Self, OpenReport), StorageError> {
+        let (db, mut report) = backup::open_with_recovery(path)?;
+        report.migrated_from = migrated_from;
         Ok((
             SqliteRepository {
                 db,
-                path: Some(path),
+                path: Some(path.to_path_buf()),
             },
             report,
         ))

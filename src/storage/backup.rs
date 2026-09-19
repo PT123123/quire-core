@@ -45,14 +45,22 @@ pub const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const STALE_SLOTS: usize = 2;
 
 /// What an open actually did, so the app can tell the user instead of the
-/// fact dying in a log line (M8_FEEDBACK #4). Both fields describe this open:
-/// a clean startup leaves `recovered_from` empty and `backup_failed` false.
+/// fact dying in a log line (M8_FEEDBACK #4). A clean startup leaves
+/// `recovered_from` empty and `backup_failed` false; `migrated_from` is a fact
+/// to announce rather than a fault.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenReport {
     /// The snapshot that was moved into the main path, because the file that
     /// was there could not be read. Anything non-`None` means the edits made
     /// after the snapshot was taken are gone.
     pub recovered_from: Option<PathBuf>,
+    /// The folder the library was carried out of on this start (D12, ADR-0020)
+    /// — the one-time move from `appdata/` into the per-user library. Not a
+    /// loss and not a fault: it is the fact the user needs in order to find
+    /// old files, which is why it rides along with the recovery notices
+    /// (M8_FEEDBACK #13). Only a caller that resolved the placement itself
+    /// (`SqliteRepository::open_at`) can fill it.
+    pub migrated_from: Option<PathBuf>,
     /// The snapshot this open should have written but could not (read-only or
     /// full directory, a locked file). Startup continues — the database itself
     /// opened — but this session has no insurance behind it.
@@ -61,11 +69,13 @@ pub struct OpenReport {
 
 impl OpenReport {
     /// Nothing to tell: the database opened as-is and the snapshot was written.
+    /// A library move is not a fault, so `migrated_from` is deliberately not
+    /// part of this — it has its own notice.
     pub fn is_clean(&self) -> bool {
         self.recovered_from.is_none() && !self.backup_failed
     }
 
-    /// Print the two facts the user would want to know at startup, in the
+    /// Print the facts the user would want to know at startup, in the
     /// `eprintln!` convention the rest of startup already uses. A UI warning
     /// can be built from the same fields (M8_FEEDBACK #4).
     pub fn log(&self) {
@@ -73,6 +83,12 @@ impl OpenReport {
             eprintln!(
                 "quire: the database was unreadable and was restored from {from:?} — \
                  edits made since then are lost"
+            );
+        }
+        if let Some(from) = &self.migrated_from {
+            eprintln!(
+                "quire: the library moved out of {from:?} to your user profile, and lives \
+                 there from now on"
             );
         }
         if self.backup_failed {
@@ -249,6 +265,7 @@ fn recover(path: &Path, error: StorageError) -> Result<(Database, OpenReport), S
             Ok(db) => {
                 let mut report = OpenReport {
                     recovered_from: Some(candidate.clone()),
+                    migrated_from: None,
                     backup_failed: false,
                 };
                 // The recovered state is what the next failure falls back to,

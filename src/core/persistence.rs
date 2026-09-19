@@ -43,7 +43,13 @@ pub enum Change {
     BlockDeleted { id: BlockId },
 
     MetaSet { key: String, value: String },
+    /// Storage removes the metadata row. Deleting an absent key is a no-op,
+    /// so a consumer can drain a key without a prior read (M8_FEEDBACK #1).
+    MetaDelete { key: String },
     SettingSet { key: String, value: String },
+    /// Storage removes the settings row — the real replacement for
+    /// settings_store's empty-value tombstone (M8_FEEDBACK #1).
+    SettingDelete { key: String },
 }
 
 /// Errors surfaced by a `Repository` implementation.

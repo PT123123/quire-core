@@ -3,13 +3,13 @@
 // is the small key/value layer behind it: theme, sidebar expansion, window
 // size, and whatever else the UI wants to remember.
 //
-// It talks to the frozen `Repository` trait only, through the two change
-// variants the contract already has (`SettingSet`, `MetaSet`), so it works
-// against the SQLite backend and against a test double alike. `settings` and
-// `metadata` are separate tables with separate variants: settings are the
-// user's choices, metadata is the app's note about the session. Which key
-// lives where stays the caller's decision; this module only keeps the two
-// namespaces apart.
+// It talks to the frozen `Repository` trait only, through the change
+// variants the contract has (`SettingSet`/`SettingDelete`, `MetaSet`/
+// `MetaDelete`), so it works against the SQLite backend and against a test
+// double alike. `settings` and `metadata` are separate tables with separate
+// variants: settings are the user's choices, metadata is the app's note about
+// the session. Which key lives where stays the caller's decision; this module
+// only keeps the two namespaces apart.
 //
 // Cost note: reading means `Repository::load()`, which reads every page and
 // block too (≈7 ms for a 10 000-block workspace, docs/PERFORMANCE.md). That is
@@ -22,10 +22,9 @@ use std::sync::Arc;
 use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{PageId, PersistedState};
 
-/// The change contract has no `SettingDelete` / `MetaDelete`, so a removal is
-/// written as an empty value and every read treats empty as absent. A caller
-/// that needs "explicitly set to empty" cannot get it — logged in
-/// docs/M8_FEEDBACK.md (ADR-0015).
+/// Removals are real deletes now (`SettingDelete`/`MetaDelete`); this only
+/// filters rows left behind by databases written before the delete variants
+/// existed, where a removal was stored as an empty value.
 pub const TOMBSTONE: &str = "";
 
 /// One namespace's contents, plus the two keys the UI already edits.
@@ -136,15 +135,21 @@ impl SettingsStore {
     /// writing them: hand these to `PersistenceService` to keep a burst
     /// (window dragging, a slider) inside the debounce window.
     pub fn settings_changes(&self, desired: &Settings) -> Result<Vec<Change>, StorageError> {
-        Ok(diff(self.repo.load()?.settings, desired.to_map(), |key, value| {
-            Change::SettingSet { key, value }
-        }))
+        Ok(diff(
+            self.repo.load()?.settings,
+            desired.to_map(),
+            |key, value| Change::SettingSet { key, value },
+            |key| Change::SettingDelete { key },
+        ))
     }
 
     pub fn meta_changes(&self, desired: &Settings) -> Result<Vec<Change>, StorageError> {
-        Ok(diff(self.repo.load()?.meta, desired.to_map(), |key, value| {
-            Change::MetaSet { key, value }
-        }))
+        Ok(diff(
+            self.repo.load()?.meta,
+            desired.to_map(),
+            |key, value| Change::MetaSet { key, value },
+            |key| Change::MetaDelete { key },
+        ))
     }
 
     pub fn save_settings(&self, desired: &Settings) -> Result<(), StorageError> {
@@ -163,12 +168,14 @@ impl SettingsStore {
     }
 }
 
-/// Add or modify what changed and tombstone what disappeared; unchanged keys
-/// stay out of the batch, so a save of three keys is three changes.
+/// Add or modify what changed and delete what disappeared; unchanged keys
+/// stay out of the batch, so a save of three keys is three changes. A key
+/// deleted in the desired map but absent from `current` emits nothing.
 fn diff(
     current: BTreeMap<String, String>,
     desired: BTreeMap<String, String>,
     make: impl Fn(String, String) -> Change,
+    del: impl Fn(String) -> Change,
 ) -> Vec<Change> {
     let mut changes = Vec::new();
     for (key, value) in &desired {
@@ -176,9 +183,9 @@ fn diff(
             changes.push(make(key.clone(), value.clone()));
         }
     }
-    for (key, value) in &current {
-        if !desired.contains_key(key) && value != TOMBSTONE {
-            changes.push(make(key.clone(), TOMBSTONE.into()));
+    for key in current.keys() {
+        if !desired.contains_key(key) {
+            changes.push(del(key.clone()));
         }
     }
     changes
@@ -223,8 +230,14 @@ mod tests {
                     Change::SettingSet { key, value } => {
                         state.settings.insert(key.clone(), value.clone());
                     }
+                    Change::SettingDelete { key } => {
+                        state.settings.remove(key);
+                    }
                     Change::MetaSet { key, value } => {
                         state.meta.insert(key.clone(), value.clone());
+                    }
+                    Change::MetaDelete { key } => {
+                        state.meta.remove(key);
                     }
                     _ => {}
                 }
@@ -273,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_key_tombstones_it_and_it_reads_back_absent() {
+    fn removing_a_key_deletes_the_row_and_it_reads_back_absent() {
         let repo = FakeRepo::new();
         let store = SettingsStore::new(repo.clone());
         let mut first = Settings::new();
@@ -284,19 +297,20 @@ mod tests {
         let mut second = first.clone();
         second.remove("font");
         assert_eq!(
-            vec![Change::SettingSet {
+            vec![Change::SettingDelete {
                 key: "font".into(),
-                value: TOMBSTONE.into(),
             }],
             store.settings_changes(&second).unwrap()
         );
         store.save_settings(&second).unwrap();
 
         assert_eq!(None, store.load_settings().unwrap().get("font"));
-        // the row is still in the table; only the read hides it
-        assert_eq!(
-            Some(TOMBSTONE),
-            repo.settings().get("font").map(String::as_str)
+        // the row is really gone from the table, not hidden by the read
+        assert_eq!(None, repo.settings().get("font"));
+        // saving again emits nothing: the delete converged
+        assert!(
+            store.settings_changes(&second).unwrap().is_empty(),
+            "no churn after the row is gone"
         );
     }
 
@@ -370,7 +384,7 @@ mod tests {
         settings.set_expanded_pages(&[PageId(12), PageId(3)]);
         assert_eq!(Some("3,12"), settings.get(Settings::KEY_EXPANDED));
         assert_eq!(vec![PageId(3), PageId(12)], settings.expanded_pages());
-        // clearing drops the key, so the next save tombstones it
+        // clearing drops the key, so the next save deletes the row
         settings.set_expanded_pages(&[]);
         assert_eq!(None, settings.get(Settings::KEY_EXPANDED));
         // junk inside the list is skipped, not fatal

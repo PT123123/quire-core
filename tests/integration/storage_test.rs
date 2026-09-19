@@ -209,6 +209,45 @@ fn deletes_cascade_recursively() {
 }
 
 #[test]
+fn meta_and_setting_deletes_remove_their_rows() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.replace_all(&sample_state()).unwrap();
+    repo.apply(&[
+        Change::MetaSet {
+            key: "last_session_aborted".into(),
+            value: "panicked somewhere".into(),
+        },
+        Change::SettingSet {
+            key: "theme".into(),
+            value: "dark".into(),
+        },
+    ])
+    .unwrap();
+    let loaded = repo.load().unwrap();
+    assert_eq!(
+        loaded.meta.get("last_session_aborted").map(String::as_str),
+        Some("panicked somewhere")
+    );
+    assert_eq!(loaded.settings.get("theme").map(String::as_str), Some("dark"));
+
+    // the consumer drains a key without a prior read; deleting an absent
+    // key is a no-op, so the same batch is safe to retry
+    repo.apply(&[
+        Change::MetaDelete {
+            key: "last_session_aborted".into(),
+        },
+        Change::MetaDelete {
+            key: "never_written".into(),
+        },
+        Change::SettingDelete { key: "theme".into() },
+    ])
+    .unwrap();
+    let loaded = repo.load().unwrap();
+    assert!(!loaded.meta.contains_key("last_session_aborted"));
+    assert!(!loaded.settings.contains_key("theme"));
+}
+
+#[test]
 fn failing_batch_rolls_the_whole_thing_back() {
     let repo = SqliteRepository::in_memory().unwrap();
     repo.replace_all(&sample_state()).unwrap();

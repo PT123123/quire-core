@@ -14,8 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
-use crate::core::types::{BlockId, MarkKind, PageId};
-use crate::core::persistence::Repository;
+use crate::core::types::PageId;use crate::core::persistence::Repository;
 use crate::storage::SqliteRepository;
 
 pub const DEFAULT_PORT: u16 = 5877;
@@ -222,6 +221,7 @@ fn respond(mut stream: &TcpStream, status: u16, body: &str) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{BlockId, MarkKind};
     use crate::core::persistence::Repository;
     use crate::services::lan_client::pull_workspace;
     use std::io::Read;

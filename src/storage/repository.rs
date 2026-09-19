@@ -640,6 +640,11 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
             .map_err(sql)?;
             Ok(())
         }
+        Change::MetaDelete { key } => {
+            tx.execute("DELETE FROM metadata WHERE key = ?1", params![key])
+                .map_err(sql)?;
+            Ok(())
+        }
         Change::SettingSet { key, value } => {
             tx.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -647,6 +652,11 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 params![key, value],
             )
             .map_err(sql)?;
+            Ok(())
+        }
+        Change::SettingDelete { key } => {
+            tx.execute("DELETE FROM settings WHERE key = ?1", params![key])
+                .map_err(sql)?;
             Ok(())
         }
     }

@@ -363,17 +363,16 @@ fn settings_round_trip_through_the_sqlite_backend() {
     assert_eq!(vec![PageId(2), PageId(7)], loaded.expanded_pages());
     assert_eq!(Some("7"), store.load_meta().unwrap().get("last.page"));
 
-    // a removal reaches the file as a tombstone and reads back absent
+    // a removal reaches the file as a real delete and reads back absent
     let mut smaller = loaded.clone();
     smaller.remove(Settings::KEY_EXPANDED);
     store.save_settings(&smaller).unwrap();
     let after = store.load_settings().unwrap();
     assert!(after.expanded_pages().is_empty());
     assert_eq!(Some("dark"), after.theme());
-    assert_eq!(
-        Some(""),
-        reopened.load().unwrap().settings.get(Settings::KEY_EXPANDED).map(String::as_str),
-        "the row stays, marked empty"
+    assert!(
+        !reopened.load().unwrap().settings.contains_key(Settings::KEY_EXPANDED),
+        "the row is gone from the table, not just hidden"
     );
     drop(store);
     drop(reopened);

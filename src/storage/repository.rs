@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, Transaction};
 use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState};
 
-use super::backup;
+use super::backup::{self, OpenReport};
 use super::database::{ord_from_db, ord_to_db, Database};
 use super::search_index::{self, Match, SearchRequest};
 
@@ -36,10 +36,17 @@ impl SqliteRepository {
     /// that fails that check is restored from the newest readable `.bak<N>`
     /// snapshot, and every successful open rotates the snapshot family
     /// (ADR-0015).
+    ///
+    /// Use [`Self::open_with_report`] when the caller needs to say out loud
+    /// that data rolled back or that no snapshot could be written.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        Ok(SqliteRepository {
-            db: backup::open_with_recovery(path)?,
-        })
+        Ok(Self::open_with_report(path)?.0)
+    }
+
+    /// `open`, plus the recovery facts of this particular startup.
+    pub fn open_with_report(path: &Path) -> Result<(Self, OpenReport), StorageError> {
+        let (db, report) = backup::open_with_recovery(path)?;
+        Ok((SqliteRepository { db }, report))
     }
 
     /// Disposable repository for tests; same schema, no journal.

@@ -25,6 +25,43 @@ use super::database::Database;
 /// bad" without doubling the startup write cost.
 pub const KEEP: usize = 3;
 
+/// What an open actually did, so the app can tell the user instead of the
+/// fact dying in a log line (M8_FEEDBACK #4). Both fields describe this open:
+/// a clean startup leaves `recovered_from` empty and `backup_failed` false.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenReport {
+    /// The snapshot that was moved into the main path, because the file that
+    /// was there could not be read. Anything non-`None` means the edits made
+    /// after the snapshot was taken are gone.
+    pub recovered_from: Option<PathBuf>,
+    /// The snapshot this open should have written but could not (read-only or
+    /// full directory, a locked file). Startup continues — the database itself
+    /// opened — but this session has no insurance behind it.
+    pub backup_failed: bool,
+}
+
+impl OpenReport {
+    /// Nothing to tell: the database opened as-is and the snapshot was written.
+    pub fn is_clean(&self) -> bool {
+        self.recovered_from.is_none() && !self.backup_failed
+    }
+
+    /// Print the two facts the user would want to know at startup, in the
+    /// `eprintln!` convention the rest of startup already uses. A UI warning
+    /// can be built from the same fields (M8_FEEDBACK #4).
+    pub fn log(&self) {
+        if let Some(from) = &self.recovered_from {
+            eprintln!(
+                "quire: the database was unreadable and was restored from {from:?} — \
+                 edits made since then are lost"
+            );
+        }
+        if self.backup_failed {
+            eprintln!("quire: could not write the startup snapshot; this session is not backed up");
+        }
+    }
+}
+
 /// `<path>.bak<N>`, 1 = newest. The suffix is appended whole so the backup
 /// keeps the main file's extension (`workspace.db.bak1`), which keeps file
 /// pickers and `sqlite3` usable on them.
@@ -104,24 +141,29 @@ fn rotate(path: &Path) -> Result<(), StorageError> {
 /// newest snapshot that opens. On success the restored file is snapshotted
 /// again, so the recovered state is protected immediately.
 ///
+/// The returned `OpenReport` says whether that walk happened and whether the
+/// snapshot could be written; `open_with_recovery` itself stays silent.
+///
 /// A backup is *moved* into the main path rather than copied into it: the
 /// handle the recovery validated is then stale on the next open, and the
 /// moved-away corpse keeps SQLite from replaying the bad file's WAL.
-pub fn open_with_recovery(path: &Path) -> Result<Database, StorageError> {
+pub fn open_with_recovery(path: &Path) -> Result<(Database, OpenReport), StorageError> {
     let db = match Database::open(path) {
         Ok(db) => db,
         Err(error @ StorageError::Corrupt(_)) => return recover(path, error),
         Err(error) => return Err(error),
     };
+    let mut report = OpenReport::default();
     // Backups are insurance, not a startup requirement: a read-only or
-    // full directory must never stop the app from opening.
-    if let Err(e) = snapshot(&db, path) {
-        eprintln!("quire: backup skipped ({e})");
+    // full directory must never stop the app from opening. The report is the
+    // one place this fact is said — saying it here too would double the line.
+    if snapshot(&db, path).is_err() {
+        report.backup_failed = true;
     }
-    Ok(db)
+    Ok((db, report))
 }
 
-fn recover(path: &Path, error: StorageError) -> Result<Database, StorageError> {
+fn recover(path: &Path, error: StorageError) -> Result<(Database, OpenReport), StorageError> {
     for index in 1..=KEEP {
         let candidate = slot(path, index);
         if !candidate.exists() {
@@ -149,12 +191,16 @@ fn recover(path: &Path, error: StorageError) -> Result<Database, StorageError> {
         std::fs::rename(&candidate, path).map_err(|e| io(e, "restore backup"))?;
         match Database::open(path) {
             Ok(db) => {
-                eprintln!("quire: recovered {path:?} from {candidate:?}");
-                let _ = snapshot(&db, path).map_err(|e| {
-                    eprintln!("quire: backup after recovery skipped ({e})");
-                    e
-                });
-                return Ok(db);
+                let mut report = OpenReport {
+                    recovered_from: Some(candidate.clone()),
+                    backup_failed: false,
+                };
+                // The recovered state is what the next failure falls back to,
+                // so protect it right away.
+                if snapshot(&db, path).is_err() {
+                    report.backup_failed = true;
+                }
+                return Ok((db, report));
             }
             Err(reopen) => {
                 eprintln!("quire: restore of {candidate:?} failed ({reopen})");

@@ -270,6 +270,60 @@ fn settings_round_trip_through_the_sqlite_backend() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn a_clean_open_reports_nothing() {
+    let dir = tempdir();
+    let path = dir.join("workspace.db");
+    let (repo, report) = SqliteRepository::open_with_report(&path).unwrap();
+    assert!(
+        report.is_clean(),
+        "a first open restores nothing and backs everything up: {report:?}"
+    );
+    drop(repo);
+    // writing over the same file again is equally quiet
+    write_marker(&path, "still-fine");
+    let (repo, report) = SqliteRepository::open_with_report(&path).unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    drop(repo);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_report_names_the_snapshot_it_rolled_back_to() {
+    let dir = tempdir();
+    let path = dir.join("workspace.db");
+    write_marker(&path, "keep-me");
+    write_marker(&path, "keep-me");
+    corrupt(&path);
+
+    let (repo, report) = SqliteRepository::open_with_report(&path).unwrap();
+    assert_eq!(Some(backup::slot(&path, 1)), report.recovered_from);
+    assert!(!report.backup_failed);
+    assert_eq!(Some("keep-me"), marker_in(&repo).as_deref());
+    drop(repo);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_report_says_when_no_snapshot_could_be_written() {
+    let dir = tempdir();
+    let path = dir.join("workspace.db");
+    write_marker(&path, "content");
+    // rotation has to delete the oldest generation first; a directory sitting
+    // there (non-empty, so even a recursive delete would refuse) fails the
+    // snapshot without touching the main file
+    let blocked = backup::slot(&path, KEEP);
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("in-the-way"), b"x").unwrap();
+
+    let (repo, report) = SqliteRepository::open_with_report(&path).unwrap();
+    assert!(report.backup_failed, "the snapshot was blocked: {report:?}");
+    assert_eq!(None, report.recovered_from);
+    assert_eq!(Some("content"), marker_in(&repo).as_deref());
+    drop(repo);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// One-off cost probe for docs/PERFORMANCE.md, not an assertion: what the
 /// startup snapshot costs against a workspace the size of scene D. Run with
 /// `cargo test --test backup -- --ignored --nocapture`.

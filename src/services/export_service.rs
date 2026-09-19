@@ -1,8 +1,16 @@
 // Markdown export (SPEC §二十六): a page's blocks -> CommonMark text.
 //
-// Scope is the M4 block set. Inline marks (M6) are not modelled yet, so
-// text is written verbatim — `**bold**` inside a block stays literal, which
-// is exactly what `import_service` reads back, so the round trip is lossless.
+// The block set is M4's and the inline marks are M6's: `Mark` spans are
+// written back as `**bold**`, `*italic*`, `` `code` ``, `~~strike~~` and
+// `[text](url)`, so a document that came in through `import_service` leaves
+// through here unchanged — and one the editor built by toggling marks leaves
+// through here with the same text and the same styling.
+//
+// Two shapes cannot be written in CommonMark at all, because its inline tree
+// is strictly nested: marks of *different* kinds that only partially overlap,
+// and styling inside a code span. `normalize` resolves the first by splitting
+// the spans at the overlap (every piece keeps its kind, no text is duplicated
+// or lost) and drops the second, since a code span's content is literal.
 //
 // Layout, chosen so re-importing yields the same block list:
 // - one block per line group, groups separated by a blank line
@@ -11,10 +19,15 @@
 // - child blocks are indented two spaces per depth (the importer accepts and
 //   flattens that indentation)
 // - the file ends with exactly one '\n'; an empty page exports to ""
+//
+// Inline markers in text get escaped; block markers at the start of a line do
+// not (ADR-0016), so a paragraph whose text begins with "- " or "# " comes
+// back as a list item. The editor turns those sequences into blocks as it
+// types, so the shape is rare; the importer's own rule is what keeps the text.
 
 use std::collections::HashMap;
 
-use crate::core::types::{Block, BlockId, BlockKind};
+use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind};
 
 /// Render a page's blocks as Markdown, in display order.
 pub fn export_page(blocks: &[Block]) -> String {
@@ -56,7 +69,12 @@ fn same_list_run(prev: BlockKind, next: BlockKind) -> bool {
 /// One block as Markdown source. `number` is the numbered-list run counter,
 /// reset whenever a non-numbered block appears.
 fn render(block: &Block, number: &mut usize) -> String {
-    let text = block.text.as_str();
+    // a code block is source and a divider has no text: markers stay literal
+    let text = match block.kind {
+        BlockKind::Code | BlockKind::Divider => block.text.clone(),
+        _ => render_inline(&block.text, &block.marks),
+    };
+    let text = text.as_str();
     match block.kind {
         BlockKind::Paragraph => {
             *number = 0;
@@ -108,6 +126,265 @@ fn prefix_lines(marker: &str, text: &str) -> String {
         .map(|l| format!("{marker}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ── inline marks (M6) ───────────────────────────────────────────────
+//
+// The writer is a small state machine over the mark boundaries: at each
+// boundary it closes the spans that end there and opens the ones that start
+// there, then emits the text between. That produces the same nesting the
+// importer reads back — `**a _b_ c**` in, bold-with-italic inside, identical
+// bytes out — without building a tree.
+
+fn render_inline(text: &str, marks: &[Mark]) -> String {
+    let spans = normalize(text, marks);
+    let mut out = String::new();
+    if spans.is_empty() {
+        escape_text(text, &mut out);
+        return out;
+    }
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    for m in &spans {
+        cuts.push(m.start);
+        cuts.push(m.end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut open: Vec<&Mark> = Vec::new();
+    let mut next = 0;
+    for pair in cuts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        while open.last().is_some_and(|m| m.end <= a) {
+            if let Some(m) = open.pop() {
+                closer_into(&mut out, m, text);
+            }
+        }
+        while next < spans.len() && spans[next].start == a {
+            opener_into(&mut out, &spans[next], text);
+            open.push(&spans[next]);
+            next += 1;
+        }
+        // inside a code span the text is verbatim: escaping there would put
+        // the backslash in the document
+        if open.iter().any(|m| m.kind == MarkKind::Code) {
+            out.push_str(&text[a..b]);
+        } else {
+            escape_text(&text[a..b], &mut out);
+        }
+    }
+    while let Some(m) = open.pop() {
+        closer_into(&mut out, m, text);
+    }
+    out
+}
+
+/// The spans as the writer needs them: on char boundaries, contiguous
+/// same-kind runs joined, everything nested or disjoint.
+fn normalize(text: &str, marks: &[Mark]) -> Vec<Mark> {
+    let mut spans: Vec<Mark> = marks
+        .iter()
+        .filter(|m| {
+            m.start < m.end && text.is_char_boundary(m.start) && text.is_char_boundary(m.end)
+        })
+        .cloned()
+        .collect();
+    spans.sort_by_key(|m| (m.start, m.end, kind_order(m.kind)));
+
+    let mut joined: Vec<Mark> = Vec::with_capacity(spans.len());
+    for m in spans {
+        match joined.last_mut() {
+            // two runs of the same kind with nothing between them are written
+            // as one: `**a****b**` leaves a four-marker run in the middle, and
+            // `` `a``b` `` reads back as a single span holding two backticks
+            Some(last) if last.kind == m.kind && last.url == m.url && last.end == m.start => {
+                last.end = m.end;
+            }
+            _ => joined.push(m),
+        }
+    }
+    // a code span's content is literal, so nothing inside it can be styled
+    let code: Vec<(usize, usize)> = joined
+        .iter()
+        .filter(|m| m.kind == MarkKind::Code)
+        .map(|m| (m.start, m.end))
+        .collect();
+    joined.retain(|m| {
+        m.kind == MarkKind::Code
+            || !code
+                .iter()
+                .any(|&(s, e)| s <= m.start && m.end <= e && (s, e) != (m.start, m.end))
+    });
+
+    // split every crossing pair at the overlap; two rounds per span is ample
+    let mut guard = joined.len() * 2 + 4;
+    while let Some((i, j)) = find_crossing(&joined) {
+        if guard == 0 {
+            break;
+        }
+        guard -= 1;
+        let (head, tail) = (joined[i].clone(), joined[j].clone());
+        let mut split = Vec::with_capacity(joined.len() + 2);
+        for (idx, m) in joined.iter().enumerate() {
+            if idx == i {
+                split_pieces(&mut split, m, tail.start);
+            } else if idx == j {
+                split_pieces(&mut split, m, head.end);
+            } else {
+                split.push(m.clone());
+            }
+        }
+        joined = split;
+    }
+    // unreachable unless the guard ran out: a span that still crosses another
+    // has no CommonMark spelling, and writing it half-closed would leak
+    // markers into the text — so it goes, and the text stays exact
+    while let Some((_, j)) = find_crossing(&joined) {
+        joined.remove(j);
+    }
+    // outer span first at each boundary, so nesting matches the importer
+    joined.sort_by_key(|m| (m.start, std::cmp::Reverse(m.end), kind_order(m.kind)));
+    joined
+}
+
+fn kind_order(kind: MarkKind) -> u8 {
+    match kind {
+        MarkKind::Bold => 0,
+        MarkKind::Italic => 1,
+        MarkKind::Strike => 2,
+        MarkKind::Code => 3,
+        MarkKind::Link => 4,
+    }
+}
+
+/// `a` starts inside `b` and ends before it: the one shape the inline tree
+/// cannot hold. Returns the indices to split, `a` first.
+fn find_crossing(spans: &[Mark]) -> Option<(usize, usize)> {
+    for i in 0..spans.len() {
+        for j in 0..spans.len() {
+            let (a, b) = (&spans[i], &spans[j]);
+            if a.start < b.start && b.start < a.end && a.end < b.end {
+                return Some((i, j));
+            }
+        }
+    }
+    None
+}
+
+fn split_pieces(out: &mut Vec<Mark>, m: &Mark, at: usize) {
+    if at <= m.start || at >= m.end {
+        out.push(m.clone());
+        return;
+    }
+    out.push(Mark {
+        start: m.start,
+        end: at,
+        kind: m.kind,
+        url: m.url.clone(),
+    });
+    out.push(Mark {
+        start: at,
+        end: m.end,
+        kind: m.kind,
+        url: m.url.clone(),
+    });
+}
+
+fn opener_into(out: &mut String, m: &Mark, text: &str) {
+    match m.kind {
+        MarkKind::Bold => out.push_str("**"),
+        MarkKind::Italic => out.push('*'),
+        MarkKind::Strike => out.push_str("~~"),
+        MarkKind::Code => {
+            out.push_str(&"`".repeat(code_run(text, m)));
+            if code_pads(text, m) {
+                out.push(' ');
+            }
+        }
+        MarkKind::Link => out.push('['),
+    }
+}
+
+fn closer_into(out: &mut String, m: &Mark, text: &str) {
+    match m.kind {
+        MarkKind::Bold => out.push_str("**"),
+        MarkKind::Italic => out.push('*'),
+        MarkKind::Strike => out.push_str("~~"),
+        MarkKind::Code => {
+            if code_pads(text, m) {
+                out.push(' ');
+            }
+            out.push_str(&"`".repeat(code_run(text, m)));
+        }
+        MarkKind::Link => out.push_str(&format!("]({})", link_target(&m.url))),
+    }
+}
+
+/// A code span needs a fence longer than any run inside it, so content that
+/// holds a backtick still closes on the right marker.
+fn code_run(text: &str, m: &Mark) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text[m.start..m.end].chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest + 1
+}
+
+/// The two contents a code span cannot carry between bare fences: a backtick
+/// at either end would merge with the fence, and the reader strips one space
+/// from each end of a padded span. Both cases take the space wrapper, which
+/// the importer strips back off.
+fn code_pads(text: &str, m: &Mark) -> bool {
+    let content = &text[m.start..m.end];
+    content.starts_with('`')
+        || content.ends_with('`')
+        || (!content.trim().is_empty() && content.starts_with(' ') && content.ends_with(' '))
+}
+
+/// A target with parentheses or spaces needs the `<…>` form, which is the
+/// spelling `import_service` also accepts.
+fn link_target(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    if url.chars().any(|c| matches!(c, '(' | ')' | ' ' | '\t')) {
+        return format!("<{url}>");
+    }
+    url.to_string()
+}
+
+/// Only markers that could still be read as syntax get a backslash, so plain
+/// prose exports as plain prose. `_` is escaped just where it could open
+/// emphasis, which keeps `snake_case` readable; the importer's closer rules
+/// then have no opener left to match, so an escaped run cannot re-form.
+fn escape_text(text: &str, out: &mut String) {
+    let mut rest = text;
+    let mut prev_alnum = false;
+    while let Some(c) = rest.chars().next() {
+        let tail = &rest[c.len_utf8()..];
+        let escape = match c {
+            '*' | '`' | '~' | '[' => true,
+            '_' => !prev_alnum && !opens_space(tail) && tail.contains('_'),
+            '\\' => tail
+                .chars()
+                .next()
+                .is_some_and(|n| n.is_ascii_punctuation()),
+            _ => false,
+        };
+        if escape {
+            out.push('\\');
+        }
+        out.push(c);
+        prev_alnum = c.is_alphanumeric();
+        rest = tail;
+    }
+}
+
+/// An emphasis opener needs something that is not a space right behind it.
+fn opens_space(tail: &str) -> bool {
+    tail.chars().next().is_none_or(|c| c.is_whitespace())
 }
 
 /// Roots sorted by `order`, each followed by its children recursively.

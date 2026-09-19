@@ -107,6 +107,26 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
     changes
 }
 
+/// The rich-paste gate (SPEC §二十七): does the clipboard text carry block
+/// structure worth landing as separate blocks? Plain text — a single
+/// paragraph without markers — stays the TextInput's native plain paste,
+/// which inserts at the caret without disturbing the block layout. Inline
+/// marks alone do not trigger it (pasting `**bold**` mid-sentence should
+/// stay literal), but a lone heading/list/todo/quote/code line does.
+/// Returns the parsed blocks so the caller does not parse twice.
+pub fn parse_if_block_structure(text: &str) -> Option<Vec<ParsedBlock>> {
+    let parsed = parse_markdown(text);
+    let structural = parsed.len() > 1
+        || parsed.first().is_some_and(|b| {
+            b.kind != BlockKind::Paragraph || b.checked
+        });
+    if structural {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
 fn fence_open_marker(body: &str) -> Option<char> {
     let marker = body.chars().next()?;
     if marker != '`' && marker != '~' {

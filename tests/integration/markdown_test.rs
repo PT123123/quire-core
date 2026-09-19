@@ -150,6 +150,32 @@ fn export_covers_every_block_kind() {
 }
 
 #[test]
+fn rich_paste_gate_admits_structure_and_rejects_plain_text() {
+    use quire::services::import_service::parse_if_block_structure;
+
+    // multi-block text lands as blocks
+    let parsed = parse_if_block_structure("# Title\n\nbody").unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].kind, BlockKind::Heading1);
+
+    // a lone non-paragraph line is structure too
+    let parsed = parse_if_block_structure("- one item").unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].kind, BlockKind::Bullet);
+
+    // a todo line is structure even unchecked (the parser wants the
+    // list-marker form)
+    let parsed = parse_if_block_structure("- [ ] buy milk").unwrap();
+    assert_eq!(parsed[0].kind, BlockKind::Todo);
+    assert!(!parsed[0].checked);
+
+    // plain single paragraphs stay native paste, marks included
+    assert!(parse_if_block_structure("just a sentence").is_none());
+    assert!(parse_if_block_structure("**bold** and *italic*").is_none());
+    assert!(parse_if_block_structure("").is_none());
+}
+
+#[test]
 fn export_page_block_writes_an_in_app_link() {
     // a Page block exports as a quire://page link, so re-import keeps the
     // target openable (the app resolves quire://page links in place). A

@@ -482,7 +482,8 @@ pub fn exec(doc: &mut Document, hist: &mut History, page: PageId, cmd: Command) 
 /// Plan several commands against the pre-state and apply them as ONE
 /// history entry (single undo step) — for compound UI actions like the
 /// slash menu (replace text + set type). Commands must be independent
-/// (none may depend on the applied result of an earlier one).
+/// (none may depend on the applied result of an earlier one). No-op
+/// commands (plan → None) are skipped; an all-no-op list is a no-op.
 pub fn exec_all(
     doc: &mut Document,
     hist: &mut History,
@@ -492,9 +493,12 @@ pub fn exec_all(
     let mut apply = Vec::new();
     let mut revert = Vec::new();
     for cmd in cmds {
-        let entry = plan(doc, page, cmd)?;
+        let Some(entry) = plan(doc, page, cmd) else { continue };
         apply.extend(entry.apply);
         revert.extend(entry.revert);
+    }
+    if apply.is_empty() {
+        return None;
     }
     revert.reverse();
     doc.apply(&apply);

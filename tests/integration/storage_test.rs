@@ -249,6 +249,38 @@ fn meta_and_setting_deletes_remove_their_rows() {
 }
 
 #[test]
+fn page_block_reference_round_trips() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.replace_all(&sample_state()).unwrap();
+    repo.apply(&[
+        Change::BlockInserted(block(60, 1, None, 300, "Untitled")),
+        Change::BlockKindSet {
+            id: BlockId(60),
+            kind: BlockKind::Page,
+        },
+        Change::BlockRefSet {
+            id: BlockId(60),
+            page: Some(PageId(2)),
+        },
+    ])
+    .unwrap();
+    let state = repo.load().unwrap();
+    let b = state.blocks.iter().find(|b| b.id == BlockId(60)).unwrap();
+    assert_eq!(b.kind, BlockKind::Page);
+    assert_eq!(b.page_ref, Some(PageId(2)));
+    // clearing the reference persists too, and other blocks stay untouched
+    repo.apply(&[Change::BlockRefSet {
+        id: BlockId(60),
+        page: None,
+    }])
+    .unwrap();
+    let state = repo.load().unwrap();
+    let b = state.blocks.iter().find(|b| b.id == BlockId(60)).unwrap();
+    assert_eq!(b.page_ref, None);
+    assert_eq!(b.kind, BlockKind::Page);
+}
+
+#[test]
 fn failing_batch_rolls_the_whole_thing_back() {
     let repo = SqliteRepository::in_memory().unwrap();
     repo.replace_all(&sample_state()).unwrap();

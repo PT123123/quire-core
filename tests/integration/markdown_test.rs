@@ -150,6 +150,19 @@ fn export_covers_every_block_kind() {
 }
 
 #[test]
+fn export_page_block_writes_an_in_app_link() {
+    // a Page block exports as a quire://page link, so re-import keeps the
+    // target openable (the app resolves quire:// links in place)
+    let mut child = block(2, BlockKind::Page, "Project Atlas");
+    child.page_ref = Some(PageId(9));
+    let md = export_page(&[block(1, BlockKind::Paragraph, "before"), child]);
+    assert_eq!(md, "before\n\n[Project Atlas](quire://page/9)\n");
+    // a dangling reference degrades to plain text
+    let md = export_page(&[block(3, BlockKind::Page, "Ghost")]);
+    assert_eq!(md, "Ghost\n");
+}
+
+#[test]
 fn export_numbered_runs_restart_after_any_other_block() {
     let md = export_page(&[
         block(1, BlockKind::Numbered, "a"),

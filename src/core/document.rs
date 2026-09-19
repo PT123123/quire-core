@@ -167,6 +167,11 @@ impl Document {
                         b.background = *background;
                     }
                 }
+                Change::BlockRefSet { id, page } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.page_ref = *page;
+                    }
+                }
                 _ => {}
             }
         }

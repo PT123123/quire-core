@@ -559,4 +559,41 @@ mod tests {
         // a row whose byte count went missing reads as empty, not as negative
         assert_eq!(format_size(-5), "0 B");
     }
+
+    /// A reading for `docs/PERFORMANCE.md`, not a gate. The pixels are random,
+    /// which no screen is, so this is the store leg of a paste at its worst.
+    /// Run by hand:
+    /// `cargo test --release --lib pasted_screenshot_is_stored -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints a measurement instead of asserting one"]
+    fn a_pasted_screenshot_is_stored_in_the_same_time_it_takes_to_decode() {
+        for (w, h) in [(1920u32, 1080u32), (3840, 2160)] {
+            let mut seed = 0x2545_F491u32;
+            let raster = image::RgbImage::from_fn(w, h, |_, _| {
+                seed = seed
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223);
+                image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8])
+            });
+            let mut out = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(raster)
+                .write_to(&mut out, ImageFormat::Png)
+                .unwrap();
+            let png = out.into_inner();
+
+            let (dir, store) = store();
+            let started = std::time::Instant::now();
+            let att = store
+                .import_bytes(AttachmentId(1), "Pasted image", &png)
+                .expect("a PNG stores");
+            println!(
+                "{w}x{h}: {} ms store, {} PNG bytes -> {} + {} cache ({} files on disk)",
+                started.elapsed().as_millis(),
+                png.len(),
+                att.file,
+                if att.thumb.is_empty() { "-" } else { &att.thumb },
+                fs::read_dir(dir.join("attachments")).unwrap().count()
+            );
+        }
+    }
 }

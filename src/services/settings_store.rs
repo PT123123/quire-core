@@ -361,6 +361,9 @@ mod tests {
             color: ColorKind::Default,
             background: ColorKind::Default,
             page_ref: None,
+            folded: false,
+            attachment: None,
+            img_percent: 100,
         });
         state.pages.push(Page {
             id: PageId(1),

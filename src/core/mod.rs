@@ -12,6 +12,7 @@ pub use document::Document;
 pub use history::History;
 pub use persistence::{Change, Repository, StorageError};
 pub use types::{
-    Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page,
+    PageId, PersistedState,
 };
 

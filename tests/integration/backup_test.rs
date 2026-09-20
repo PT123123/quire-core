@@ -4,7 +4,6 @@
 // main file from the newest snapshot that still opens.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -14,17 +13,13 @@ use quire::services::search_service::SearchService;
 use quire::services::settings_store::{Settings, SettingsStore};
 use quire::storage::backup::{self, KEEP};
 use quire::storage::{Database, SqliteRepository};
+use quire::testing::ScratchDir;
 
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-fn tempdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "quire-backup-{}-{}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A workspace folder that goes away with the test. Each `tempdir()` call used
+/// to be answered by a hand-written `remove_dir_all(&dir).unwrap()` on the
+/// happy path only, so every red run left another one behind.
+fn tempdir() -> ScratchDir {
+    ScratchDir::new("backup")
 }
 
 /// Write a file's modified time, which is the only clock `prune` can read: a
@@ -113,7 +108,6 @@ fn every_open_rotates_the_snapshot_family() {
         !backup::slot(&path, KEEP + 1).exists(),
         "the family stays bounded at {KEEP} generations"
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Age out the middle of the family and prune must drop exactly that
@@ -153,7 +147,6 @@ fn prune_drops_a_generation_older_than_the_age_window() {
     // and the next open rewrites the family it just trimmed
     write_marker(&path, "content");
     assert!(backup::slot(&path, 1).exists());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -171,7 +164,6 @@ fn prune_bounds_a_family_an_older_setting_left_behind() {
     );
     // a second pass is quiet: nothing left to say, nothing to delete
     assert!(backup::prune(&path, SystemTime::now()).unwrap().is_empty());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -200,7 +192,6 @@ fn a_snapshot_of_a_workspace_with_old_snapshots_keeps_the_new_window() {
         !backup::slot(&path, 3).exists(),
         "the aged generation is gone"
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -220,7 +211,6 @@ fn a_snapshot_is_one_self_contained_file() {
     }
     // and it opens on its own, integrity check and all
     assert_eq!(Some("content"), marker_at(&newest).as_deref());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -242,7 +232,6 @@ fn a_corrupt_main_file_is_restored_from_the_newest_snapshot() {
     // and the recovered state is snapshotted again at once
     assert_eq!(Some("keep-me"), marker_at(&backup::slot(&path, 1)).as_deref());
     drop(repo);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -259,7 +248,6 @@ fn recovery_skips_a_snapshot_that_is_also_damaged() {
     let repo = SqliteRepository::open(&path).expect("the older snapshot must work");
     assert_eq!(Some("oldest"), marker_in(&repo).as_deref());
     drop(repo);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -283,7 +271,6 @@ fn with_no_usable_snapshot_the_corrupt_error_and_the_file_both_stay() {
     );
     assert_eq!(before, std::fs::read(&path).unwrap());
     assert!(!Path::new(&format!("{}.corrupt", path.display())).exists());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -315,6 +302,9 @@ fn a_recovered_database_is_searchable_straight_away() {
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
         page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
             }),
         ])
         .unwrap();
@@ -337,7 +327,6 @@ fn a_recovered_database_is_searchable_straight_away() {
     assert_eq!(None, marker_in(&repo).as_deref());
     drop(service);
     drop(repo);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -377,7 +366,6 @@ fn settings_round_trip_through_the_sqlite_backend() {
     );
     drop(store);
     drop(reopened);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -395,7 +383,6 @@ fn a_clean_open_reports_nothing() {
     let (repo, report) = SqliteRepository::open_with_report(&path).unwrap();
     assert!(report.is_clean(), "{report:?}");
     drop(repo);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -411,7 +398,6 @@ fn the_report_names_the_snapshot_it_rolled_back_to() {
     assert!(!report.backup_failed);
     assert_eq!(Some("keep-me"), marker_in(&repo).as_deref());
     drop(repo);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -431,7 +417,6 @@ fn the_report_says_when_no_snapshot_could_be_written() {
     assert_eq!(None, report.recovered_from);
     assert_eq!(Some("content"), marker_in(&repo).as_deref());
     drop(repo);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// One-off cost probe for docs/PERFORMANCE.md, not an assertion: what the
@@ -468,6 +453,9 @@ fn snapshot_cost() {
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
         page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
         })
         .collect();
     {
@@ -532,5 +520,4 @@ fn snapshot_cost() {
     let blocks = repo.load().unwrap().blocks.len();
     println!("repository open (rotate + snapshot): {opened:.3?}, {blocks} blocks loaded");
     drop(repo);
-    let _ = std::fs::remove_dir_all(&dir);
 }

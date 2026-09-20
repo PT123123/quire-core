@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 5;
+pub const CURRENT_VERSION: i32 = 7;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -127,6 +127,34 @@ CREATE INDEX IF NOT EXISTS idx_marks_block ON marks(block);
     // hand-downgraded or snapshot-restored file may already carry it.
     sql: "",
     backfill: Some(add_page_ref_column),
+}, Migration {
+    version: 6,
+    label: "block fold state",
+    // `blocks.folded` — the block's subtree is hidden in the editor
+    // (SPEC §三十七). Added conditionally like the other late columns.
+    sql: "",
+    backfill: Some(add_folded_column),
+}, Migration {
+    version: 7,
+    label: "attachments",
+    // SPEC §三十七 批次 A: the media layer. `attachments` holds one row per
+    // file that lives in the folder next to this database — the row is the
+    // reference, the bytes are on disk. `blocks.attachment` points at it and
+    // carries no FK: a block whose file row is gone must still load, and
+    // render as a missing picture, rather than fail the whole library.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS attachments (
+    id     INTEGER PRIMARY KEY,
+    name   TEXT NOT NULL,
+    file   TEXT NOT NULL,
+    thumb  TEXT NOT NULL DEFAULT '',
+    mime   TEXT NOT NULL DEFAULT '',
+    bytes  INTEGER NOT NULL DEFAULT 0,
+    width  INTEGER NOT NULL DEFAULT 0,
+    height INTEGER NOT NULL DEFAULT 0
+);
+"#,
+    backfill: Some(add_attachment_columns),
 }];
 
 /// Migration 4 body: add each color column only when it is missing.
@@ -163,6 +191,51 @@ fn add_page_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
     if present == 0 {
         conn.execute("ALTER TABLE blocks ADD COLUMN page_ref INTEGER", [])
             .map_err(|e| StorageError::Sql(format!("add page_ref: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migration 6 body: add `blocks.folded` only when it is missing.
+fn add_folded_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'folded'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE blocks ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| StorageError::Sql(format!("add folded: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migration 7 body: the two block-side attachment columns, each added only
+/// when it is missing (same shape as the color pair above).
+fn add_attachment_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    const COLUMNS: [(&str, &str); 2] = [
+        ("attachment", "ALTER TABLE blocks ADD COLUMN attachment INTEGER"),
+        (
+            "img_percent",
+            "ALTER TABLE blocks ADD COLUMN img_percent INTEGER NOT NULL DEFAULT 100",
+        ),
+    ];
+    for (name, ddl) in COLUMNS {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if present == 0 {
+            conn.execute(ddl, [])
+                .map_err(|e| StorageError::Sql(format!("add {name}: {e}")))?;
+        }
     }
     Ok(())
 }
@@ -207,11 +280,12 @@ pub fn ensure_current(conn: &mut Connection) -> Result<(), StorageError> {
 
 /// True when every table the current schema needs is present.
 pub fn check_schema(conn: &Connection) -> Result<(), StorageError> {
-    const TABLES: [&str; 8] = [
+    const TABLES: [&str; 9] = [
         "workspaces",
         "pages",
         "blocks",
         "block_children",
+        "attachments",
         "metadata",
         "settings",
         "search_pages",

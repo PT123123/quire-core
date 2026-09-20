@@ -10,6 +10,7 @@ use quire::core::types::{Block, BlockId, BlockKind, OrderKey, Page, PageId, Pers
 use quire::services::search_service::SearchService;
 use quire::storage::search_index::SearchRequest;
 use quire::storage::SqliteRepository;
+use quire::testing::ScratchDir;
 
 fn page(id: u64, title: &str) -> Page {
     Page {
@@ -35,6 +36,9 @@ fn block(id: u64, page_id: u64, text: &str) -> Block {
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
         page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
     }
 }
 
@@ -347,9 +351,7 @@ fn an_aborted_batch_leaves_the_index_untouched() {
 
 #[test]
 fn a_v1_database_is_backfilled_on_upgrade() {
-    let dir = std::env::temp_dir().join(format!("quire-search-mig-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = ScratchDir::new("search-mig");
     let path = dir.join("search.db");
 
     {
@@ -390,5 +392,4 @@ fn a_v1_database_is_backfilled_on_upgrade() {
     }])
     .unwrap();
     assert!(hits(&repo, "quarter").is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -102,6 +102,9 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
             color: ColorKind::Default,
             background: ColorKind::Default,
             page_ref: None,
+            folded: false,
+            attachment: None,
+            img_percent: 100,
         }));
     }
     changes

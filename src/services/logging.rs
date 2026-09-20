@@ -485,27 +485,36 @@ fn install_panic_hook(logger: Arc<Logger>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::testing::ScratchDir;
 
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-    /// A fresh directory under `%TEMP%`, unique per call.
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "quire-log-{}-{}-{label}",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(label: &str) -> ScratchDir {
+        ScratchDir::new(&format!("log-{label}"))
     }
 
-    fn scratch_logger(max_bytes: u64, keep: usize) -> Arc<Logger> {
-        Arc::new(Logger::with_limits(
-            scratch(&format!("max{max_bytes}-keep{keep}")),
-            max_bytes,
-            keep,
-        ))
+    /// A logger over a scratch directory that is guaranteed to outlive it.
+    ///
+    /// `Logger` opens its files per line, so a directory deleted underneath one
+    /// is not an error — the next line simply recreates it, and the test's
+    /// leftovers reappear in `%TEMP%`. Wrapping the pair keeps the test body
+    /// writing `logger.log(..)` straight through the deref.
+    struct ScratchLogger {
+        logger: Arc<Logger>,
+        _scratch: ScratchDir,
+    }
+
+    impl std::ops::Deref for ScratchLogger {
+        type Target = Logger;
+        fn deref(&self) -> &Logger {
+            &self.logger
+        }
+    }
+
+    fn scratch_logger(max_bytes: u64, keep: usize) -> ScratchLogger {
+        let scratch = scratch(&format!("max{max_bytes}-keep{keep}"));
+        ScratchLogger {
+            logger: Arc::new(Logger::with_limits(scratch.to_path_buf(), max_bytes, keep)),
+            _scratch: scratch,
+        }
     }
 
     #[test]
@@ -597,7 +606,8 @@ mod tests {
 
     #[test]
     fn a_clean_start_reports_no_abort() {
-        let logger = Logger::new(scratch("clean"));
+        let scratch = scratch("clean");
+        let logger = Logger::new(scratch.to_path_buf());
         assert!(logger.start().is_none());
         assert!(logger.meta(KEY_SESSION_ABORTED).is_none());
         assert!(logger.contents().unwrap().contains("[info] session started"));
@@ -605,7 +615,8 @@ mod tests {
 
     #[test]
     fn metadata_survives_a_reopen_and_escapes_newlines() {
-        let logger = Logger::new(scratch("meta"));
+        let scratch = scratch("meta");
+        let logger = Logger::new(scratch.to_path_buf());
         logger
             .set_meta(KEY_SESSION_ABORTED, "first line\nsecond line")
             .unwrap();
@@ -622,10 +633,10 @@ mod tests {
 
     #[test]
     fn panic_hook_reports_through_the_installed_logger() {
-        let dir = scratch("hook");
+        let scratch = scratch("hook");
         // `install_at` is the only thing that needs the process lock; taking it
         // here as well would self-deadlock (the mutex is not reentrant).
-        let logger = init_at(&dir);
+        let logger = init_at(scratch.path());
         assert!(std::panic::catch_unwind(|| panic!("boom from the hook test")).is_err());
         let report = std::fs::read_to_string(logger.panic_report_path()).unwrap();
         assert!(
@@ -637,7 +648,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|current| current.dir() == dir));
+            .is_some_and(|current| current.dir() == scratch.path()));
     }
 
     #[test]
@@ -650,7 +661,8 @@ mod tests {
 
     #[test]
     fn a_missing_directory_is_created_and_a_depth_of_one_truncates() {
-        let dir = scratch("nested").join("not-created");
+        let nested = scratch("nested");
+        let dir = nested.join("not-created");
         rotate(&dir, KEEP).unwrap(); // nothing to shift is not an error
         let logger = Logger::new(&dir);
         for n in 0..6 {
@@ -765,9 +777,10 @@ mod tests {
 
     #[test]
     fn an_empty_log_is_a_first_run_not_an_abort() {
-        let dir = scratch("empty-log");
-        std::fs::write(slot(&dir, 0), "").unwrap();
-        let logger = Logger::new(&dir);
+        let scratch = scratch("empty-log");
+        let dir = scratch.path();
+        std::fs::write(slot(dir, 0), "").unwrap();
+        let logger = Logger::new(dir);
         assert!(logger.start().is_none());
         assert!(logger.meta(KEY_SESSION_ABORTED).is_none());
     }

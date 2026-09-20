@@ -4,7 +4,9 @@
 // trip (Chinese and CRLF).
 
 use quire::core::persistence::Change;
-use quire::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId};
+use quire::core::types::{
+    AttachmentId, Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId,
+};
 use quire::services::export_service::export_page;
 use quire::services::import_service::{import_markdown, parse_inline, parse_markdown, ParsedBlock};
 
@@ -21,6 +23,9 @@ fn block(id: u64, kind: BlockKind, text: &str) -> Block {
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
         page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
     }
 }
 
@@ -200,6 +205,52 @@ fn export_page_block_writes_an_in_app_link() {
 }
 
 #[test]
+fn export_writes_a_picture_as_a_link_that_keeps_its_name() {
+    let pic = Block {
+        attachment: Some(AttachmentId(12)),
+        ..block(5, BlockKind::Image, "sunset.png")
+    };
+    let md = export_page(&[pic.clone()]);
+    assert_eq!(md, "![sunset.png](quire://attachment/12)\n");
+
+    // a picture whose file row is gone still names itself
+    let dangling = Block { attachment: None, ..pic };
+    assert_eq!(export_page(&[dangling]), "![sunset.png]()\n");
+
+    // the importer has no picture shape, so the file name must survive as
+    // text rather than vanish along with the syntax
+    let back = parse_markdown(&md);
+    assert_eq!(back.len(), 1);
+    assert!(back[0].text.contains("sunset.png"), "got {:?}", back[0].text);
+}
+
+#[test]
+fn export_writes_a_file_as_a_link_that_reopens_it() {
+    let file = Block {
+        attachment: Some(AttachmentId(12)),
+        ..block(5, BlockKind::File, "quarterly-report.pdf")
+    };
+    // Unlike a picture, a file degrades to a *link* rather than an image: the
+    // importer parses `[text](url)` into a marked run, so the round trip keeps
+    // both the name and a way back to the bytes.
+    let md = export_page(&[file.clone()]);
+    assert_eq!(md, "[quarterly-report.pdf](quire://attachment/12)\n");
+
+    let dangling = Block { attachment: None, ..file };
+    assert_eq!(export_page(&[dangling]), "quarterly-report.pdf\n");
+
+    let back = parse_markdown(&md);
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].text, "quarterly-report.pdf");
+    assert!(
+        back[0].marks.iter().any(|m| m.kind == MarkKind::Link
+            && m.url == "quire://attachment/12"),
+        "the link has to survive as a mark, got {:?}",
+        back[0]
+    );
+}
+
+#[test]
 fn export_numbered_runs_restart_after_any_other_block() {
     let md = export_page(&[
         block(1, BlockKind::Numbered, "a"),
@@ -233,6 +284,27 @@ fn export_indents_child_blocks_and_keeps_them_under_the_parent() {
     };
     let md = export_page(&[grand, child, parent]);
     assert_eq!(md, "- parent\n  - child\n    - grandchild\n");
+}
+
+/// CommonMark has no collapsible section, so a Toggle leaves as a quote —
+/// the same degradation Callout already accepts. Fold state is editor view
+/// state: it neither reaches the file nor hides anything from it.
+#[test]
+fn export_degrades_a_toggle_but_keeps_its_whole_section() {
+    let parent = Block {
+        folded: true,
+        ..block(1, BlockKind::Toggle, "Notes")
+    };
+    let child = Block {
+        parent: Some(BlockId(1)),
+        ..block(2, BlockKind::Bullet, "inside")
+    };
+    let md = export_page(&[parent, child]);
+    assert_eq!(md, "> Notes\n\n  - inside\n");
+    // and the text comes back on re-import, just no longer collapsible
+    let back = import_markdown(&md, &page(), &mut counter(50));
+    let texts: Vec<String> = blocks_of(&back).into_iter().map(|b| b.text).collect();
+    assert_eq!(texts, vec!["Notes", "inside"]);
 }
 
 #[test]

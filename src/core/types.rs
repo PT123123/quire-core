@@ -34,6 +34,10 @@ macro_rules! id_newtype {
 
 id_newtype!(PageId, "Stable identifier of a page.");
 id_newtype!(BlockId, "Stable identifier of a block.");
+id_newtype!(
+    AttachmentId,
+    "Stable identifier of an attachment (SPEC §三十七 批次 A)."
+);
 
 /// Sibling position. Smaller sorts first; unique among siblings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -80,10 +84,21 @@ pub enum BlockKind {
     /// A link to an existing page: `page_ref` names the target, which the
     /// block does NOT own — deleting the block leaves the page alone.
     Link,
+    /// A collapsible text block (SPEC §三十七 批次 B). Any kind that owns
+    /// children can fold them; `Toggle` is the kind the slash and insert
+    /// menus create for it, rendering the fold triangle as its marker.
+    Toggle,
+    /// An attached picture (SPEC §三十七 批次 A). `attachment` names the
+    /// file; `text` stays empty and `img_percent` is the display width.
+    Image,
+    /// An attached file of any type (SPEC §三十七 批次 A). `attachment` names
+    /// the bytes; `text` holds the display name, which is what the row shows
+    /// when the file row itself is gone.
+    File,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 13] = [
+    pub const ALL: [BlockKind; 16] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -97,6 +112,9 @@ impl BlockKind {
         BlockKind::Callout,
         BlockKind::Page,
         BlockKind::Link,
+        BlockKind::Toggle,
+        BlockKind::Image,
+        BlockKind::File,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -114,6 +132,9 @@ impl BlockKind {
             BlockKind::Callout => "callout",
             BlockKind::Page => "page",
             BlockKind::Link => "link_to_page",
+            BlockKind::Toggle => "toggle",
+            BlockKind::Image => "image",
+            BlockKind::File => "file",
         }
     }
 
@@ -263,6 +284,37 @@ pub struct Block {
     /// The page a `Page` block opens (a child page the block owns).
     /// Meaningless for every other kind; `None` renders as a missing page.
     pub page_ref: Option<PageId>,
+    /// Folded: this block's whole subtree is hidden from the editor rows
+    /// (SPEC §三十七). Meaningless for a childless block, where it is still
+    /// legal to store — the row simply has nothing to hide.
+    pub folded: bool,
+    /// The picture an `Image` block shows (SPEC §三十七 批次 A). `None` for
+    /// every other kind; an `Image` block whose attachment is gone renders as
+    /// a missing file rather than an empty row.
+    pub attachment: Option<AttachmentId>,
+    /// Display width of an `Image` block, in percent of the editor column
+    /// (25 / 50 / 100). Meaningless for other kinds, where it stays 100.
+    pub img_percent: u16,
+}
+
+/// One file that lives next to the database (SPEC §三十七 批次 A, §十八's
+/// reserved `attachments` table). The row is the reference; the bytes are on
+/// disk, and `thumb` is the raster the editor actually loads — a picture
+/// never reaches the UI at its original size (§二十二's memory budget).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub id: AttachmentId,
+    /// Name shown to the user: the picked file's stem, not the stored name.
+    pub name: String,
+    /// File name inside the attachments folder, as stored.
+    pub file: String,
+    /// Downscaled copy of `file`, or `""` when `file` is already small enough.
+    pub thumb: String,
+    pub mime: String,
+    pub bytes: i64,
+    /// Original pixel size, 0 when unknown (a file we cannot decode).
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One page of the workspace tree.

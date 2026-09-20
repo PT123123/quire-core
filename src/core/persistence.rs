@@ -10,7 +10,8 @@
 use std::fmt;
 
 use super::types::{
-    Block, BlockId, BlockKind, ColorKind, Mark, OrderKey, Page, PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Mark, OrderKey, Page, PageId,
+    PersistedState,
 };
 
 /// Ordered list of persisted mutations.
@@ -28,6 +29,9 @@ pub enum Change {
     BlockTextSet { id: BlockId, text: String },
     BlockKindSet { id: BlockId, kind: BlockKind },
     BlockCheckedSet { id: BlockId, checked: bool },
+    /// Fold state (SPEC §三十七): the block's subtree is hidden in the editor
+    /// while set. Persisted view state, like `PageExpandedSet`.
+    BlockFoldedSet { id: BlockId, folded: bool },
     /// Replace the block's whole inline-mark list (M6).
     BlockMarksSet { id: BlockId, marks: Vec<Mark> },
     BlockMoved { id: BlockId, parent: Option<BlockId>, order: OrderKey },
@@ -42,6 +46,19 @@ pub enum Change {
     /// itself is created/destroyed by the surrounding `PageCreated` /
     /// `PageDeleted` changes in the same batch, not here.
     BlockRefSet { id: BlockId, page: Option<PageId> },
+    /// Point an `Image` block at an attachment (SPEC §三十七 批次 A). The
+    /// file row itself arrives in the same batch as `AttachmentAdded`; undo
+    /// clears this pointer and leaves the file alone (see `AttachmentAdded`).
+    BlockAttachmentSet {
+        id: BlockId,
+        attachment: Option<AttachmentId>,
+    },
+    /// Display width of an `Image` block, in percent of the editor column.
+    BlockImageWidthSet { id: BlockId, percent: u16 },
+    /// Upsert one attachment row. The bytes are already on disk by the time
+    /// this is recorded, so undo removes the *reference* only and never the
+    /// file: an orphaned picture is recoverable, a deleted one is not.
+    AttachmentAdded(Attachment),
     /// Storage deletes the block and (recursively) its children; undo
     /// replays the captured subtree as `BlockInserted`s.
     BlockDeleted { id: BlockId },

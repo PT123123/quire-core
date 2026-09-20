@@ -135,6 +135,11 @@ impl Document {
                         b.checked = *checked;
                     }
                 }
+                Change::BlockFoldedSet { id, folded } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.folded = *folded;
+                    }
+                }
                 Change::BlockMarksSet { id, marks } => {
                     if let Some(b) = self.block_mut(*id) {
                         b.marks = marks.clone();
@@ -183,6 +188,16 @@ impl Document {
                         b.page_ref = *page;
                     }
                 }
+                Change::BlockAttachmentSet { id, attachment } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.attachment = *attachment;
+                    }
+                }
+                Change::BlockImageWidthSet { id, percent } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.img_percent = *percent;
+                    }
+                }
                 _ => {}
             }
         }
@@ -223,6 +238,9 @@ mod tests {
             color: ColorKind::Default,
             background: ColorKind::Default,
             page_ref: None,
+            folded: false,
+            attachment: None,
+            img_percent: 100,
         }
     }
 

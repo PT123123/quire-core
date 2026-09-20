@@ -93,6 +93,13 @@ fn render(block: &Block, number: &mut usize) -> String {
             *number = 0;
             prefix_lines("> ", text)
         }
+        // CommonMark has no fold syntax, so a toggle degrades exactly like a
+        // callout does (SPEC §二十六); the subtree rides along indented,
+        // which is the caller's depth walk, and import never restores the fold.
+        BlockKind::Toggle => {
+            *number = 0;
+            prefix_lines("> ", text)
+        }
         BlockKind::Code => {
             *number = 0;
             format!("```\n{text}\n```")
@@ -121,6 +128,27 @@ fn render(block: &Block, number: &mut usize) -> String {
             *number = 0;
             match block.page_ref {
                 Some(p) => format!("[{text}](quire://page/{})", p.as_u64()),
+                None => text.to_string(),
+            }
+        }
+        // The bytes themselves are not Markdown's business: `text` is the file
+        // name and the target is the in-app reference, same shape as a Page
+        // block's link. Re-import keeps the name as a link, not a picture.
+        BlockKind::Image => {
+            *number = 0;
+            match block.attachment {
+                Some(a) => format!("![{text}](quire://attachment/{})", a.as_u64()),
+                None => format!("![{text}]()"),
+            }
+        }
+        // A file has no Markdown shape either, and unlike a picture a link is
+        // the right degradation: the importer parses `[text](url)` into a
+        // paragraph carrying a link mark, so the name survives *and* stays
+        // clickable inside the app.
+        BlockKind::File => {
+            *number = 0;
+            match block.attachment {
+                Some(a) => format!("[{text}](quire://attachment/{})", a.as_u64()),
                 None => text.to_string(),
             }
         }

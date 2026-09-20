@@ -124,9 +124,8 @@ mod tests {
 
     #[test]
     fn integrity_check_rejects_a_mangled_file() {
-        let dir = std::env::temp_dir().join(format!("quire-integrity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("corp.db");
+        let scratch = crate::testing::ScratchDir::new("integrity");
+        let path = scratch.join("corp.db");
         {
             let db = Database::open(&path).unwrap();
             drop(db);
@@ -145,6 +144,5 @@ mod tests {
             "expected Corrupt, got {:?}",
             result.err().map(|e| e.to_string())
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

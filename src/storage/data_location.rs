@@ -413,6 +413,7 @@ fn move_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::ScratchDir;
 
     fn args(values: &[&str]) -> Vec<String> {
         let mut out = vec!["quire".to_string()];
@@ -426,17 +427,8 @@ mod tests {
         LaunchOptions::from_args(&args(values))
     }
 
-    fn temp(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "quire-location-{}-{tag}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn temp(tag: &str) -> ScratchDir {
+        ScratchDir::new(&format!("location-{tag}"))
     }
 
     /// A database the move will accept: `migrate_legacy` opens the copy before
@@ -450,14 +442,28 @@ mod tests {
     /// Nothing here may hand the *default-shaped* relative path to `migration`
     /// or `migrate_legacy`: those two are the only ones that act on the working
     /// directory, and the crate root has a real `appdata/quire.db` to move.
-    fn per_user_dir(tag: &str) -> PathBuf {
-        app_data(&temp(tag)).unwrap()
+    ///
+    /// The root travels with the path derived from it: the scratch guard that
+    /// deletes the stand-in `%APPDATA%` has to outlive every use of it, so the
+    /// two are one value rather than a pair the caller could pull apart.
+    struct Root {
+        _appdata: ScratchDir,
+        per_user: PathBuf,
+    }
+
+    fn per_user_dir(tag: &str) -> Root {
+        let appdata = temp(tag);
+        Root {
+            per_user: app_data(&appdata).unwrap(),
+            _appdata: appdata,
+        }
     }
 
     #[test]
     fn the_default_now_resolves_to_the_per_user_library() {
-        let per_user = per_user_dir("appdata");
-        let placement = decide(&options(&[]), &legacy_db(), Some(&per_user));
+        let root = per_user_dir("appdata");
+        let per_user = &root.per_user;
+        let placement = decide(&options(&[]), &legacy_db(), Some(per_user));
         assert_eq!(
             Placement::Roaming {
                 path: per_user.join("quire.db"),
@@ -466,63 +472,64 @@ mod tests {
             placement
         );
         assert_eq!(Some(legacy_db().as_path()), placement.legacy());
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 
     #[test]
     fn portable_mode_keeps_the_library_beside_the_working_directory() {
-        let per_user = per_user_dir("appdata2");
-        let placement = decide(&options(&["--portable"]), &legacy_db(), Some(&per_user));
+        let root = per_user_dir("appdata2");
+        let per_user = &root.per_user;
+        let placement = decide(&options(&["--portable"]), &legacy_db(), Some(per_user));
         assert_eq!(Placement::Portable(legacy_db()), placement);
         assert_eq!(None, placement.legacy());
         // a portable run resolves to the same file it was asked for, twice over
         assert_eq!(
             legacy_db(),
-            migration(&options(&["--portable"]), &legacy_db(), Some(&per_user)).path
+            migration(&options(&["--portable"]), &legacy_db(), Some(per_user)).path
         );
         assert_eq!(
             legacy_db(),
-            migration(&options(&["--portable"]), &legacy_db(), Some(&per_user)).path
+            migration(&options(&["--portable"]), &legacy_db(), Some(per_user)).path
         );
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 
     #[test]
     fn an_explicit_db_beats_both_the_environment_and_portable() {
-        let per_user = per_user_dir("appdata3");
-        let chosen = temp("chosen").join("notes.db");
+        let root = per_user_dir("appdata3");
+        let per_user = &root.per_user;
+        let chosen_dir = temp("chosen");
+        let chosen = chosen_dir.join("notes.db");
         let flag = format!("--db={}", chosen.display());
         for spell in [
             options(&["--portable", "--db", &chosen.display().to_string()]),
             options(&["--portable", flag.as_str()]),
         ] {
-            assert_eq!(Placement::Fixed(chosen.clone()), decide(&spell, &legacy_db(), Some(&per_user)));
+            assert_eq!(Placement::Fixed(chosen.clone()), decide(&spell, &legacy_db(), Some(per_user)));
             // and the resolution opens exactly that file, nothing else — twice,
             // because the run must be idempotent
             for _ in 0..2 {
-                let run = migration(&spell, &legacy_db(), Some(&per_user));
+                let run = migration(&spell, &legacy_db(), Some(per_user));
                 assert_eq!(chosen, run.path);
                 assert_eq!(None, run.from, "--db never migrates anything");
             }
         }
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 
     #[test]
     fn a_caller_that_named_its_own_file_is_never_rerouted() {
-        let per_user = per_user_dir("appdata4");
-        let mine = temp("mine").join("quire.db");
+        let root = per_user_dir("appdata4");
+        let per_user = &root.per_user;
+        let mine_dir = temp("mine");
+        let mine = mine_dir.join("quire.db");
         // even with --portable in the launch flags, an explicit path is taken literally
         assert_eq!(
             Placement::Fixed(mine.clone()),
-            decide(&options(&["--portable"]), &mine, Some(&per_user))
+            decide(&options(&["--portable"]), &mine, Some(per_user))
         );
         // the default is recognised with or without the leading "./"
         assert!(is_default(Path::new("./appdata/quire.db")));
         assert!(is_default(Path::new("appdata/quire.db")));
         assert!(!is_default(Path::new("other/quire.db")));
         assert!(!is_default(&mine));
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 
     #[test]
@@ -541,7 +548,8 @@ mod tests {
     #[test]
     fn the_first_default_run_moves_once_and_reports_where_from() {
         let legacy = temp("legacy7");
-        let per_user = temp("per-user7").join("Quire");
+        let per_user_root = temp("per-user7");
+        let per_user = per_user_root.join("Quire");
         let db = legacy.join("quire.db");
         make_db(&db);
         let placement = Placement::Roaming {
@@ -556,8 +564,6 @@ mod tests {
         let run = migrate_placement(&placement);
         assert_eq!(per_user.join("quire.db"), run.path);
         assert_eq!(None, run.from);
-        let _ = fs::remove_dir_all(legacy);
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 
     #[test]
@@ -579,7 +585,8 @@ mod tests {
     #[test]
     fn the_whole_library_moves_in_one_pass() {
         let legacy = temp("legacy");
-        let per_user = temp("per-user").join("Quire");
+        let per_user_root = temp("per-user");
+        let per_user = per_user_root.join("Quire");
         let db = legacy.join("quire.db");
         make_db(&db);
         fs::write(backup::slot(&db, 1), b"snapshot 1").unwrap();
@@ -613,15 +620,13 @@ mod tests {
         assert!(!legacy.join("quire.log").exists());
         assert!(legacy.join("unrelated.txt").exists());
         assert!(is_migrated(&target));
-        for stale in [legacy, per_user] {
-            let _ = fs::remove_dir_all(stale);
-        }
     }
 
     #[test]
     fn a_second_run_does_not_move_a_library_that_is_already_live() {
         let legacy = temp("legacy2");
-        let per_user = temp("per-user2").join("Quire");
+        let per_user_root = temp("per-user2");
+        let per_user = per_user_root.join("Quire");
         let db = legacy.join("quire.db");
         make_db(&db);
         let target = per_user.join("quire.db");
@@ -634,14 +639,13 @@ mod tests {
         assert!(migrate_legacy(&db, &target).unwrap().is_empty());
         assert_eq!(b"edited after the move".as_slice(), fs::read(&target).unwrap());
         assert_eq!(b"stale".as_slice(), fs::read(&db).unwrap());
-        let _ = fs::remove_dir_all(legacy);
-        let _ = fs::remove_dir_all(per_user);
     }
 
     #[test]
     fn a_database_the_copy_rejects_is_left_where_recovery_can_reach_it() {
         let legacy = temp("legacy6");
-        let per_user = temp("per-user6").join("Quire");
+        let per_user_root = temp("per-user6");
+        let per_user = per_user_root.join("Quire");
         let db = legacy.join("quire.db");
         // not a database: the copy is made, opened, refused — and the source
         // stays, so `open_with_recovery` can still roll back to the snapshot
@@ -658,20 +662,17 @@ mod tests {
             b"the readable one".as_slice(),
             fs::read(backup::slot(&db, 1)).unwrap()
         );
-        let _ = fs::remove_dir_all(legacy);
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 
     #[test]
     fn an_empty_legacy_folder_is_not_a_migration() {
         let legacy = temp("legacy3");
-        let per_user = temp("per-user3").join("Quire");
+        let per_user_root = temp("per-user3");
+        let per_user = per_user_root.join("Quire");
         let target = per_user.join("quire.db");
         assert!(migrate_legacy(&legacy.join("quire.db"), &target).unwrap().is_empty());
         assert!(!target.exists());
         assert!(!is_migrated(&target));
-        let _ = fs::remove_dir_all(legacy);
-        let _ = fs::remove_dir_all(per_user);
     }
 
     #[test]
@@ -682,15 +683,14 @@ mod tests {
         fs::write(backup::slot(&db, 1), b"snapshot").unwrap();
         // a *file* where the per-user directory belongs: nothing can be created
         // inside it, so the whole move fails
-        let blocker = temp("blocked").join("blocker");
+        let blocked = temp("blocked");
+        let blocker = blocked.join("blocker");
         fs::write(&blocker, b"not a directory").unwrap();
         let target = blocker.join("Quire").join("quire.db");
 
         assert!(migrate_legacy(&db, &target).is_err());
         assert_eq!(b"my notes".as_slice(), fs::read(&db).unwrap());
         assert!(backup::slot(&db, 1).exists(), "nothing moves before the destination is ready");
-        let _ = fs::remove_dir_all(legacy);
-        let _ = fs::remove_dir_all(blocker.parent().unwrap());
     }
 
     #[test]
@@ -699,7 +699,8 @@ mod tests {
         // the moved bytes must be a database the app can open, not a copy
         // SQLite rejects — the same check `open_with_recovery` runs at startup
         let legacy = temp("legacy5");
-        let per_user = temp("per-user5").join("Quire");
+        let per_user_root = temp("per-user5");
+        let per_user = per_user_root.join("Quire");
         let db = legacy.join("quire.db");
         {
             let repo = crate::storage::SqliteRepository::open(&db).unwrap();
@@ -719,7 +720,5 @@ mod tests {
             reopened.load().unwrap().settings.get("theme").map(String::as_str)
         );
         assert_eq!(Some(target.as_path()), reopened.path());
-        let _ = fs::remove_dir_all(legacy);
-        let _ = fs::remove_dir_all(per_user.parent().unwrap());
     }
 }

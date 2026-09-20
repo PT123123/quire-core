@@ -10,11 +10,12 @@ use std::process::{Command, Stdio};
 
 use quire::core::persistence::{Change, Repository, StorageError};
 use quire::core::types::{
-    Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState,
 };
 use quire::storage::backup;
 use quire::storage::migrations;
 use quire::storage::SqliteRepository;
+use quire::testing::ScratchDir;
 
 fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
     Page {
@@ -40,6 +41,9 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
         page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
     }
 }
 
@@ -338,6 +342,257 @@ fn migrations_upgrade_a_v0_database_and_are_idempotent() {
     assert!(repo.load().unwrap().pages.is_empty());
 }
 
+/// The v5 -> v6 step is a conditional ALTER, so it has to be tested against
+/// a database that really is missing the column, not a fresh one.
+#[test]
+fn the_v6_step_adds_folded_to_a_v5_database() {
+    let dir = tempfile();
+    let path = dir.join("fold.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        // roll the schema back to what version 5 shipped
+        conn.execute_batch(
+            "ALTER TABLE blocks DROP COLUMN folded; PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded)
+             VALUES (1, 'Old', NULL, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocks (id, page, kind, text, checked, color, bg)
+             VALUES (10, 1, 'paragraph', 'from v5', 0, '', '')",
+            [],
+        )
+        .unwrap();
+        // block_children rows are what load() joins on
+        conn.execute("INSERT INTO block_children (block, parent, ord) VALUES (10, NULL, 100)", [])
+            .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 5);
+        // control: the fixture must really be missing the column, or this
+        // test would pass without the v6 step ever running
+        let pre: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'folded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0, "the rolled-back schema has no folded column");
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), migrations::CURRENT_VERSION);
+        // the pre-upgrade row reads as unfolded rather than failing the load
+        let folded: i64 = conn
+            .query_row("SELECT folded FROM blocks WHERE id = 10", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(folded, 0);
+        migrations::ensure_current(&mut conn).unwrap();
+    }
+    SqliteRepository::open(&path).unwrap().load().unwrap();
+}
+
+/// Like the v6 step, v7 is a conditional ALTER plus a CREATE TABLE, so it has
+/// to be tested against a database that really lacks both.
+#[test]
+fn the_v7_step_adds_attachments_to_a_v6_database() {
+    let dir = tempfile();
+    let path = dir.join("attach.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        // roll the schema back to what version 6 shipped
+        conn.execute_batch(
+            "DROP TABLE attachments;
+             ALTER TABLE blocks DROP COLUMN attachment;
+             ALTER TABLE blocks DROP COLUMN img_percent;
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded)
+             VALUES (1, 'Old', NULL, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocks (id, page, kind, text, checked, color, bg, folded)
+             VALUES (10, 1, 'paragraph', 'from v6', 0, '', '', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO block_children (block, parent, ord) VALUES (10, NULL, 100)", [])
+            .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 6);
+        // control: all three things v7 adds must really be absent, or this
+        // test would pass without the step ever running
+        let tables: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_table_info('attachments')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "the rolled-back schema has no attachments table");
+        for column in ["attachment", "img_percent"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = ?1",
+                    [column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "the rolled-back schema has no {column} column");
+        }
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), migrations::CURRENT_VERSION);
+        // the pre-upgrade block reads as a plain paragraph with a default
+        // width, not as a corrupt row
+        let (att, pct): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT attachment, img_percent FROM blocks WHERE id = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(att, None);
+        assert_eq!(pct, 100);
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let state = repo.load().unwrap();
+    let old = state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap();
+    assert_eq!(old.attachment, None);
+    assert_eq!(old.img_percent, 100);
+    assert!(repo.load_attachments().unwrap().is_empty());
+}
+
+#[test]
+fn attachments_round_trip_and_a_dangling_reference_still_loads() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.apply(&[
+        Change::PageCreated(page(1, "One", None, 1 << 32)),
+        Change::AttachmentAdded(Attachment {
+            id: AttachmentId(4),
+            name: "Sunset photo.png".into(),
+            file: "4.png".into(),
+            thumb: "4.cache.png".into(),
+            mime: "image/png".into(),
+            bytes: 12345,
+            width: 1280,
+            height: 720,
+        }),
+        Change::BlockInserted(Block {
+            kind: BlockKind::Image,
+            attachment: Some(AttachmentId(4)),
+            img_percent: 50,
+            ..block(10, 1, None, 100, "Sunset photo.png")
+        }),
+    ])
+    .unwrap();
+
+    let atts = repo.load_attachments().unwrap();
+    assert_eq!(atts.len(), 1);
+    assert_eq!(atts[0].name, "Sunset photo.png");
+    assert_eq!((atts[0].width, atts[0].height), (1280, 720));
+
+    let state = repo.load().unwrap();
+    let pic = state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap();
+    assert_eq!(pic.attachment, Some(AttachmentId(4)));
+    assert_eq!(pic.img_percent, 50);
+
+    // re-adding the same id is an upsert, not a duplicate or a failure
+    repo.apply(&[Change::AttachmentAdded(Attachment { bytes: 999, ..atts[0].clone() })]).unwrap();
+    let atts = repo.load_attachments().unwrap();
+    assert_eq!(atts.len(), 1);
+    assert_eq!(atts[0].bytes, 999);
+
+    repo.apply(&[Change::BlockImageWidthSet { id: BlockId(10), percent: 100 }]).unwrap();
+    let state = repo.load().unwrap();
+    assert_eq!(state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().img_percent, 100);
+}
+
+/// `blocks.attachment` deliberately carries no foreign key: a picture whose
+/// file row is gone must render as a missing image, not fail the library.
+#[test]
+fn a_picture_whose_attachment_row_vanished_still_loads() {
+    let dir = tempfile();
+    let path = dir.join("dangling.db");
+    {
+        let repo = SqliteRepository::open(&path).unwrap();
+        repo.apply(&[
+            Change::PageCreated(page(1, "One", None, 1 << 32)),
+            Change::AttachmentAdded(Attachment {
+                id: AttachmentId(4),
+                name: "photo.png".into(),
+                file: "4.png".into(),
+                thumb: String::new(),
+                mime: "image/png".into(),
+                bytes: 10,
+                width: 4,
+                height: 4,
+            }),
+            Change::BlockInserted(Block {
+                kind: BlockKind::Image,
+                attachment: Some(AttachmentId(4)),
+                ..block(10, 1, None, 100, "photo.png")
+            }),
+        ])
+        .unwrap();
+    }
+    // the row disappears behind Quire's back — no Change deletes it, because
+    // undo must never throw bytes away
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(conn.execute("DELETE FROM attachments", []).unwrap(), 1);
+        drop(conn);
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let state = repo.load().unwrap();
+    let pic = state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap();
+    assert_eq!(pic.attachment, Some(AttachmentId(4)), "the dangling reference survives");
+    assert!(repo.load_attachments().unwrap().is_empty());
+}
+
+#[test]
+fn fold_state_round_trips_and_a_missing_id_is_an_error() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.apply(&[
+        Change::PageCreated(page(1, "One", None, 1 << 32)),
+        Change::BlockInserted(Block {
+            kind: BlockKind::Toggle,
+            folded: true,
+            ..block(10, 1, None, 100, "section")
+        }),
+        Change::BlockInserted(block(11, 1, Some(10), 110, "hidden child")),
+    ])
+    .unwrap();
+
+    let state = repo.load().unwrap();
+    assert!(state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().folded);
+    assert!(!state.blocks.iter().find(|b| b.id == BlockId(11)).unwrap().folded);
+
+    repo.apply(&[Change::BlockFoldedSet { id: BlockId(11), folded: true }]).unwrap();
+    let state = repo.load().unwrap();
+    assert!(state.blocks.iter().find(|b| b.id == BlockId(11)).unwrap().folded);
+
+    // unfolding writes false back; the flag is not a one-way door
+    repo.apply(&[Change::BlockFoldedSet { id: BlockId(10), folded: false }]).unwrap();
+    let state = repo.load().unwrap();
+    assert!(!state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().folded);
+
+    let err = repo
+        .apply(&[Change::BlockFoldedSet { id: BlockId(999), folded: true }])
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Sql(_)), "got {err}");
+}
+
 #[test]
 fn replace_all_rejects_a_parent_cycle_at_commit() {
     let repo = SqliteRepository::in_memory().unwrap();
@@ -513,10 +768,17 @@ fn crash_writer_child() {
     ])
     .unwrap();
 
+    // Bounded retry: an orphan whose parent died before accepting must not
+    // sit here forever. On Windows a live child keeps the test exe open, and
+    // every later `cargo test` then fails to link it (LNK1104).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut stream = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => break s,
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => std::process::exit(0x7F),
         }
     };
     stream.write_all(b"committed\n").unwrap();
@@ -611,17 +873,14 @@ fn save_latency() {
     );
 }
 
-fn tempfile() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "quire-test-{}-{}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A scratch database folder that deletes itself with the test.
+///
+/// These fixtures used to be a bare `PathBuf` and nothing removed them: over
+/// many runs `%TEMP%` collected six hundred `quire-test-*` directories, each
+/// holding a database nobody would open again.
+fn tempfile() -> ScratchDir {
+    ScratchDir::new("test")
 }
-
-static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ── block colors + cross-page moves (schema v4, ADR-0023) ───────────
 

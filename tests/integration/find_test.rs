@@ -19,6 +19,9 @@ fn block(id: u64, text: &str) -> Block {
         color: quire::core::ColorKind::Default,
         background: quire::core::ColorKind::Default,
         page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
     }
 }
 

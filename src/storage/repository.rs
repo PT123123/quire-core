@@ -9,7 +9,8 @@ use rusqlite::{params, Connection, Transaction};
 
 use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{
-    Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page, PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page,
+    PageId, PersistedState,
 };
 
 use super::backup::{self, OpenReport};
@@ -118,6 +119,35 @@ impl SqliteRepository {
     pub fn search(&self, req: &SearchRequest) -> Result<Vec<Match>, StorageError> {
         search_index::matches(&self.db.conn(), req)
     }
+
+    /// Every attachment row (SPEC §三十七 批次 A). Metadata only — the pixels
+    /// stay on disk and reach the UI one visible block at a time. Like
+    /// `search`, this is off the `Repository` trait: the change contract
+    /// carries attachments, the load path deliberately does not.
+    pub fn load_attachments(&self) -> Result<Vec<Attachment>, StorageError> {
+        let conn = self.db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, file, thumb, mime, bytes, width, height
+                 FROM attachments ORDER BY id",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Attachment {
+                    id: AttachmentId(r.get::<_, i64>(0)? as u64),
+                    name: r.get(1)?,
+                    file: r.get(2)?,
+                    thumb: r.get(3)?,
+                    mime: r.get(4)?,
+                    bytes: r.get(5)?,
+                    width: r.get::<_, i64>(6)? as u32,
+                    height: r.get::<_, i64>(7)? as u32,
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
+    }
 }
 
 impl Repository for SqliteRepository {
@@ -159,7 +189,7 @@ impl Repository for SqliteRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
-                            b.color, b.bg, b.page_ref
+                            b.color, b.bg, b.page_ref, b.folded, b.attachment, b.img_percent
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -177,12 +207,28 @@ impl Repository for SqliteRepository {
                         r.get::<_, String>(7)?,
                         r.get::<_, String>(8)?,
                         r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, i64>(10)?,
+                        r.get::<_, Option<i64>>(11)?,
+                        r.get::<_, i64>(12)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
-                let (id, page, parent, ord, kind, text, checked, color, bg, page_ref) =
-                    row.map_err(sql)?;
+                let (
+                    id,
+                    page,
+                    parent,
+                    ord,
+                    kind,
+                    text,
+                    checked,
+                    color,
+                    bg,
+                    page_ref,
+                    folded,
+                    attachment,
+                    img_percent,
+                ) = row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
                     // string means the file was tampered with or truncated.
@@ -204,6 +250,9 @@ impl Repository for SqliteRepository {
                     color: ColorKind::try_from_str(&color).unwrap_or(ColorKind::Default),
                     background: ColorKind::try_from_str(&bg).unwrap_or(ColorKind::Default),
                     page_ref: page_ref.map(|p| PageId(p as u64)),
+                    folded: db_to_bool(folded),
+                    attachment: attachment.map(|a| AttachmentId(a as u64)),
+                    img_percent: img_percent.clamp(1, u16::MAX as i64) as u16,
                 });
             }
         }
@@ -294,6 +343,10 @@ impl Repository for SqliteRepository {
         // inserts below re-index every row.
         tx.execute("DELETE FROM search_blocks", []).map_err(sql)?;
         tx.execute("DELETE FROM search_pages", []).map_err(sql)?;
+        // `attachments` survives on purpose. The files are on disk and this
+        // path cannot know which of them the incoming state still references;
+        // dropping the rows would turn a live picture into a missing file.
+        // The cost is orphans, which no user action can see (SPEC §三十七).
         // A→B→A parent references satisfy FK rules but would spin the
         // sidebar tree forever, so the bulk path validates acyclicity.
         detect_cycle(
@@ -406,8 +459,9 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref, folded,
+                             attachment, img_percent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
@@ -417,6 +471,9 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
             block.color.as_str(),
             block.background.as_str(),
             block.page_ref.map(|p| p.as_u64() as i64),
+            bool_to_db(block.folded),
+            block.attachment.map(|a| a.as_u64() as i64),
+            block.img_percent as i64,
         ],
     )
     .map_err(sql)?;
@@ -541,6 +598,9 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 color: ColorKind::Default,
                 background: ColorKind::Default,
                 page_ref: None,
+                folded: false,
+                attachment: None,
+                img_percent: 100,
             };
             for m in &block.marks {
                 tx.execute(
@@ -584,6 +644,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockCheckedSet", id.as_u64())
+        }
+        Change::BlockFoldedSet { id, folded } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET folded = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, bool_to_db(*folded)],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockFoldedSet", id.as_u64())
         }
         Change::BlockMoved { id, parent, order } => {
             let n = tx
@@ -639,6 +708,48 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockRefSet", id.as_u64())
+        }
+        Change::BlockAttachmentSet { id, attachment } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET attachment = ?2 WHERE id = ?1",
+                    params![
+                        id.as_u64() as i64,
+                        attachment.map(|a| a.as_u64() as i64)
+                    ],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockAttachmentSet", id.as_u64())
+        }
+        Change::BlockImageWidthSet { id, percent } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET img_percent = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, *percent as i64],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockImageWidthSet", id.as_u64())
+        }
+        Change::AttachmentAdded(attachment) => {
+            // `INSERT OR REPLACE`, not a plain INSERT: undoing an insert and
+            // re-doing it replays the same row for the same id.
+            tx.execute(
+                "INSERT OR REPLACE INTO attachments
+                    (id, name, file, thumb, mime, bytes, width, height)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    attachment.id.as_u64() as i64,
+                    attachment.name,
+                    attachment.file,
+                    attachment.thumb,
+                    attachment.mime,
+                    attachment.bytes,
+                    attachment.width as i64,
+                    attachment.height as i64,
+                ],
+            )
+            .map_err(sql)?;
+            Ok(())
         }
         Change::BlockDeleted { id } => {
             let n = tx

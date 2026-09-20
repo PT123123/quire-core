@@ -1,5 +1,6 @@
 // Services — use-case orchestration above core+storage (M3+).
 
+pub mod attachment_store;
 pub mod export_service;
 pub mod find_service;
 pub mod import_service;

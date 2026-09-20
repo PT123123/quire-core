@@ -183,25 +183,71 @@ fn rank(matches: &[Match], terms: &[String], limit: usize) -> Vec<Hit> {
         .collect()
 }
 
-/// Window `text` around the first query word that occurs in it.
+/// Window `text` around the first query word that occurs in it, with both
+/// edges on word boundaries (see [`snap_to_words`]).
 pub fn snippet(text: &str, terms: &[String]) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let center = terms
+    let (center, term_end) = terms
         .iter()
-        .filter_map(|term| find(&chars, &term.chars().collect::<Vec<_>>()))
+        .filter_map(|term| {
+            let needle: Vec<char> = term.chars().collect();
+            find(&chars, &needle).map(|at| (at, at + needle.len()))
+        })
         .min()
-        .unwrap_or(0);
+        .unwrap_or((0, 0));
     let start = center.saturating_sub(SNIPPET_CHARS / 3);
     let end = (start + SNIPPET_CHARS).min(chars.len());
+    // term_end == 0 means no term occurred in `text`: the window stays at the
+    // head of the document and there is nothing to keep, so nothing to snap.
+    let (s, e) = if term_end == 0 {
+        (start, end)
+    } else {
+        snap_to_words(&chars, start, end, center, term_end)
+    };
+    let window: String = chars[s..e].iter().collect();
+    let window = window.trim();
     let mut out = String::new();
-    if start > 0 {
+    if s > 0 {
         out.push('…');
     }
-    out.extend(&chars[start..end]);
-    if end < chars.len() {
+    out.push_str(window);
+    if e < chars.len() {
         out.push('…');
     }
     out
+}
+
+/// Drop the partial word at the head of a char window and the one at its tail.
+/// Only ASCII runs count as words: a cut between CJK characters splits nothing,
+/// so it is left alone. The match itself is never snapped away. When snapping
+/// would leave less than half of the requested window — an unbroken run (a URL,
+/// a base64 blob) filling it — the raw cut is kept: a partial word beats an
+/// empty snippet. Shared with the repo-less local search (`app::workspace`).
+pub(crate) fn snap_to_words(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    center: usize,
+    term_end: usize,
+) -> (usize, usize) {
+    let split = |i: usize| {
+        i > 0
+            && i < chars.len()
+            && chars[i].is_ascii_alphanumeric()
+            && chars[i - 1].is_ascii_alphanumeric()
+    };
+    let mut s = start;
+    while s < center && split(s) {
+        s += 1;
+    }
+    let mut e = end;
+    while e > term_end && split(e) {
+        e -= 1;
+    }
+    if e - s < (end - start) / 2 {
+        return (start, end);
+    }
+    (s, e)
 }
 
 /// Case-insensitive char-window search; `None` when the term is absent.
@@ -246,6 +292,29 @@ mod tests {
     fn snippet_of_short_text_is_the_whole_text() {
         assert_eq!(snippet("short note", &["note".into()]), "short note");
         assert_eq!(snippet("", &["x".into()]), "");
+    }
+
+    #[test]
+    fn snippet_edges_never_split_a_word() {
+        // Terms at several offsets, so the raw window is sometimes cut inside
+        // a token and sometimes not: every case must come back whole.
+        let text: String = (0..120).map(|i| format!("w{i} ")).collect();
+        for term in 20..40 {
+            let needle = format!("w{term}");
+            let s = snippet(&text, std::slice::from_ref(&needle));
+            assert!(s.contains(&needle), "term {needle} lost: {s}");
+            let body = s.trim_matches('…');
+            let at = text
+                .find(body)
+                .unwrap_or_else(|| panic!("not a source window: {s}"));
+            let whole_head = at == 0 || text.as_bytes()[at - 1] == b' ';
+            let tail = at + body.len();
+            let whole_tail = tail == text.len() || text.as_bytes()[tail] == b' ';
+            assert!(
+                whole_head && whole_tail,
+                "split word in {s:?} (term {needle})"
+            );
+        }
     }
 
     #[test]

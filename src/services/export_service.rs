@@ -33,13 +33,34 @@ use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind};
 pub fn export_page(blocks: &[Block]) -> String {
     let mut out = String::new();
     let mut number = 0;
-    let walk = display_order(blocks);
+    // A table's cells are children, so the grid has to be assembled before the
+    // walk rather than block by block.
+    let grids = table_grids(blocks);
+    // A columns layout writes no marker of its own: its containers are a shape,
+    // not a block with text, and its content exports at the page's own depth in
+    // the order the columns read — the same degradation a grid's cells take.
+    let walk: Vec<(usize, &Block)> = display_order(blocks)
+        .into_iter()
+        .filter(|(_, b)| {
+            !matches!(
+                b.kind,
+                BlockKind::TableCell | BlockKind::Columns | BlockKind::Column
+            )
+        })
+        .map(|(depth, b)| (if inside_columns(blocks, b) { 0 } else { depth }, b))
+        .collect();
     for (i, (depth, block)) in walk.iter().enumerate() {
         if i > 0 && !same_list_run(walk[i - 1].1.kind, block.kind) {
             out.push('\n');
         }
         let indent = "  ".repeat(*depth);
-        let rendered = render(block, &mut number);
+        let rendered = match block.kind {
+            BlockKind::Table => {
+                number = 0;
+                render_table(block, grids.get(&block.id).map(Vec::as_slice).unwrap_or(&[]))
+            }
+            _ => render(block, &mut number),
+        };
         for line in rendered.lines() {
             if line.is_empty() {
                 out.push('\n');
@@ -51,6 +72,67 @@ pub fn export_page(blocks: &[Block]) -> String {
         }
     }
     out
+}
+
+/// True when the block sits inside a columns layout, at any depth.
+fn inside_columns(blocks: &[Block], b: &Block) -> bool {
+    let mut parent = b.parent;
+    while let Some(pid) = parent {
+        let Some(p) = blocks.iter().find(|x| x.id == pid) else {
+            break;
+        };
+        if matches!(p.kind, BlockKind::Columns | BlockKind::Column) {
+            return true;
+        }
+        parent = p.parent;
+    }
+    false
+}
+
+/// The cells of every table on the page, in row-major order.
+fn table_grids(blocks: &[Block]) -> HashMap<BlockId, Vec<Block>> {
+    let mut out: HashMap<BlockId, Vec<Block>> = HashMap::new();
+    for (_, b) in display_order(blocks).into_iter() {
+        if b.kind != BlockKind::TableCell {
+            continue;
+        }
+        let Some(parent) = b.parent else { continue };
+        let Some(table) = blocks.iter().find(|x| x.id == parent && x.kind == BlockKind::Table)
+        else {
+            continue; // an orphaned cell is not part of any grid
+        };
+        out.entry(table.id).or_default().push(b.clone());
+    }
+    out
+}
+
+/// A grid as a GitHub-flavored-Markdown table. The first row is the header
+/// row — the same convention the block itself starts with, and the only shape
+/// a Markdown table has. A table with no cells writes nothing.
+fn render_table(table: &Block, cells: &[Block]) -> String {
+    let cols = table.columns as usize;
+    if cols == 0 || cells.is_empty() {
+        return String::new();
+    }
+    let cell = |b: Option<&Block>| {
+        b.map(|c| {
+            let text = render_inline(&c.text, &c.marks);
+            // a pipe would end the column, a newline the row: neither is
+            // representable inside a cell, so both become text
+            text.replace('|', "\\|").replace('\n', " ")
+        })
+        .unwrap_or_default()
+    };
+    let mut out = String::new();
+    for (r, row) in cells.chunks(cols).enumerate() {
+        let line = (0..cols).map(|c| cell(row.get(c))).collect::<Vec<_>>().join(" | ");
+        out.push_str(&format!("| {line} |\n"));
+        if r == 0 {
+            let dashes = (0..cols).map(|_| "---").collect::<Vec<_>>().join(" | ");
+            out.push_str(&format!("| {dashes} |\n"));
+        }
+    }
+    out.trim_end().to_string()
 }
 
 fn is_list(kind: BlockKind) -> bool {
@@ -151,6 +233,17 @@ fn render(block: &Block, number: &mut usize) -> String {
                 Some(a) => format!("[{text}](quire://attachment/{})", a.as_u64()),
                 None => text.to_string(),
             }
+        }
+        // A grid is written by `render_table`, which is the only place that
+        // sees a table's cells; on its own a table block has no text, and a
+        // cell is part of a grid rather than a block of its own. The columns
+        // containers are filtered out by `export_page` for the same reason.
+        BlockKind::Table
+        | BlockKind::TableCell
+        | BlockKind::Columns
+        | BlockKind::Column => {
+            *number = 0;
+            String::new()
         }
     }
 }

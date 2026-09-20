@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 7;
+pub const CURRENT_VERSION: i32 = 8;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -155,7 +155,36 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 "#,
     backfill: Some(add_attachment_columns),
+}, Migration {
+    version: 8,
+    label: "table columns",
+    // SPEC §三十七 批次 B: `blocks.columns` is how many boxes a container
+    // holds — the column count of a Table block, or the side-by-side box count
+    // of a Columns layout (0 = neither). Both containers' contents are ordinary
+    // child blocks, so nothing else needs storing and the columns slice needed
+    // no new migration. Added conditionally like every other late column.
+    sql: "",
+    backfill: Some(add_columns_column),
 }];
+
+/// Migration 8 body: add `blocks.columns` only when it is missing.
+fn add_columns_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'columns'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE blocks ADD COLUMN columns INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| StorageError::Sql(format!("add columns: {e}")))?;
+    }
+    Ok(())
+}
 
 /// Migration 4 body: add each color column only when it is missing.
 fn add_color_columns(conn: &mut Connection) -> Result<(), StorageError> {

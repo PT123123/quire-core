@@ -46,6 +46,11 @@ pub struct OrderKey(pub u64);
 impl OrderKey {
     pub const FIRST: OrderKey = OrderKey(1 << 32);
 
+    /// Spacing `Document::renumber_page` hands out. One insert halves a gap,
+    /// so a wide stride means a renumber buys thousands of inserts instead of
+    /// one — what a table needs when it adds a column (one cell per row).
+    pub const STRIDE: u64 = 1 << 16;
+
     /// Midpoint between two keys; `None` when the gap is exhausted and the
     /// caller must renumber the sibling run.
     pub fn between(before: Option<OrderKey>, after: Option<OrderKey>) -> Option<OrderKey> {
@@ -95,10 +100,27 @@ pub enum BlockKind {
     /// the bytes; `text` holds the display name, which is what the row shows
     /// when the file row itself is gone.
     File,
+    /// A simple N×M grid (SPEC §三十七 批次 B). `columns` is M; the cells are
+    /// child blocks in row-major order, so rows = cells / columns. Deliberately
+    /// NOT a database view — schema, filters and sorting are §三十九.
+    Table,
+    /// One cell of a `Table`, a child block of it. Never gets its own editor
+    /// row: the table's delegate projects the whole grid, so the cells stay
+    /// hidden from `visible_block_indices` the same way a fold hides them.
+    TableCell,
+    /// 2 or 3 side-by-side columns of blocks (SPEC §三十七 批次 B). `columns`
+    /// is the count; the columns themselves are child `Column` blocks, and a
+    /// column's content hangs off that. Like a table it owns its subtree's
+    /// rendering: the row it costs is one row, whatever it holds.
+    Columns,
+    /// One column of a `Columns` block: a child block that owns the column's
+    /// content. Never gets its own editor row — the delegate of the `Columns`
+    /// block projects it, so a column's whole subtree stays hidden.
+    Column,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 16] = [
+    pub const ALL: [BlockKind; 20] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -115,6 +137,10 @@ impl BlockKind {
         BlockKind::Toggle,
         BlockKind::Image,
         BlockKind::File,
+        BlockKind::Table,
+        BlockKind::TableCell,
+        BlockKind::Columns,
+        BlockKind::Column,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -135,6 +161,10 @@ impl BlockKind {
             BlockKind::Toggle => "toggle",
             BlockKind::Image => "image",
             BlockKind::File => "file",
+            BlockKind::Table => "table",
+            BlockKind::TableCell => "table_cell",
+            BlockKind::Columns => "columns",
+            BlockKind::Column => "column",
         }
     }
 
@@ -295,6 +325,11 @@ pub struct Block {
     /// Display width of an `Image` block, in percent of the editor column
     /// (25 / 50 / 100). Meaningless for other kinds, where it stays 100.
     pub img_percent: u16,
+    /// Column count of a `Table` block (SPEC §三十七 批次 B) or a `Columns`
+    /// block. `0` means "neither": a table's cell count is always a multiple
+    /// of it, so its row count is derived rather than stored, and a columns
+    /// block's `Column` children are counted the same way.
+    pub columns: u16,
 }
 
 /// One file that lives next to the database (SPEC §三十七 批次 A, §十八's

@@ -189,7 +189,8 @@ impl Repository for SqliteRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
-                            b.color, b.bg, b.page_ref, b.folded, b.attachment, b.img_percent
+                            b.color, b.bg, b.page_ref, b.folded, b.attachment, b.img_percent,
+                            b.columns
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -210,6 +211,7 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(10)?,
                         r.get::<_, Option<i64>>(11)?,
                         r.get::<_, i64>(12)?,
+                        r.get::<_, i64>(13)?,
                     ))
                 })
                 .map_err(sql)?;
@@ -228,6 +230,7 @@ impl Repository for SqliteRepository {
                     folded,
                     attachment,
                     img_percent,
+                    columns,
                 ) = row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
@@ -253,6 +256,7 @@ impl Repository for SqliteRepository {
                     folded: db_to_bool(folded),
                     attachment: attachment.map(|a| AttachmentId(a as u64)),
                     img_percent: img_percent.clamp(1, u16::MAX as i64) as u16,
+                    columns: columns.clamp(0, u16::MAX as i64) as u16,
                 });
             }
         }
@@ -460,8 +464,8 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref, folded,
-                             attachment, img_percent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                             attachment, img_percent, columns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
@@ -474,6 +478,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
             bool_to_db(block.folded),
             block.attachment.map(|a| a.as_u64() as i64),
             block.img_percent as i64,
+            block.columns as i64,
         ],
     )
     .map_err(sql)?;
@@ -601,6 +606,7 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 folded: false,
                 attachment: None,
                 img_percent: 100,
+                columns: 0,
             };
             for m in &block.marks {
                 tx.execute(
@@ -729,6 +735,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockImageWidthSet", id.as_u64())
+        }
+        Change::BlockColumnsSet { id, columns } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET columns = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, *columns as i64],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockColumnsSet", id.as_u64())
         }
         Change::AttachmentAdded(attachment) => {
             // `INSERT OR REPLACE`, not a plain INSERT: undoing an insert and

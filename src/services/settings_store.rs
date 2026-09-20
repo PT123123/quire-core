@@ -364,6 +364,7 @@ mod tests {
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         });
         state.pages.push(Page {
             id: PageId(1),

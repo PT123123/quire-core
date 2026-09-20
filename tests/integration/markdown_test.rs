@@ -26,6 +26,7 @@ fn block(id: u64, kind: BlockKind, text: &str) -> Block {
         folded: false,
         attachment: None,
         img_percent: 100,
+        columns: 0,
     }
 }
 
@@ -828,5 +829,154 @@ fn import_of_export_is_stable_for_the_app_sample_shape() {
     let again = blocks_of(&import_markdown(&md, &page(), &mut alloc));
     assert_eq!(parsed_of(&again), parsed_of(&blocks));
     // exporting twice is byte-identical
+    assert_eq!(export_page(&again), md);
+}
+
+// ---- table grid (SPEC §三十七 批次 B) ----
+
+/// A table plus its cells row-major, ids and orders following the table.
+fn grid(table_id: u64, cols: u16, texts: &[&str]) -> Vec<Block> {
+    let mut out = vec![Block {
+        columns: cols,
+        ..block(table_id, BlockKind::Table, "")
+    }];
+    for (i, t) in texts.iter().enumerate() {
+        out.push(Block {
+            parent: Some(BlockId(table_id)),
+            ..block(table_id * 100 + i as u64, BlockKind::TableCell, t)
+        });
+    }
+    out
+}
+
+#[test]
+fn export_writes_a_grid_as_a_gfm_table_with_a_header_row() {
+    let mut blocks = grid(1, 3, &["North", "South", "East", "West", "Up", "Down"]);
+    blocks.push(block(2, BlockKind::Paragraph, "after"));
+    assert_eq!(
+        export_page(&blocks),
+        "| North | South | East |\n| --- | --- | --- |\n| West | Up | Down |\n\nafter\n"
+    );
+}
+
+#[test]
+fn export_keeps_marks_in_a_cell_and_escapes_what_would_end_the_column() {
+    // §十 inline marks ride into the grid: a cell exports like a line of prose
+    let mut blocks = grid(1, 2, &[]);
+    let bold = |id: u64, text: &str, marks: Vec<Mark>| Block {
+        parent: Some(BlockId(1)),
+        marks,
+        ..block(id, BlockKind::TableCell, text)
+    };
+    blocks.push(bold(100, "Comms", vec![mark(0, 5, MarkKind::Bold)]));
+    blocks.push(bold(101, "a|b", vec![]));
+    blocks.push(bold(102, "two\nlines", vec![]));
+    blocks.push(bold(103, "", vec![]));
+    blocks.push(bold(104, "`x`", vec![]));
+    blocks.push(bold(105, "中文 · ok", vec![]));
+    assert_eq!(
+        export_page(&blocks),
+        // the cell text is prose, so the inline escaper runs on it first: a
+        // backtick that is only a backtick stays only a backtick (ADR-0016)
+        "| **Comms** | a\\|b |\n| --- | --- |\n| two lines |  |\n| \\`x\\` | 中文 · ok |\n"
+    );
+}
+
+#[test]
+fn a_grid_with_nothing_in_it_exports_to_nothing() {
+    assert_eq!(export_page(&grid(1, 3, &[])), "");
+    // a cell without its table writes no text of its own: it is only ever a
+    // piece of a grid, and a piece with no grid has no place in the document
+    let orphan = Block { parent: Some(BlockId(9)), ..block(5, BlockKind::TableCell, "loose") };
+    assert_eq!(export_page(&[orphan]), "");
+}
+
+#[test]
+fn a_gfm_table_imports_as_text_not_as_a_grid() {
+    // documented limitation: the importer recognizes no table syntax, so a
+    // Markdown table file comes in as lines rather than breaking on the pipes
+    let src = "| a | b |\n| --- | --- |\n| c | d |\n";
+    let mut alloc = counter(100);
+    let blocks = blocks_of(&import_markdown(src, &page(), &mut alloc));
+    assert!(blocks.iter().all(|b| b.kind != BlockKind::Table), "{:?}", blocks.iter().map(|b| (b.kind, &b.text)).collect::<Vec<_>>());
+    assert!(blocks.iter().all(|b| b.kind != BlockKind::TableCell));
+    assert!(blocks.iter().any(|b| b.text.contains('a')), "the pipes keep their text");
+}
+
+// ---- columns layout (SPEC §三十七 批次 B) ----
+
+/// A two-box layout: `before`, [left | right], `after`, with the lines
+/// parented to their box and the boxes to the layout.
+fn laid_out() -> Vec<Block> {
+    let col = |id: u64, parent: u64| Block {
+        parent: Some(BlockId(parent)),
+        ..block(id, BlockKind::Column, "")
+    };
+    vec![
+        block(1, BlockKind::Paragraph, "before"),
+        Block { columns: 2, ..block(2, BlockKind::Columns, "") },
+        col(3, 2),
+        Block { parent: Some(BlockId(3)), ..block(4, BlockKind::Paragraph, "left") },
+        col(5, 2),
+        Block { parent: Some(BlockId(5)), ..todo(6, "right", true) },
+        block(7, BlockKind::Paragraph, "after"),
+    ]
+}
+
+#[test]
+fn a_columns_layout_exports_its_lines_in_reading_order() {
+    // the shape is a layout, not text, so Markdown has nothing to write for
+    // it: the containers drop out and the lines come out as page-level prose
+    assert_eq!(
+        export_page(&laid_out()),
+        "before\n\nleft\n\n- [x] right\n\nafter\n"
+    );
+}
+
+#[test]
+fn a_layout_flattens_its_boxes_nesting_too() {
+    // a line under a line, both inside a box: the box's own depth is already
+    // gone, so the inner indent would be a lie about the document
+    let mut blocks = laid_out();
+    blocks.push(Block {
+        parent: Some(BlockId(4)),
+        ..block(8, BlockKind::Bullet, "nested")
+    });
+    assert_eq!(
+        export_page(&blocks),
+        // no two-space indent in front of "- nested": the depth was flattened
+        // with the box, and the paragraph/list break is the usual one
+        "before\n\nleft\n\n- nested\n\n- [x] right\n\nafter\n"
+    );
+}
+
+#[test]
+fn an_empty_layout_exports_to_nothing() {
+    // the same degradation a grid takes: a container with no content is not a
+    // block of text, and a bare box is only a piece of a layout
+    let only = vec![Block { columns: 3, ..block(1, BlockKind::Columns, "") }];
+    assert_eq!(export_page(&only), "");
+    let orphan = Block { parent: Some(BlockId(9)), ..block(5, BlockKind::Column, "") };
+    assert_eq!(export_page(&[orphan]), "");
+}
+
+#[test]
+fn a_layout_round_trips_as_its_lines_losing_only_the_shape() {
+    let md = export_page(&laid_out());
+    let mut alloc = counter(100);
+    let again = blocks_of(&import_markdown(&md, &page(), &mut alloc));
+    let expected = vec![
+        parsed(BlockKind::Paragraph, "before"),
+        parsed(BlockKind::Paragraph, "left"),
+        ParsedBlock {
+            kind: BlockKind::Todo,
+            text: "right".into(),
+            checked: true,
+            marks: Vec::new(),
+        },
+        parsed(BlockKind::Paragraph, "after"),
+    ];
+    assert_eq!(parsed_of(&again), expected);
+    // and exporting that again is byte-identical
     assert_eq!(export_page(&again), md);
 }

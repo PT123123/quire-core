@@ -55,6 +55,10 @@ pub enum Change {
     },
     /// Display width of an `Image` block, in percent of the editor column.
     BlockImageWidthSet { id: BlockId, percent: u16 },
+    /// Column count of a `Table` block (SPEC §三十七 批次 B). `0` = not a
+    /// table; adding/removing a column is one of these plus the cell inserts
+    /// or deletes it implies.
+    BlockColumnsSet { id: BlockId, columns: u16 },
     /// Upsert one attachment row. The bytes are already on disk by the time
     /// this is recorded, so undo removes the *reference* only and never the
     /// file: an orphaned picture is recoverable, a deleted one is not.

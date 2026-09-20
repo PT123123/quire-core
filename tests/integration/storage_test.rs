@@ -44,6 +44,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         folded: false,
         attachment: None,
         img_percent: 100,
+        columns: 0,
     }
 }
 
@@ -474,6 +475,180 @@ fn the_v7_step_adds_attachments_to_a_v6_database() {
 }
 
 #[test]
+fn a_grid_and_its_cells_round_trip_through_storage() {
+    use quire::core::{Mark, MarkKind};
+    let dir = tempfile();
+    let path = dir.join("grid.db");
+    let table = Block {
+        kind: BlockKind::Table,
+        columns: 3,
+        ..block(50, 1, None, 90, "")
+    };
+    let cell = |id: u64, ord: u64, text: &str| {
+        Block { kind: BlockKind::TableCell, ..block(id, 1, Some(50), ord, text) }
+    };
+    let state = PersistedState {
+        pages: vec![page(1, "Grid", None, 1)],
+        blocks: vec![
+            table.clone(),
+            cell(51, 91, "North"),
+            Block {
+                marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
+                ..cell(52, 92, "South")
+            },
+            cell(53, 93, "East"),
+            cell(54, 94, "West"),
+            cell(55, 95, "Up"),
+            cell(56, 96, "Down"),
+        ],
+        meta: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    SqliteRepository::open(&path).unwrap().replace_all(&state).unwrap();
+    let loaded = SqliteRepository::open(&path).unwrap().load().unwrap();
+    // the grid is its table plus six children, parent and column count intact
+    assert_eq!(sorted_blocks(&loaded), sorted_blocks(&state));
+    let back = loaded.blocks.iter().find(|b| b.id == BlockId(50)).unwrap();
+    assert_eq!((back.kind, back.columns), (BlockKind::Table, 3));
+    assert_eq!(back.text, "");
+    let cells: Vec<&Block> =
+        loaded.blocks.iter().filter(|b| b.parent == Some(BlockId(50))).collect();
+    assert_eq!(cells.len(), 6);
+    assert_eq!(
+        cells[1].marks,
+        vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
+        "a cell's inline marks are ordinary block marks"
+    );
+    // the kind strings on disk are the ones the SPEC names, because the
+    // Markdown export and any outside reader match on them
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM blocks WHERE kind LIKE 'table%' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["table", "table_cell", "table_cell", "table_cell", "table_cell", "table_cell", "table_cell"]
+    );
+    let columns: i64 =
+        conn.query_row("SELECT columns FROM blocks WHERE id = 50", [], |r| r.get(0)).unwrap();
+    assert_eq!(columns, 3);
+}
+
+/// A columns layout stores exactly like a grid: the container carries the
+/// box count in the same `columns` column, and the boxes and their lines are
+/// ordinary parent-linked child blocks. That is why slice B needed no new
+/// migration.
+#[test]
+fn a_columns_layout_and_its_boxes_round_trip_through_storage() {
+    let dir = tempfile();
+    let path = dir.join("columns.db");
+    let layout = Block { kind: BlockKind::Columns, columns: 2, ..block(60, 1, None, 90, "") };
+    let box_of =
+        |id: u64, ord: u64| Block { kind: BlockKind::Column, ..block(id, 1, Some(60), ord, "") };
+    let state = PersistedState {
+        pages: vec![page(1, "Layout", None, 1)],
+        blocks: vec![
+            block(59, 1, None, 80, "before the layout"),
+            layout.clone(),
+            box_of(61, 91),
+            box_of(62, 92),
+            Block { kind: BlockKind::Todo, checked: true, ..block(63, 1, Some(61), 93, "left") },
+            block(64, 1, Some(62), 94, "right"),
+            block(65, 1, None, 95, "after the layout"),
+        ],
+        meta: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    SqliteRepository::open(&path).unwrap().replace_all(&state).unwrap();
+    let loaded = SqliteRepository::open(&path).unwrap().load().unwrap();
+    assert_eq!(sorted_blocks(&loaded), sorted_blocks(&state));
+    let back = loaded.blocks.iter().find(|b| b.id == BlockId(60)).unwrap();
+    assert_eq!((back.kind, back.columns), (BlockKind::Columns, 2));
+    let boxes: Vec<&Block> =
+        loaded.blocks.iter().filter(|b| b.parent == Some(BlockId(60))).collect();
+    assert_eq!(boxes.len(), 2, "the layout owns its boxes directly");
+    assert!(boxes.iter().all(|b| b.kind == BlockKind::Column));
+    let left = loaded.blocks.iter().find(|b| b.id == BlockId(63)).unwrap();
+    assert_eq!((left.parent, left.checked), (Some(BlockId(61)), true), "a box keeps its lines");
+    // the kind strings on disk are the ones the SPEC names
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM blocks WHERE kind IN ('columns', 'column') ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(kinds, ["columns", "column", "column"]);
+    let columns: i64 =
+        conn.query_row("SELECT columns FROM blocks WHERE id = 60", [], |r| r.get(0)).unwrap();
+    assert_eq!(columns, 2, "the box count lives in the v8 column");
+    // and a box is a box only through its kind: it stores no extra state
+    let box_columns: i64 =
+        conn.query_row("SELECT columns FROM blocks WHERE id = 61", [], |r| r.get(0)).unwrap();
+    assert_eq!(box_columns, 0);
+}
+
+/// v8 is a conditional ALTER like v6 and v7, so it has to run against a
+/// database that really lacks the column.
+#[test]
+fn the_v8_step_adds_columns_to_a_v7_database() {
+    let dir = tempfile();
+    let path = dir.join("columns.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE blocks DROP COLUMN columns;
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded)
+             VALUES (1, 'Old', NULL, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocks (id, page, kind, text, checked, color, bg, folded, attachment, img_percent)
+             VALUES (10, 1, 'paragraph', 'from v7', 0, '', '', 0, NULL, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO block_children (block, parent, ord) VALUES (10, NULL, 100)", [])
+            .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 7);
+        // control: the column must really be gone, or the test passes without
+        // the v8 step ever running
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'columns'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no columns column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), migrations::CURRENT_VERSION);
+        let columns: i64 =
+            conn.query_row("SELECT columns FROM blocks WHERE id = 10", [], |r| r.get(0)).unwrap();
+        assert_eq!(columns, 0, "a pre-table row is not a table");
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let state = SqliteRepository::open(&path).unwrap().load().unwrap();
+    assert_eq!(state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().columns, 0);
+}
+
+#[test]
 fn attachments_round_trip_and_a_dangling_reference_still_loads() {
     let repo = SqliteRepository::in_memory().unwrap();
     repo.apply(&[
@@ -492,6 +667,7 @@ fn attachments_round_trip_and_a_dangling_reference_still_loads() {
             kind: BlockKind::Image,
             attachment: Some(AttachmentId(4)),
             img_percent: 50,
+            columns: 0,
             ..block(10, 1, None, 100, "Sunset photo.png")
         }),
     ])

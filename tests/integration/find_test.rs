@@ -22,6 +22,7 @@ fn block(id: u64, text: &str) -> Block {
         folded: false,
         attachment: None,
         img_percent: 100,
+        columns: 0,
     }
 }
 

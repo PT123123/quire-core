@@ -2,6 +2,8 @@
 // planned against the document into a forward/revert `Entry`. The revert
 // list is what undo applies — never a database re-read.
 
+use std::collections::{HashMap, HashSet};
+
 use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
@@ -64,6 +66,238 @@ pub enum Command {
     SetBlockFile { id: BlockId, attachment: Attachment },
     /// Display width of an `Image` block, in percent of the editor column.
     SetImageWidth { id: BlockId, percent: u16 },
+    /// One empty row at index `row` (`0..=rows`; `rows` appends at the bottom).
+    TableAddRow { id: BlockId, row: usize },
+    /// One empty column at index `col` (`0..=columns`; `columns` appends).
+    TableAddColumn { id: BlockId, col: usize },
+    /// Delete row `row`. Refused on the only row: the block the user is
+    /// pointing at must not vanish because they removed a row.
+    TableDeleteRow { id: BlockId, row: usize },
+    /// Delete column `col`, refused on the only column for the same reason.
+    TableDeleteColumn { id: BlockId, col: usize },
+    /// One more column on a `Columns` block, empty, at the right end; refused
+    /// at three (SPEC §三十七 批次 B says 2 / 3 栏).
+    ColumnsAddColumn { id: BlockId },
+    /// The `Columns` block's last column, folded into the one before it: its
+    /// blocks keep their order keys and only change parent, so the reflow
+    /// reads as "the columns got narrower" rather than as a deletion. Refused
+    /// at two columns.
+    ColumnsDeleteColumn { id: BlockId },
+    /// One empty paragraph at the end of a `Column` box. A box is not a line
+    /// the caret can land on, so the last block in it going away leaves
+    /// something nothing can click into (SPEC §三十七 批次 B).
+    ColumnsAddBlock { id: BlockId },
+}
+
+/// The grid shape the "+", the slash menu and "Turn into" hand out. Three
+/// columns because the first row is the Markdown header row, and two rows give
+/// it something to head.
+pub const TABLE_DEFAULT_COLUMNS: u16 = 3;
+pub const TABLE_DEFAULT_ROWS: u16 = 2;
+
+/// The layout the slash menu and "Turn into" hand out, and the widest the
+/// hover strip reaches. Two is the default because it is the shape that still
+/// reads as two columns at a normal window width.
+pub const COLUMNS_DEFAULT: u16 = 2;
+pub const COLUMNS_MAX: u16 = 3;
+
+fn is_table_kind(kind: BlockKind) -> bool {
+    matches!(kind, BlockKind::Table | BlockKind::TableCell)
+}
+
+/// The kinds whose blocks are containers rather than lines: they draw their
+/// own subtree inside one editor row, so no structural editing reaches into
+/// them as if they were prose (SPEC §三十七 批次 B).
+fn is_container_kind(kind: BlockKind) -> bool {
+    is_table_kind(kind) || is_column_kind(kind)
+}
+
+fn is_column_kind(kind: BlockKind) -> bool {
+    matches!(kind, BlockKind::Columns | BlockKind::Column)
+}
+
+/// True when the block is drawn by a container's delegate instead of by a row
+/// of its own: a cell, a column box, or anything below them.
+fn inside_container(doc: &Document, id: BlockId) -> bool {
+    let mut parent = match doc.block(id) {
+        Some(b) => b.parent,
+        None => return false,
+    };
+    let mut guard = 0;
+    while let Some(pid) = parent {
+        let Some(p) = doc.block(pid) else { break };
+        if is_container_kind(p.kind) {
+            return true;
+        }
+        parent = p.parent;
+        guard += 1;
+        if guard >= 32 {
+            break;
+        }
+    }
+    false
+}
+
+/// A table as stored: its column count and its cells in row-major sequence.
+/// Cells are child blocks, and a parent's children keep their relative order
+/// in the page's display order, so filtering the page yields the grid.
+struct Grid {
+    slots: Vec<usize>,
+    cells: Vec<Block>,
+    cols: usize,
+    table_columns: u16,
+}
+
+impl Grid {
+    fn rows(&self) -> usize {
+        self.cells.len() / self.cols
+    }
+}
+
+/// Read the grid, or `None` when `id` is not a well-formed table. A grid whose
+/// cell count is not a multiple of its column count is not editable: the plan
+/// refuses rather than guess which row is short.
+fn grid(doc: &Document, page: PageId, id: BlockId) -> Option<Grid> {
+    let blocks = doc.page_blocks(page);
+    let table = blocks.get(doc.index_of(page, id)?)?;
+    if table.kind != BlockKind::Table || table.columns == 0 {
+        return None;
+    }
+    let cols = table.columns as usize;
+    let mut slots = Vec::new();
+    let mut cells = Vec::new();
+    for (i, b) in blocks.iter().enumerate() {
+        if b.parent == Some(id) && b.kind == BlockKind::TableCell {
+            slots.push(i);
+            cells.push(b.clone());
+        }
+    }
+    if cells.len() % cols != 0 {
+        return None;
+    }
+    Some(Grid { slots, cells, cols, table_columns: table.columns })
+}
+
+/// Page slots bounding a new cell that must sort after cell sequence position
+/// `at - 1` and before position `at` (`0..=` the cell count): the block to sort
+/// after, and the block to sort before (`None` only when the run ends the
+/// page).
+fn run_bounds(g: &Grid, tslot: usize, at: usize) -> (Option<usize>, Option<usize>) {
+    let lo = if at == 0 { Some(tslot) } else { Some(g.slots[at - 1]) };
+    let after_run = g.slots.last().map(|s| s + 1).unwrap_or(tslot + 1);
+    (lo, Some(*g.slots.get(at).unwrap_or(&after_run)))
+}
+
+/// `n` order keys strictly between `lo` and `hi`, evenly spread. `None` when
+/// the gap cannot hold that many — one midpoint per insert halves a gap, so a
+/// batch of inserts needs the whole run planned at once.
+fn keys_between(lo: Option<OrderKey>, hi: Option<OrderKey>, n: usize) -> Option<Vec<OrderKey>> {
+    let n = n as u64;
+    match (lo, hi) {
+        (Some(a), Some(b)) if b.0 > a.0 + n => {
+            let step = (b.0 - a.0) / (n + 1);
+            (0..n).map(|i| OrderKey(a.0 + (i + 1) * step)).collect::<Vec<_>>().into()
+        }
+        (Some(a), None) => {
+            (0..n).map(|i| a.0.checked_add(i + 1)).collect::<Option<Vec<_>>>().map(|v| v.into_iter().map(OrderKey).collect())
+        }
+        (None, Some(b)) if b.0 > n => {
+            let step = b.0 / (n + 1);
+            (0..n).map(|i| OrderKey((i + 1) * step)).collect::<Vec<_>>().into()
+        }
+        (None, None) => (0..n)
+            .map(|i| OrderKey(OrderKey::FIRST.0 + (i + 1) * OrderKey::STRIDE))
+            .collect::<Vec<_>>()
+            .into(),
+        _ => None,
+    }
+}
+
+/// Order keys for one batch of inserts, each into its own gap between two
+/// existing page slots. When a gap is too tight the page is renumbered and
+/// every gap re-derived: a renumber preserves relative order, so the slot
+/// indices stay valid and no key generated on the failed attempt is in the
+/// document yet.
+fn keys_in_gaps(doc: &mut Document, page: PageId, gaps: &[(Option<usize>, Option<usize>, usize)]) -> Option<Vec<Vec<OrderKey>>> {
+    for attempt in 0..2 {
+        if attempt == 1 {
+            doc.renumber_page(page);
+        }
+        let blocks = doc.page_blocks(page);
+        let at = |slot: Option<usize>| slot.and_then(|i| blocks.get(i)).map(|b| b.order);
+        let mut out = Vec::with_capacity(gaps.len());
+        let mut fits = true;
+        for (lo, hi, n) in gaps {
+            match keys_between(at(*lo), at(*hi), *n) {
+                Some(keys) => out.push(keys),
+                None => {
+                    fits = false;
+                    break;
+                }
+            }
+        }
+        if fits {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// One empty child block of `parent`, of `kind`, ordered by `order`. Both
+/// container kinds build their subtree out of these: a table's cells and a
+/// columns block's columns.
+fn new_child(doc: &mut Document, page: PageId, parent: BlockId, order: OrderKey, kind: BlockKind) -> Block {
+    Block {
+        id: doc.alloc_block_id(),
+        page,
+        parent: Some(parent),
+        order,
+        kind,
+        text: String::new(),
+        checked: false,
+        marks: Vec::new(),
+        color: ColorKind::Default,
+        background: ColorKind::Default,
+        page_ref: None,
+        folded: false,
+        attachment: None,
+        img_percent: 100,
+        columns: 0,
+    }
+}
+
+/// One empty cell of table `parent`, ordered by `order`.
+fn new_cell(doc: &mut Document, page: PageId, parent: BlockId, order: OrderKey) -> Block {
+    new_child(doc, page, parent, order, BlockKind::TableCell)
+}
+
+/// A columns block's `Column` children, in display order. The page's block
+/// list is display order, so filtering it yields them — the same reading
+/// `grid` makes of a table.
+fn column_blocks(doc: &Document, page: PageId, id: BlockId) -> Option<Vec<Block>> {
+    let b = doc.block(id)?;
+    if b.kind != BlockKind::Columns {
+        return None;
+    }
+    Some(
+        doc.page_blocks(page)
+            .iter()
+            .filter(|x| x.parent == Some(id) && x.kind == BlockKind::Column)
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The direct content of column `parent`: what one column of the layout shows,
+/// in order. A nested block under one of these rides along inside it — the
+/// delegate walks the column's whole subtree, so a re-parent is all a
+/// reflow needs.
+fn column_children(doc: &Document, page: PageId, column: BlockId) -> Vec<Block> {
+    doc.page_blocks(page)
+        .iter()
+        .filter(|b| b.parent == Some(column))
+        .cloned()
+        .collect()
 }
 
 fn is_list_kind(kind: BlockKind) -> bool {
@@ -122,6 +356,31 @@ fn key_after(doc: &mut Document, page: PageId, idx: usize) -> Option<OrderKey> {
     OrderKey::between(Some(before), after)
 }
 
+/// A block and its whole subtree, in display order — which, because a
+/// parent's children directly follow it, also lists every parent before its
+/// descendants. A delete cascades (`Document::remove_recursive` in memory, the
+/// recursive `WITH RECURSIVE` statement in storage), so undoing one has to
+/// write every descendant back, not just the root it removed.
+fn subtree(doc: &Document, page: PageId, root: BlockId) -> Vec<Block> {
+    let blocks = doc.page_blocks(page);
+    if !blocks.iter().any(|b| b.id == root) {
+        return Vec::new();
+    }
+    let mut keep = HashSet::from([root]);
+    loop {
+        let added: Vec<BlockId> = blocks
+            .iter()
+            .filter(|b| b.parent.is_some_and(|p| keep.contains(&p)) && !keep.contains(&b.id))
+            .map(|b| b.id)
+            .collect();
+        if added.is_empty() {
+            break;
+        }
+        keep.extend(added);
+    }
+    blocks.iter().filter(|b| keep.contains(&b.id)).cloned().collect()
+}
+
 /// The two attachment kinds share their whole shape: a block that points at
 /// stored bytes and takes the file name as its text. Only `kind` differs —
 /// and with it the width tier, which only a picture draws.
@@ -155,6 +414,7 @@ fn insert_attachment(
         folded: false,
         attachment: Some(aid),
         img_percent: 100,
+        columns: 0,
     };
     Some(Entry {
         apply: vec![Change::AttachmentAdded(attachment), Change::BlockInserted(new)],
@@ -262,7 +522,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
         Command::SplitBlock { id, caret } => {
             let idx = doc.index_of(page, id)?;
             let first = doc.page_blocks(page).get(idx)?.clone();
-            if first.kind == BlockKind::Divider {
+            if first.kind == BlockKind::Divider || is_container_kind(first.kind) {
                 return None;
             }
             let caret = snap_left(&first.text, caret);
@@ -292,19 +552,35 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
         Command::MergeBackward { id } => {
             let idx = doc.index_of(page, id)?;
             let this = doc.page_blocks(page).get(idx)?.clone();
+            if is_container_kind(this.kind) {
+                // a cell has no block to merge into — its neighbours are grid
+                // slots, not prose — and a container has no text to merge
+                return None;
+            }
             if idx == 0 {
                 // first block: only an empty one may vanish
                 if this.text.is_empty() {
                     Some(Entry {
                         apply: vec![Change::BlockDeleted { id }],
-                        revert: vec![Change::BlockInserted(this)],
+                        revert: subtree(doc, page, id)
+                            .into_iter()
+                            .map(Change::BlockInserted)
+                            .collect(),
                     })
                 } else {
                     None
                 }
             } else {
                 let prev = doc.page_blocks(page).get(idx - 1)?.clone();
-                if prev.kind == BlockKind::Divider {
+                if prev.kind == BlockKind::Divider
+                    || is_container_kind(prev.kind)
+                    || prev.parent != this.parent
+                {
+                    // Merging stays inside one parent: the flat order puts a
+                    // container's whole subtree between the container and the
+                    // next line, so merging across it would hand the words to
+                    // a block the row cannot show (a grid draws no text) or to
+                    // a sibling of another column.
                     return None;
                 }
                 Some(Entry {
@@ -312,10 +588,14 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                         Change::BlockTextSet { id: prev.id, text: prev.text.clone() + &this.text },
                         Change::BlockDeleted { id },
                     ],
-                    revert: vec![
-                        Change::BlockInserted(this),
-                        Change::BlockTextSet { id: prev.id, text: prev.text },
-                    ],
+                    revert: {
+                        let mut r: Vec<Change> = subtree(doc, page, id)
+                            .into_iter()
+                            .map(Change::BlockInserted)
+                            .collect();
+                        r.push(Change::BlockTextSet { id: prev.id, text: prev.text });
+                        r
+                    },
                 })
             }
         }
@@ -323,21 +603,49 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
         Command::DeleteBlock { id } => {
             let idx = doc.index_of(page, id)?;
             let this = doc.page_blocks(page).get(idx)?.clone();
+            if matches!(this.kind, BlockKind::TableCell | BlockKind::Column) {
+                // cells die with a row or a column, and a column with its
+                // layout — neither is a block the user can point at
+                return None;
+            }
             Some(Entry {
                 apply: vec![Change::BlockDeleted { id }],
-                revert: vec![Change::BlockInserted(this)],
+                // the delete took the subtree with it, so undo re-inserts the
+                // whole of it — a table's grid, a toggle's children
+                revert: subtree(doc, page, id)
+                    .into_iter()
+                    .map(Change::BlockInserted)
+                    .collect(),
             })
         }
 
         Command::InsertBlockAfter { id, kind, text } => {
+            if is_container_kind(kind) {
+                return None; // a grid or a layout is built by SetBlockType, not by a bare kind
+            }
             let idx = doc.index_of(page, id)?;
-            doc.page_blocks(page).get(idx)?;
-            let order = key_after(doc, page, idx)?;
+            let anchor = doc.page_blocks(page).get(idx)?.clone();
+            // The anchor decides where the new block lands and who owns it. A
+            // container's row is its whole subtree, so "+" on a layout means "a
+            // block after the layout" — not one wedged between it and its
+            // boxes, which would break the flat order everything else reads.
+            // A block inside a container keeps its container: a paste at a
+            // caret in a box belongs to that box.
+            let (slot, parent) = match anchor.kind {
+                BlockKind::Columns | BlockKind::Table => {
+                    (doc.index_of(page, subtree(doc, page, id).last()?.id)?, None)
+                }
+                BlockKind::Column | BlockKind::TableCell => {
+                    return None; // a slot of a container, not a row of its own
+                }
+                _ => (idx, anchor.parent),
+            };
+            let order = key_after(doc, page, slot)?;
             let new_id = doc.alloc_block_id();
             let new = Block {
                 id: new_id,
                 page,
-                parent: None,
+                parent,
                 order,
                 kind,
                 text,
@@ -349,6 +657,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 folded: false,
                 attachment: None,
                 img_percent: 100,
+                columns: 0,
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
@@ -383,19 +692,246 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             })
         }
 
+        Command::TableAddRow { id, row } => {
+            let tslot = doc.index_of(page, id)?;
+            let g = grid(doc, page, id)?;
+            if row > g.rows() {
+                return None;
+            }
+            let (lo, hi) = run_bounds(&g, tslot, row * g.cols);
+            let keys = keys_in_gaps(doc, page, &[(lo, hi, g.cols)])?;
+            let mut cells = Vec::new();
+            for k in &keys[0] {
+                cells.push(new_cell(doc, page, id, *k));
+            }
+            Some(Entry {
+                apply: cells.iter().cloned().map(Change::BlockInserted).collect(),
+                revert: cells.iter().map(|c| Change::BlockDeleted { id: c.id }).collect(),
+            })
+        }
+
+        Command::TableAddColumn { id, col } => {
+            let tslot = doc.index_of(page, id)?;
+            let g = grid(doc, page, id)?;
+            let (rows, cols) = (g.rows(), g.cols);
+            if rows == 0 || col > cols {
+                return None;
+            }
+            // one cell per row, each into its own gap, so the whole batch is
+            // keyed before any id is allocated
+            let after_run = *g.slots.last().unwrap_or(&tslot) + 1;
+            let gaps: Vec<(Option<usize>, Option<usize>, usize)> = (0..rows)
+                .map(|r| {
+                    let lo = if col > 0 {
+                        g.slots[r * cols + col - 1]
+                    } else if r > 0 {
+                        g.slots[r * cols - 1]
+                    } else {
+                        tslot
+                    };
+                    let hi = if col < cols {
+                        g.slots[r * cols + col]
+                    } else if r + 1 < rows {
+                        g.slots[(r + 1) * cols]
+                    } else {
+                        after_run
+                    };
+                    (Some(lo), Some(hi), 1)
+                })
+                .collect();
+            let keys = keys_in_gaps(doc, page, &gaps)?;
+            let mut cells = Vec::new();
+            for k in keys.iter().flatten() {
+                cells.push(new_cell(doc, page, id, *k));
+            }
+            let mut apply = vec![Change::BlockColumnsSet { id, columns: (cols + 1) as u16 }];
+            apply.extend(cells.iter().cloned().map(Change::BlockInserted));
+            let mut revert: Vec<Change> =
+                cells.iter().map(|c| Change::BlockDeleted { id: c.id }).collect();
+            revert.push(Change::BlockColumnsSet { id, columns: g.table_columns });
+            Some(Entry { apply, revert })
+        }
+
+        Command::TableDeleteRow { id, row } => {
+            let g = grid(doc, page, id)?;
+            if g.rows() <= 1 || row >= g.rows() {
+                return None; // never the last row: the table itself stays
+            }
+            let doomed: Vec<Block> = g.cells[row * g.cols..(row + 1) * g.cols].to_vec();
+            Some(Entry {
+                apply: doomed.iter().map(|c| Change::BlockDeleted { id: c.id }).collect(),
+                revert: doomed.iter().cloned().map(Change::BlockInserted).collect(),
+            })
+        }
+
+        Command::TableDeleteColumn { id, col } => {
+            let g = grid(doc, page, id)?;
+            let (rows, cols) = (g.rows(), g.cols);
+            if cols <= 1 || col >= cols {
+                return None;
+            }
+            let doomed: Vec<Block> =
+                (0..rows).map(|r| g.cells[r * cols + col].clone()).collect();
+            let mut apply = vec![Change::BlockColumnsSet { id, columns: (cols - 1) as u16 }];
+            apply.extend(doomed.iter().map(|c| Change::BlockDeleted { id: c.id }));
+            let mut revert: Vec<Change> =
+                doomed.iter().cloned().map(Change::BlockInserted).collect();
+            revert.push(Change::BlockColumnsSet { id, columns: g.table_columns });
+            Some(Entry { apply, revert })
+        }
+
+        Command::ColumnsAddColumn { id } => {
+            let cols = column_blocks(doc, page, id)?;
+            if cols.len() >= COLUMNS_MAX as usize {
+                return None; // three is as wide as the layout goes
+            }
+            // the new column and its first line sort after the layout's whole
+            // subtree, which is where a column's siblings end
+            let end = doc.index_of(page, subtree(doc, page, id).last()?.id)?;
+            let keys =
+                keys_in_gaps(doc, page, &[(Some(end), Some(end + 1), 2)])?;
+            let column = new_child(doc, page, id, keys[0][0], BlockKind::Column);
+            let line = new_child(doc, page, column.id, keys[0][1], BlockKind::Paragraph);
+            let (cid, lid) = (column.id, line.id);
+            Some(Entry {
+                apply: vec![
+                    Change::BlockColumnsSet { id, columns: (cols.len() + 1) as u16 },
+                    Change::BlockInserted(column),
+                    Change::BlockInserted(line),
+                ],
+                revert: vec![
+                    Change::BlockDeleted { id: lid },
+                    Change::BlockDeleted { id: cid },
+                    Change::BlockColumnsSet { id, columns: cols.len() as u16 },
+                ],
+            })
+        }
+
+        Command::ColumnsDeleteColumn { id } => {
+            let cols = column_blocks(doc, page, id)?;
+            if cols.len() <= COLUMNS_DEFAULT as usize {
+                return None; // never below two: the layout itself stays
+            }
+            let doomed = cols.last()?;
+            let target = cols.get(cols.len() - 2)?;
+            // The last column's blocks move into the one before it and keep
+            // their order keys: they already sort after its own content, so
+            // the reflow needs no re-keying — and nothing is deleted but the
+            // shape.
+            let mut apply = Vec::new();
+            let mut revert = vec![Change::BlockInserted(doomed.clone())];
+            for item in column_children(doc, page, doomed.id) {
+                apply.push(Change::BlockMoved {
+                    id: item.id,
+                    parent: Some(target.id),
+                    order: item.order,
+                });
+                revert.push(Change::BlockMoved {
+                    id: item.id,
+                    parent: Some(doomed.id),
+                    order: item.order,
+                });
+            }
+            apply.push(Change::BlockColumnsSet { id, columns: (cols.len() - 1) as u16 });
+            apply.push(Change::BlockDeleted { id: doomed.id });
+            revert.push(Change::BlockColumnsSet { id, columns: cols.len() as u16 });
+            Some(Entry { apply, revert })
+        }
+
+        Command::ColumnsAddBlock { id } => {
+            let this = doc.block(id)?;
+            if this.kind != BlockKind::Column {
+                return None; // only a box has boxes to fill
+            }
+            // after the box's whole subtree and before whatever follows it, so
+            // the line reads as the box's last block rather than as the next
+            // box's first
+            let end = doc.index_of(page, subtree(doc, page, id).last()?.id)?;
+            let keys = keys_in_gaps(doc, page, &[(Some(end), Some(end + 1), 1)])?;
+            let line = new_child(doc, page, id, keys[0][0], BlockKind::Paragraph);
+            let lid = line.id;
+            Some(Entry {
+                apply: vec![Change::BlockInserted(line)],
+                revert: vec![Change::BlockDeleted { id: lid }],
+            })
+        }
+
         Command::DuplicateBlock { id } => {
             let idx = doc.index_of(page, id)?;
             let src = doc.page_blocks(page).get(idx)?.clone();
-            let order = key_after(doc, page, idx)?;
+            // A columns block IS its content: copying only the shell would put
+            // an empty layout next to a full one, so the copy carries the whole
+            // subtree with freshly minted ids and its parent links remapped.
+            if src.kind == BlockKind::Columns {
+                let group = subtree(doc, page, id);
+                let land_after = doc.index_of(page, group.last()?.id)?;
+                let keys = keys_in_gaps(
+                    doc,
+                    page,
+                    &[(Some(land_after), Some(land_after + 1), group.len())],
+                )?;
+                let fresh: Vec<BlockId> = group.iter().map(|_| doc.alloc_block_id()).collect();
+                let remap: HashMap<BlockId, BlockId> =
+                    group.iter().zip(&fresh).map(|(b, n)| (b.id, *n)).collect();
+                let mut apply = Vec::with_capacity(group.len());
+                for (src, (new_id, order)) in
+                    group.iter().zip(fresh.iter().zip(&keys[0]))
+                {
+                    let parent = if src.id == id {
+                        src.parent // the root keeps the parent it had
+                    } else {
+                        Some(*remap.get(&src.parent?)?)
+                    };
+                    let mut copy = src.clone();
+                    copy.id = *new_id;
+                    copy.order = *order;
+                    copy.parent = parent;
+                    // a copy of the layout root must not start out hiding a
+                    // subtree the copy does have — the fold is a view state
+                    if src.id == id {
+                        copy.folded = false;
+                    }
+                    apply.push(Change::BlockInserted(copy));
+                }
+                let copy_id = *fresh.first()?;
+                return Some(Entry {
+                    // one delete is enough: it cascades to the copy's subtree
+                    apply,
+                    revert: vec![Change::BlockDeleted { id: copy_id }],
+                });
+            }
+            // A table's cells are part of it: the copy has to carry its own
+            // grid, and it lands after the source's whole run so the two stay
+            // readable as two tables. A grid that cannot be read must not be
+            // copied at all — a cell-less table would open broken.
+            let g = if src.kind == BlockKind::Table {
+                Some(grid(doc, page, id)?)
+            } else {
+                None
+            };
+            let land_after = g.as_ref().and_then(|g| g.slots.last().copied()).unwrap_or(idx);
+            let kids = g.map(|g| g.cells).unwrap_or_default();
+            let keys =
+                keys_in_gaps(doc, page, &[(Some(land_after), Some(land_after + 1), kids.len() + 1)])?;
+            let keys = &keys[0];
             let new_id = doc.alloc_block_id();
             let mut copy = src.clone();
             copy.id = new_id;
-            copy.order = order;
+            copy.order = keys[0];
             // a duplicate is flat (no subtree): it must not start out hiding
             // children that were never copied
             copy.folded = false;
+            let mut apply = vec![Change::BlockInserted(copy)];
+            for (src_cell, k) in kids.iter().zip(keys.iter().skip(1)) {
+                let mut cell = src_cell.clone();
+                cell.id = doc.alloc_block_id();
+                cell.parent = Some(new_id);
+                cell.order = *k;
+                apply.push(Change::BlockInserted(cell));
+            }
             Some(Entry {
-                apply: vec![Change::BlockInserted(copy)],
+                // one delete is enough: storage cascades to the copy's cells
+                apply,
                 revert: vec![Change::BlockDeleted { id: new_id }],
             })
         }
@@ -403,7 +939,25 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
         Command::SetBlockType { id, kind } => {
             let b = doc.block(id)?;
             let old = b.kind;
-            if old == kind {
+            let folded = b.folded;
+            let text = b.text.clone();
+            let columns = b.columns;
+            if old == kind
+                || matches!(kind, BlockKind::TableCell | BlockKind::Column)
+                || matches!(old, BlockKind::TableCell | BlockKind::Column)
+            {
+                // a cell's kind belongs to its grid and a column's to its
+                // layout, not to the Turn-into menu
+                return None;
+            }
+            if (kind == BlockKind::Table || kind == BlockKind::Columns)
+                && (doc.page_blocks(page).iter().any(|x| x.parent == Some(id))
+                    || inside_container(doc, id))
+            {
+                // the block already owns blocks: as a container its children
+                // would vanish behind the grid or the layout, so the
+                // conversion is refused. So is a block inside a container:
+                // the row's delegate has no room for a second one.
                 return None;
             }
             let mut apply = vec![Change::BlockKindSet { id, kind }];
@@ -411,9 +965,110 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             // Only a Toggle draws a chevron, so a folded block of another
             // kind would hide its subtree with no way back: turning one into
             // a plain kind re-opens it (and undo re-closes it).
-            if b.folded && kind != BlockKind::Toggle {
+            if folded && kind != BlockKind::Toggle {
                 apply.push(Change::BlockFoldedSet { id, folded: false });
                 revert.push(Change::BlockFoldedSet { id, folded: true });
+            }
+            if old == BlockKind::Table && columns > 0 {
+                // Flattening a grid keeps the words: the cells become
+                // paragraphs, which the row projection shows again.
+                let g = grid(doc, page, id)?;
+                apply.push(Change::BlockColumnsSet { id, columns: 0 });
+                revert.push(Change::BlockColumnsSet { id, columns });
+                for c in &g.cells {
+                    apply.push(Change::BlockKindSet { id: c.id, kind: BlockKind::Paragraph });
+                    revert.push(Change::BlockKindSet { id: c.id, kind: BlockKind::TableCell });
+                }
+            }
+            if old == BlockKind::Columns && columns > 0 {
+                // Flattening a layout keeps the words and drops the shape: the
+                // columns' blocks move up under the line being flattened, which
+                // leaves them in the same display order as its children, and
+                // the now-empty column containers go away with the shape.
+                let cols = column_blocks(doc, page, id)?;
+                apply.push(Change::BlockColumnsSet { id, columns: 0 });
+                revert.push(Change::BlockColumnsSet { id, columns });
+                for c in &cols {
+                    // the container comes back before its content is re-keyed
+                    // onto it, which is the order storage's parent check needs
+                    revert.push(Change::BlockInserted(c.clone()));
+                    for item in column_children(doc, page, c.id) {
+                        apply.push(Change::BlockMoved {
+                            id: item.id,
+                            parent: Some(id),
+                            order: item.order,
+                        });
+                        revert.push(Change::BlockMoved {
+                            id: item.id,
+                            parent: Some(c.id),
+                            order: item.order,
+                        });
+                    }
+                    apply.push(Change::BlockDeleted { id: c.id });
+                }
+            }
+            if kind == BlockKind::Columns {
+                // The block's own words become the first line of the first
+                // column: a layout draws no text of its own, and losing a line
+                // to a menu pick is not an acceptable trade for the columns.
+                let idx = doc.index_of(page, id)?;
+                let n = COLUMNS_DEFAULT as usize;
+                // one column, and one line inside it, per slot
+                let keys = keys_in_gaps(doc, page, &[(Some(idx), Some(idx + 1), 2 * n)])?;
+                let mut created = Vec::new();
+                for (i, pair) in keys[0].chunks(2).enumerate() {
+                    let column = new_child(doc, page, id, pair[0], BlockKind::Column);
+                    let mut line = new_child(doc, page, column.id, pair[1], BlockKind::Paragraph);
+                    if i == 0 {
+                        line.text = text.clone();
+                    }
+                    created.push(column.id);
+                    created.push(line.id);
+                    apply.push(Change::BlockInserted(column));
+                    apply.push(Change::BlockInserted(line));
+                }
+                apply.push(Change::BlockColumnsSet { id, columns: COLUMNS_DEFAULT });
+                if !text.is_empty() {
+                    apply.push(Change::BlockTextSet { id, text: String::new() });
+                }
+                // reversed, so a line dies before the column holding it: a
+                // delete that found no row is a storage error, not a no-op
+                for c in created.into_iter().rev() {
+                    revert.push(Change::BlockDeleted { id: c });
+                }
+                revert.push(Change::BlockColumnsSet { id, columns: 0 });
+                if !text.is_empty() {
+                    revert.push(Change::BlockTextSet { id, text: text.clone() });
+                }
+            }
+            if kind == BlockKind::Table {
+                // The block's own words become the top-left cell: a table
+                // block draws no text, and losing a line to a menu pick is not
+                // an acceptable trade for the grid.
+                let idx = doc.index_of(page, id)?;
+                let cols = TABLE_DEFAULT_COLUMNS as usize;
+                let total = cols * TABLE_DEFAULT_ROWS as usize;
+                let keys = keys_in_gaps(doc, page, &[(Some(idx), Some(idx + 1), total)])?;
+                let mut created = Vec::new();
+                for (i, k) in keys[0].iter().enumerate() {
+                    let mut cell = new_cell(doc, page, id, *k);
+                    if i == 0 {
+                        cell.text = text.clone();
+                    }
+                    created.push(cell.clone());
+                    apply.push(Change::BlockInserted(cell));
+                }
+                apply.push(Change::BlockColumnsSet { id, columns: TABLE_DEFAULT_COLUMNS });
+                if !text.is_empty() {
+                    apply.push(Change::BlockTextSet { id, text: String::new() });
+                }
+                for c in created.into_iter().rev() {
+                    revert.push(Change::BlockDeleted { id: c.id });
+                }
+                revert.push(Change::BlockColumnsSet { id, columns: 0 });
+                if !text.is_empty() {
+                    revert.push(Change::BlockTextSet { id, text });
+                }
             }
             Some(Entry { apply, revert })
         }
@@ -508,6 +1163,10 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 blocks.get(idx)?.clone()
             };
             let parent_id = this.parent?;
+            if doc.block(parent_id)?.kind == BlockKind::Column {
+                return None; // a column is the layout's boundary: what is in it
+                             // leaves through the layout, not through Shift+Tab
+            }
             // land after the parent's whole subtree, before the parent's
             // next top-level sibling (renumber when the gap is exhausted)
             let order = {
@@ -567,12 +1226,17 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
         Command::MoveBlock { id, delta } => {
             let idx = doc.index_of(page, id)?;
             let blocks = doc.page_blocks(page);
+            let this = blocks.get(idx)?.clone();
+            if this.kind == BlockKind::TableCell {
+                // its siblings are grid slots, so a swap would shuffle two
+                // cells instead of moving anything
+                return None;
+            }
             let target = i32::try_from(idx).ok()? + delta;
             if target < 0 {
                 return None;
             }
             let neighbor_idx = usize::try_from(target).ok()?;
-            let this = blocks.get(idx)?.clone();
             let neighbor = blocks.get(neighbor_idx)?.clone();
             if this.parent != neighbor.parent {
                 return None; // reordering stays within a sibling run
@@ -800,6 +1464,7 @@ mod tests {
                 folded: false,
                 attachment: None,
                 img_percent: 100,
+                columns: 0,
             });
             doc.set_page_blocks(page, v);
             prev = Some(order);
@@ -908,6 +1573,7 @@ mod tests {
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         };
         let c1 = doc.alloc_block_id();
         let c2 = doc.alloc_block_id();
@@ -963,6 +1629,7 @@ mod tests {
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         };
         let a = doc.alloc_block_id();
         let b = doc.alloc_block_id();
@@ -1218,6 +1885,7 @@ mod tests {
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         };
         let p = mk(&mut doc, source, "p", 10, None);
         let c = mk(&mut doc, source, "c", 12, Some(p.id));
@@ -1520,5 +2188,710 @@ mod tests {
         let back = doc.block(ids[1]).unwrap();
         assert_eq!(back.kind, BlockKind::Paragraph);
         assert_eq!(back.attachment, None);
+    }
+
+    // ---- table grid (SPEC §三十七 批次 B) ----
+
+    fn to_table(doc: &mut Document, hist: &mut History, page: PageId, id: BlockId) {
+        exec(doc, hist, page, Command::SetBlockType { id, kind: BlockKind::Table }).unwrap();
+    }
+
+    fn cells(doc: &Document, page: PageId, table: BlockId) -> Vec<Block> {
+        doc.page_blocks(page).iter().filter(|b| b.parent == Some(table)).cloned().collect()
+    }
+
+    /// A 3x2 grid whose cells read A0..A2 / B0..B2, from the "first" paragraph.
+    fn labeled_table(doc: &mut Document, hist: &mut History, page: PageId, id: BlockId) {
+        to_table(doc, hist, page, id);
+        let labels = ["A0", "A1", "A2", "B0", "B1", "B2"];
+        for (cell, label) in cells(doc, page, id).iter().zip(labels) {
+            exec(doc, hist, page, Command::ReplaceText { id: cell.id, text: label.into() })
+                .unwrap();
+        }
+    }
+
+    fn texts(doc: &Document, page: PageId, table: BlockId) -> Vec<String> {
+        cells(doc, page, table).iter().map(|c| c.text.clone()).collect()
+    }
+
+    #[test]
+    fn a_line_becomes_a_grid_that_holds_its_words() {
+        let (mut doc, mut hist, page, ids) = setup();
+        to_table(&mut doc, &mut hist, page, ids[0]);
+        let table = doc.block(ids[0]).unwrap();
+        assert_eq!(table.kind, BlockKind::Table);
+        assert_eq!(table.columns, TABLE_DEFAULT_COLUMNS);
+        // a grid draws no text of its own, so the line's words moved to the
+        // top-left cell rather than disappearing with the paragraph
+        assert_eq!(table.text, "");
+        let grid = cells(&doc, page, ids[0]);
+        assert_eq!(grid.len(), (TABLE_DEFAULT_COLUMNS * TABLE_DEFAULT_ROWS) as usize);
+        assert!(grid.iter().all(|b| b.kind == BlockKind::TableCell && b.parent == Some(ids[0])));
+        assert_eq!(grid[0].text, "first");
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks[0].id, ids[0]);
+        assert_eq!(blocks[1].id, grid[0].id);
+        assert_eq!(blocks.last().unwrap().id, ids[2]);
+
+        undo(&mut doc, &mut hist, page);
+        let back = doc.block(ids[0]).unwrap();
+        assert_eq!((back.kind, back.text.as_str(), back.columns), (BlockKind::Paragraph, "first", 0));
+        assert_eq!(doc.page_blocks(page).len(), 3);
+        redo(&mut doc, &mut hist, page);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 6);
+        assert_eq!(doc.block(ids[0]).unwrap().columns, TABLE_DEFAULT_COLUMNS);
+    }
+
+    #[test]
+    fn turning_a_block_that_owns_children_into_a_table_is_refused() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let order = OrderKey::between(Some(doc.block(ids[1]).unwrap().order), None).unwrap();
+        doc.apply(&[Change::BlockMoved { id: ids[2], parent: Some(ids[1]), order }]);
+        // ids[1] already has a child: as a table it would hide behind the grid
+        assert!(exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::SetBlockType { id: ids[1], kind: BlockKind::Table }
+        )
+        .is_none());
+        assert_eq!(doc.block(ids[1]).unwrap().kind, BlockKind::Paragraph);
+        // a block with nothing under it still converts
+        assert!(exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::SetBlockType { id: ids[0], kind: BlockKind::Table }
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn adding_a_row_appends_whole_rows_and_undo_drops_them() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+
+        exec(&mut doc, &mut hist, page, Command::TableAddRow { id: ids[0], row: 2 }).unwrap();
+        assert_eq!(
+            texts(&doc, page, ids[0]),
+            ["A0", "A1", "A2", "B0", "B1", "B2", "", "", ""]
+        );
+        // a row can also land at the top — the slot is where the cells sort
+        exec(&mut doc, &mut hist, page, Command::TableAddRow { id: ids[0], row: 0 }).unwrap();
+        assert_eq!(texts(&doc, page, ids[0])[..3], ["", "", ""]);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 12);
+        // one past the last row is the append the Tab key asks for; two past
+        // is a row that cannot exist, so the plan refuses it
+        exec(&mut doc, &mut hist, page, Command::TableAddRow { id: ids[0], row: 4 }).unwrap();
+        assert_eq!(cells(&doc, page, ids[0]).len(), 15);
+        assert!(exec(&mut doc, &mut hist, page, Command::TableAddRow { id: ids[0], row: 6 }).is_none());
+        // and a row is the unit: no table command runs on a non-table
+        assert!(exec(&mut doc, &mut hist, page, Command::TableAddRow { id: ids[1], row: 0 }).is_none());
+
+        for _ in 0..3 {
+            undo(&mut doc, &mut hist, page);
+        }
+        assert_eq!(texts(&doc, page, ids[0]), ["A0", "A1", "A2", "B0", "B1", "B2"]);
+    }
+
+    #[test]
+    fn adding_a_column_puts_one_cell_in_every_row() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+
+        exec(&mut doc, &mut hist, page, Command::TableAddColumn { id: ids[0], col: 1 }).unwrap();
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 4);
+        // row-major: the new cell of each row sits after that row's column 0
+        assert_eq!(
+            texts(&doc, page, ids[0]),
+            ["A0", "", "A1", "A2", "B0", "", "B1", "B2"]
+        );
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 3);
+        assert_eq!(texts(&doc, page, ids[0]), ["A0", "A1", "A2", "B0", "B1", "B2"]);
+        redo(&mut doc, &mut hist, page);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 8);
+
+        // at the far edge, and past the last column
+        exec(&mut doc, &mut hist, page, Command::TableAddColumn { id: ids[0], col: 4 }).unwrap();
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 5);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 10);
+        assert!(exec(&mut doc, &mut hist, page, Command::TableAddColumn { id: ids[0], col: 6 }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::TableAddColumn { id: ids[1], col: 0 }).is_none());
+    }
+
+    #[test]
+    fn deleting_a_row_or_column_takes_only_its_own_cells() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+
+        exec(&mut doc, &mut hist, page, Command::TableDeleteRow { id: ids[0], row: 0 }).unwrap();
+        assert_eq!(texts(&doc, page, ids[0]), ["B0", "B1", "B2"]);
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 6);
+        assert_eq!(texts(&doc, page, ids[0]), ["A0", "A1", "A2", "B0", "B1", "B2"]);
+
+        exec(&mut doc, &mut hist, page, Command::TableDeleteColumn { id: ids[0], col: 1 }).unwrap();
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 2);
+        assert_eq!(texts(&doc, page, ids[0]), ["A0", "A2", "B0", "B2"]);
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 3);
+        assert_eq!(texts(&doc, page, ids[0]), ["A0", "A1", "A2", "B0", "B1", "B2"]);
+
+        // out of range, and the last row / last column are protected
+        assert!(exec(&mut doc, &mut hist, page, Command::TableDeleteRow { id: ids[0], row: 2 }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::TableDeleteColumn { id: ids[0], col: 3 }).is_none());
+        exec(&mut doc, &mut hist, page, Command::TableDeleteRow { id: ids[0], row: 1 }).unwrap();
+        assert_eq!(cells(&doc, page, ids[0]).len(), 3);
+        assert!(exec(&mut doc, &mut hist, page, Command::TableDeleteRow { id: ids[0], row: 0 }).is_none());
+        exec(&mut doc, &mut hist, page, Command::TableDeleteColumn { id: ids[0], col: 2 }).unwrap();
+        exec(&mut doc, &mut hist, page, Command::TableDeleteColumn { id: ids[0], col: 1 }).unwrap();
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 1);
+        assert_eq!(texts(&doc, page, ids[0]), ["A0"]);
+        assert!(exec(&mut doc, &mut hist, page, Command::TableDeleteColumn { id: ids[0], col: 0 }).is_none());
+        // the table itself never dies from the grid toolbar
+        assert_eq!(cells(&doc, page, ids[0]).len(), 1);
+        assert_eq!(doc.block(ids[0]).unwrap().kind, BlockKind::Table);
+    }
+
+    #[test]
+    fn flattening_a_grid_gives_the_words_back_as_paragraphs() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::SetBlockType { id: ids[0], kind: BlockKind::Heading2 },
+        )
+        .unwrap();
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks[0].kind, BlockKind::Heading2);
+        assert_eq!(blocks[0].columns, 0);
+        // the cells are visible blocks again, in grid order, words and all
+        assert_eq!(
+            texts(&doc, page, ids[0]),
+            ["A0", "A1", "A2", "B0", "B1", "B2"]
+        );
+        assert!(cells(&doc, page, ids[0]).iter().all(|b| b.kind == BlockKind::Paragraph));
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(ids[0]).unwrap().kind, BlockKind::Table);
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 3);
+        assert!(cells(&doc, page, ids[0]).iter().all(|b| b.kind == BlockKind::TableCell));
+    }
+
+    #[test]
+    fn a_cell_is_not_a_prose_block() {
+        let (mut doc, mut hist, page, ids) = setup();
+        to_table(&mut doc, &mut hist, page, ids[0]);
+        let grid = ids_from(&cells(&doc, page, ids[0]));
+
+        // it moves with its grid, not with Alt+Up/Down
+        let before = doc.page_blocks(page).iter().map(|b| b.id).collect::<Vec<_>>();
+        for delta in [1i32, -1] {
+            assert!(exec(&mut doc, &mut hist, page, Command::MoveBlock { id: grid[1], delta }).is_none());
+        }
+        assert_eq!(doc.page_blocks(page).iter().map(|b| b.id).collect::<Vec<_>>(), before);
+        // and it dies with a row or a column, never alone or merged away
+        assert!(exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: grid[1] }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::MergeBackward { id: grid[1] }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::MergeBackward { id: ids[0] }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SplitBlock { id: grid[1], caret: 0 }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SplitBlock { id: ids[0], caret: 0 }).is_none());
+        // no bare kind builds a grid, and the Turn-into menu keeps out of it
+        assert!(exec(&mut doc, &mut hist, page, Command::InsertBlockAfter { id: ids[1], kind: BlockKind::Table, text: "".into() }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::InsertBlockAfter { id: ids[1], kind: BlockKind::TableCell, text: "".into() }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SetBlockType { id: grid[1], kind: BlockKind::Paragraph }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SetBlockType { id: ids[1], kind: BlockKind::TableCell }).is_none());
+        assert_eq!(doc.page_blocks(page).len(), before.len());
+    }
+
+    fn ids_from(blocks: &[Block]) -> Vec<BlockId> {
+        blocks.iter().map(|b| b.id).collect()
+    }
+
+    #[test]
+    fn a_table_copy_carries_its_own_grid() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+
+        exec(&mut doc, &mut hist, page, Command::DuplicateBlock { id: ids[0] }).unwrap();
+        let original = ids[0];
+        let copy = doc
+            .page_blocks(page)
+            .iter()
+            .find(|b| b.kind == BlockKind::Table && b.id != original)
+            .unwrap()
+            .id;
+        assert_eq!(doc.block(copy).unwrap().columns, 3);
+        // the copy is ordered as its own grid: two rows of three, same words
+        assert_eq!(texts(&doc, page, copy), ["A0", "A1", "A2", "B0", "B1", "B2"]);
+        assert_eq!(cells(&doc, page, original).len(), 6);
+        // and it landed after the source's whole run, so both read as tables
+        let order = doc.page_blocks(page).iter().map(|b| b.parent).collect::<Vec<_>>();
+        assert_eq!(order, vec![
+            None,
+            Some(original),
+            Some(original),
+            Some(original),
+            Some(original),
+            Some(original),
+            Some(original),
+            None,
+            Some(copy),
+            Some(copy),
+            Some(copy),
+            Some(copy),
+            Some(copy),
+            Some(copy),
+            None,
+            None,
+        ]);
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(copy), None);
+        assert_eq!(cells(&doc, page, original).len(), 6);
+    }
+
+    #[test]
+    fn a_ragged_grid_is_not_editable() {
+        // grid() refuses a cell count that is not a whole number of rows rather
+        // than guess which row is short — so does every command built on it.
+        let (mut doc, mut hist, page, ids) = setup();
+        to_table(&mut doc, &mut hist, page, ids[0]);
+        let stray = cells(&doc, page, ids[0])[4].id;
+        doc.apply(&[Change::BlockDeleted { id: stray }]);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 5);
+        for cmd in [
+            Command::TableAddRow { id: ids[0], row: 2 },
+            Command::TableAddColumn { id: ids[0], col: 0 },
+            Command::TableDeleteRow { id: ids[0], row: 0 },
+            Command::TableDeleteColumn { id: ids[0], col: 0 },
+            Command::DuplicateBlock { id: ids[0] },
+        ] {
+            assert!(exec(&mut doc, &mut hist, page, cmd.clone()).is_none(), "{cmd:?} ran on a ragged grid");
+        }
+    }
+
+    #[test]
+    fn cells_key_into_one_gap_as_a_batch() {
+        // Each insert halves a gap, so a batch keyed one at a time would run
+        // out before the row finished. keys_in_gaps plans the whole batch, and
+        // renumbers once when the gap cannot hold it.
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+        for _ in 0..40 {
+            let row = cells(&doc, page, ids[0]).len() / 3;
+            exec(&mut doc, &mut hist, page, Command::TableAddRow { id: ids[0], row }).unwrap();
+        }
+        assert_eq!(cells(&doc, page, ids[0]).len(), 6 + 40 * 3);
+        // still a grid: whole rows, and every cell sorts inside its table
+        let grid = cells(&doc, page, ids[0]);
+        let blocks = doc.page_blocks(page);
+        let tslot = blocks.iter().position(|b| b.id == ids[0]).unwrap();
+        assert_eq!(blocks[tslot + 1].id, grid[0].id);
+        assert_eq!(blocks[tslot + grid.len()].id, grid[grid.len() - 1].id);
+        assert_eq!(blocks[tslot + grid.len() + 1].id, ids[1]);
+    }
+
+    #[test]
+    fn undoing_a_table_delete_brings_the_grid_back() {
+        // the delete cascades, in memory and in storage, so the revert list has
+        // to carry the cells too — a table restored without its grid reads as
+        // an empty one and the words are gone for good
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+        assert_eq!(cells(&doc, page, ids[0]).len(), 6);
+        exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: ids[0] }).unwrap();
+        assert_eq!(doc.page_blocks(page).len(), 2);
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(ids[0]).unwrap().kind, BlockKind::Table);
+        assert_eq!(texts(&doc, page, ids[0]), ["A0", "A1", "A2", "B0", "B1", "B2"]);
+        // and the grid is still in its own slot run, so the row projection
+        // reads three columns twice rather than a table that ends mid-row
+        let order: Vec<Option<BlockId>> =
+            doc.page_blocks(page).iter().map(|b| b.parent).collect();
+        assert_eq!(
+            order,
+            vec![
+                None,
+                Some(ids[0]),
+                Some(ids[0]),
+                Some(ids[0]),
+                Some(ids[0]),
+                Some(ids[0]),
+                Some(ids[0]),
+                None,
+                None
+            ]
+        );
+        // redo takes the whole thing away again
+        crate::core::command::redo(&mut doc, &mut hist, page);
+        assert_eq!(doc.page_blocks(page).len(), 2);
+    }
+
+    #[test]
+    fn undoing_a_toggle_delete_brings_its_children_back() {
+        let (mut doc, mut hist, page, ids) = setup();
+        for id in [&ids[0], &ids[1]] {
+            exec(&mut doc, &mut hist, page, Command::SetBlockType { id: *id, kind: BlockKind::Bullet })
+                .unwrap();
+        }
+        exec(&mut doc, &mut hist, page, Command::IndentList { id: ids[1] }).unwrap();
+        exec(&mut doc, &mut hist, page, Command::SetBlockType { id: ids[0], kind: BlockKind::Toggle })
+            .unwrap();
+        assert_eq!(doc.block(ids[1]).unwrap().parent, Some(ids[0]));
+        exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: ids[0] }).unwrap();
+        assert_eq!(doc.page_blocks(page).len(), 1);
+        undo(&mut doc, &mut hist, page);
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>(), ["first", "second", "third"]);
+        assert_eq!(blocks[1].parent, Some(ids[0]));
+    }
+
+    #[test]
+    fn undoing_a_merge_that_ate_a_subtree_restores_it() {
+        // a merged block is deleted, so its children went with it
+        let (mut doc, mut hist, page, ids) = setup();
+        for id in [&ids[1], &ids[2]] {
+            exec(&mut doc, &mut hist, page, Command::SetBlockType { id: *id, kind: BlockKind::Bullet })
+                .unwrap();
+        }
+        exec(&mut doc, &mut hist, page, Command::IndentList { id: ids[2] }).unwrap();
+        exec(&mut doc, &mut hist, page, Command::MergeBackward { id: ids[1] }).unwrap();
+        assert_eq!(doc.page_blocks(page).len(), 1);
+        undo(&mut doc, &mut hist, page);
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>(), ["first", "second", "third"]);
+        assert_eq!(blocks[2].parent, Some(ids[1]));
+    }
+
+    // ---- columns layout (SPEC §三十七 批次 B) ----
+
+    fn to_columns(doc: &mut Document, hist: &mut History, page: PageId, id: BlockId) {
+        exec(doc, hist, page, Command::SetBlockType { id, kind: BlockKind::Columns }).unwrap();
+    }
+
+    /// A layout's boxes, left to right.
+    fn boxes(doc: &Document, page: PageId, layout: BlockId) -> Vec<Block> {
+        doc.page_blocks(page)
+            .iter()
+            .filter(|b| b.parent == Some(layout) && b.kind == BlockKind::Column)
+            .cloned()
+            .collect()
+    }
+
+    /// What one box shows: its direct content, in order.
+    fn lines(doc: &Document, page: PageId, column: BlockId) -> Vec<Block> {
+        column_children(doc, page, column)
+    }
+
+    /// Append a labelled line to a box, as the empty-box click does.
+    fn add_line(doc: &mut Document, hist: &mut History, page: PageId, column: BlockId, label: &str) -> BlockId {
+        let changes =
+            exec(doc, hist, page, Command::ColumnsAddBlock { id: column }).unwrap();
+        let id = changes
+            .iter()
+            .find_map(|c| match c {
+                Change::BlockInserted(b) => Some(b.id),
+                _ => None,
+            })
+            .unwrap();
+        exec(doc, hist, page, Command::ReplaceText { id, text: label.into() }).unwrap();
+        id
+    }
+
+    /// A 2-box layout reading A0 / A1 and B0 / B1, from the "first" paragraph.
+    fn labeled_layout(doc: &mut Document, hist: &mut History, page: PageId, id: BlockId) {
+        to_columns(doc, hist, page, id);
+        let bs = boxes(doc, page, id);
+        for (i, b) in bs.iter().enumerate() {
+            let first = lines(doc, page, b.id)[0].id;
+            let label = ["A", "B"][i];
+            exec(doc, hist, page, Command::ReplaceText { id: first, text: format!("{label}0") })
+                .unwrap();
+            add_line(doc, hist, page, b.id, &format!("{label}1"));
+        }
+    }
+
+    #[test]
+    fn a_line_becomes_a_layout_that_holds_its_words() {
+        let (mut doc, mut hist, page, ids) = setup();
+        to_columns(&mut doc, &mut hist, page, ids[0]);
+        let layout = doc.block(ids[0]).unwrap();
+        assert_eq!(layout.kind, BlockKind::Columns);
+        assert_eq!(layout.columns, COLUMNS_DEFAULT);
+        // a layout draws no text of its own, so the line's words moved into the
+        // first box rather than disappearing with the paragraph
+        assert_eq!(layout.text, "");
+        let bs = boxes(&doc, page, ids[0]);
+        assert_eq!(bs.len(), 2);
+        let left = lines(&doc, page, bs[0].id);
+        let right = lines(&doc, page, bs[1].id);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, BlockKind::Paragraph);
+        assert_eq!(left[0].text, "first");
+        assert_eq!(right[0].text, "");
+        // the boxes are the layout's only direct children, and each sorts
+        // before its own content
+        let parents = doc.page_blocks(page).iter().map(|b| b.parent).collect::<Vec<_>>();
+        assert_eq!(parents, vec![
+            None,
+            Some(ids[0]),
+            Some(bs[0].id),
+            Some(ids[0]),
+            Some(bs[1].id),
+            None,
+            None,
+        ]);
+
+        undo(&mut doc, &mut hist, page);
+        let back = doc.block(ids[0]).unwrap();
+        assert_eq!(back.kind, BlockKind::Paragraph);
+        assert_eq!(back.columns, 0);
+        assert_eq!(back.text, "first");
+        assert_eq!(doc.page_blocks(page).len(), 3);
+    }
+
+    #[test]
+    fn adding_a_box_gives_it_a_line_and_deleting_one_reflows_its_words() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+
+        exec(&mut doc, &mut hist, page, Command::ColumnsAddColumn { id: ids[0] }).unwrap();
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 3);
+        let bs = boxes(&doc, page, ids[0]);
+        assert_eq!(bs.len(), 3);
+        // the new box is not a dead end: it arrives with a line to type into
+        assert_eq!(lines(&doc, page, bs[2].id).len(), 1);
+        assert_eq!(
+            doc.page_blocks(page).iter().filter(|b| b.parent == Some(bs[2].id)).count(),
+            1
+        );
+        // three is as wide as the layout goes
+        assert!(exec(&mut doc, &mut hist, page, Command::ColumnsAddColumn { id: ids[0] }).is_none());
+
+        exec(&mut doc, &mut hist, page, Command::ColumnsDeleteColumn { id: ids[0] }).unwrap();
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 2);
+        // nothing was deleted but the shape: the last box's line moved into
+        // the one before it
+        assert_eq!(lines(&doc, page, boxes(&doc, page, ids[0])[1].id).len(), 3);
+        assert_eq!(boxes(&doc, page, ids[0]).len(), 2);
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(ids[0]).unwrap().columns, 3);
+        assert_eq!(boxes(&doc, page, ids[0]).len(), 3);
+        assert_eq!(lines(&doc, page, boxes(&doc, page, ids[0])[2].id).len(), 1);
+
+        // and never below two: the layout itself is not the delete target
+        exec(&mut doc, &mut hist, page, Command::ColumnsDeleteColumn { id: ids[0] }).unwrap();
+        assert!(exec(&mut doc, &mut hist, page, Command::ColumnsDeleteColumn { id: ids[0] }).is_none());
+        assert_eq!(doc.block(ids[0]).unwrap().kind, BlockKind::Columns);
+    }
+
+    #[test]
+    fn an_empty_box_takes_the_click_as_a_request_for_a_line() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+        let bs = boxes(&doc, page, ids[0]);
+        for line in lines(&doc, page, bs[1].id) {
+            exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: line.id }).unwrap();
+        }
+        assert!(lines(&doc, page, bs[1].id).is_empty());
+
+        let new = add_line(&mut doc, &mut hist, page, bs[1].id, "typed");
+        // it sorts inside the box: right after the container, before whatever
+        // follows it, so the next box still reads as the next box
+        let blocks = doc.page_blocks(page);
+        let slot = blocks.iter().position(|b| b.id == bs[1].id).unwrap();
+        assert_eq!(blocks[slot + 1].id, new);
+        assert_eq!(blocks[slot + 1].parent, Some(bs[1].id));
+        assert_eq!(doc.block(new).unwrap().kind, BlockKind::Paragraph);
+
+        undo(&mut doc, &mut hist, page);
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(new), None);
+        assert!(lines(&doc, page, bs[1].id).is_empty());
+
+        // only a box has boxes to fill
+        assert!(exec(&mut doc, &mut hist, page, Command::ColumnsAddBlock { id: ids[0] }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::ColumnsAddBlock { id: new }).is_none());
+    }
+
+    #[test]
+    fn flattening_a_layout_keeps_the_words_and_drops_the_shape() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::SetBlockType { id: ids[0], kind: BlockKind::Heading2 },
+        )
+        .unwrap();
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks[0].kind, BlockKind::Heading2);
+        assert_eq!(blocks[0].columns, 0);
+        assert!(!blocks.iter().any(|b| b.kind == BlockKind::Column));
+        // the boxes are gone; their lines stayed in the same display order and
+        // moved up under the heading, which is what a toggle does with them
+        assert_eq!(
+            blocks.iter().filter(|b| b.parent == Some(ids[0])).map(|b| b.text.as_str()).collect::<Vec<_>>(),
+            ["A0", "A1", "B0", "B1"]
+        );
+
+        undo(&mut doc, &mut hist, page);
+        let back = doc.block(ids[0]).unwrap();
+        assert_eq!(back.kind, BlockKind::Columns);
+        assert_eq!(back.columns, 2);
+        let bs = boxes(&doc, page, ids[0]);
+        assert_eq!(bs.len(), 2);
+        assert_eq!(texts_of(&lines(&doc, page, bs[0].id)), ["A0", "A1"]);
+        assert_eq!(texts_of(&lines(&doc, page, bs[1].id)), ["B0", "B1"]);
+    }
+
+    fn texts_of(blocks: &[Block]) -> Vec<String> {
+        blocks.iter().map(|b| b.text.clone()).collect()
+    }
+
+    #[test]
+    fn a_box_is_not_a_prose_block() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+        let bs = boxes(&doc, page, ids[0]);
+        let item = lines(&doc, page, bs[0].id)[0].id;
+        let before = doc.page_blocks(page).iter().map(|b| b.id).collect::<Vec<_>>();
+
+        // a box dies with its layout, never alone, and its kind is not a menu
+        // choice
+        assert!(exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: bs[0].id }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::MergeBackward { id: bs[0].id }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SetBlockType { id: bs[0].id, kind: BlockKind::Paragraph }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SetBlockType { id: ids[1], kind: BlockKind::Column }).is_none());
+        // a line stays in its box: it cannot walk out with Alt+Up, be promoted
+        // out of it, or host a second container
+        assert!(exec(&mut doc, &mut hist, page, Command::MoveBlock { id: item, delta: -1 }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::MoveBlock { id: bs[0].id, delta: 1 }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::OutdentList { id: item }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SetBlockType { id: item, kind: BlockKind::Table }).is_none());
+        assert!(exec(&mut doc, &mut hist, page, Command::SetBlockType { id: item, kind: BlockKind::Columns }).is_none());
+        // a container does not build inside a container
+        assert!(exec(&mut doc, &mut hist, page, Command::InsertBlockAfter { id: bs[0].id, kind: BlockKind::Paragraph, text: "".into() }).is_none());
+        assert_eq!(doc.page_blocks(page).iter().map(|b| b.id).collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn editing_inside_a_box_stays_inside_it() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+        let bs = boxes(&doc, page, ids[0]);
+        let item = lines(&doc, page, bs[0].id)[0].id;
+
+        // Enter splits the line into two lines of the same box
+        exec(&mut doc, &mut hist, page, Command::SplitBlock { id: item, caret: 1 }).unwrap();
+        let after = lines(&doc, page, bs[0].id);
+        assert_eq!(texts_of(&after), ["A", "0", "A1"]);
+        assert!(after.iter().all(|b| b.parent == Some(bs[0].id)));
+        // and backspace at the start of a box's first line does not eat the
+        // box: its neighbour is a different parent
+        assert!(exec(&mut doc, &mut hist, page, Command::MergeBackward { id: after[0].id }).is_none());
+        // Alt+Up/Down can reorder a box's own lines — siblings, so the swap is
+        // allowed — but never past the box's edge
+        exec(&mut doc, &mut hist, page, Command::MoveBlock { id: after[0].id, delta: 1 }).unwrap();
+        assert_eq!(texts_of(&lines(&doc, page, bs[0].id)), ["0", "A", "A1"]);
+        // ... and the box's first line has nowhere further up to go
+        assert!(exec(&mut doc, &mut hist, page, Command::MoveBlock { id: after[1].id, delta: -1 })
+            .is_none());
+        // the second box is untouched
+        assert_eq!(texts_of(&lines(&doc, page, bs[1].id)), ["B0", "B1"]);
+    }
+
+    #[test]
+    fn a_layout_copy_carries_its_own_boxes() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+
+        exec(&mut doc, &mut hist, page, Command::DuplicateBlock { id: ids[0] }).unwrap();
+        let original = ids[0];
+        let copy = doc
+            .page_blocks(page)
+            .iter()
+            .find(|b| b.kind == BlockKind::Columns && b.id != original)
+            .unwrap()
+            .id;
+        assert_eq!(doc.block(copy).unwrap().columns, 2);
+        let cb = boxes(&doc, page, copy);
+        assert_eq!(cb.len(), 2);
+        assert_eq!(texts_of(&lines(&doc, page, cb[0].id)), ["A0", "A1"]);
+        assert_eq!(texts_of(&lines(&doc, page, cb[1].id)), ["B0", "B1"]);
+        // the copy is its own layout: different boxes, different lines
+        assert!(boxes(&doc, page, original).iter().all(|b| !cb.iter().any(|c| c.id == b.id)));
+        // and it landed after the source's whole subtree, so both read as
+        // layouts rather than one layout with a stray line in the middle
+        let blocks = doc.page_blocks(page);
+        let slot = blocks.iter().position(|b| b.id == copy).unwrap();
+        assert_eq!(blocks[slot - 1].parent, Some(boxes(&doc, page, original)[1].id));
+        assert_eq!(
+            blocks.iter().filter(|b| b.parent.is_none()).map(|b| b.id).collect::<Vec<_>>(),
+            vec![original, copy, ids[1], ids[2]]
+        );
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(doc.block(copy), None);
+        assert_eq!(boxes(&doc, page, original).len(), 2);
+    }
+
+    #[test]
+    fn undoing_a_layout_delete_brings_its_boxes_back() {
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+        exec(&mut doc, &mut hist, page, Command::DeleteBlock { id: ids[0] }).unwrap();
+        assert_eq!(doc.page_blocks(page).len(), 2);
+        undo(&mut doc, &mut hist, page);
+        let back = doc.block(ids[0]).unwrap();
+        assert_eq!(back.kind, BlockKind::Columns);
+        assert_eq!(back.columns, 2);
+        // the words are not gone for good: the cascade came back with them
+        let bs = boxes(&doc, page, ids[0]);
+        assert_eq!(texts_of(&lines(&doc, page, bs[0].id)), ["A0", "A1"]);
+        assert_eq!(texts_of(&lines(&doc, page, bs[1].id)), ["B0", "B1"]);
+        redo(&mut doc, &mut hist, page);
+        assert_eq!(doc.page_blocks(page).len(), 2);
+    }
+
+    #[test]
+    fn a_line_after_a_layout_lands_outside_it() {
+        // "+" on the layout's row means "a block after the layout": the new
+        // line must not sort between the layout and its first box
+        let (mut doc, mut hist, page, ids) = setup();
+        labeled_layout(&mut doc, &mut hist, page, ids[0]);
+        let changes = exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertBlockAfter {
+                id: ids[0],
+                kind: BlockKind::Paragraph,
+                text: "after".into(),
+            },
+        )
+        .unwrap();
+        let new = changes
+            .iter()
+            .find_map(|c| match c {
+                Change::BlockInserted(b) => Some(b.id),
+                _ => None,
+            })
+            .unwrap();
+        let blocks = doc.page_blocks(page);
+        let slot = blocks.iter().position(|b| b.id == new).unwrap();
+        assert_eq!(blocks[slot].parent, None);
+        // the whole layout is above it, the next paragraph below
+        assert_eq!(blocks[slot - 1].parent, Some(boxes(&doc, page, ids[0])[1].id));
+        assert_eq!(blocks[slot + 1].id, ids[1]);
     }
 }

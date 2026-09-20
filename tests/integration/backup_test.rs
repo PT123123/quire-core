@@ -305,6 +305,7 @@ fn a_recovered_database_is_searchable_straight_away() {
         folded: false,
         attachment: None,
         img_percent: 100,
+        columns: 0,
             }),
         ])
         .unwrap();
@@ -456,6 +457,7 @@ fn snapshot_cost() {
         folded: false,
         attachment: None,
         img_percent: 100,
+        columns: 0,
         })
         .collect();
     {

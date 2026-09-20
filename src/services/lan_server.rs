@@ -255,6 +255,7 @@ mod tests {
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         });
         state.settings.insert("theme".into(), "dark".into());
         repo.replace_all(&state).unwrap();

@@ -105,6 +105,7 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         }));
     }
     changes

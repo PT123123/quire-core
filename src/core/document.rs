@@ -88,10 +88,14 @@ impl Document {
     /// mid-insert finds no gap. Deliberately NOT emitted as `Change`s: the
     /// relative order is unchanged, so persisted keys may drift from memory
     /// keys without breaking anything (storage only preserves order).
+    ///
+    /// The stride is wide on purpose: a table inserts several cells into one
+    /// gap at a time, and each insert halves it, so the post-renumber gap has
+    /// to survive more than one insert.
     pub fn renumber_page(&mut self, page: PageId) {
         if let Some(vec) = self.pages.get_mut(&page) {
             for (i, b) in vec.iter_mut().enumerate() {
-                b.order = OrderKey((1 << 32) + (2 * i) as u64);
+                b.order = OrderKey((1 << 32) + (i as u64) * OrderKey::STRIDE);
             }
         }
     }
@@ -198,6 +202,11 @@ impl Document {
                         b.img_percent = *percent;
                     }
                 }
+                Change::BlockColumnsSet { id, columns } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.columns = *columns;
+                    }
+                }
                 _ => {}
             }
         }
@@ -241,6 +250,7 @@ mod tests {
             folded: false,
             attachment: None,
             img_percent: 100,
+            columns: 0,
         }
     }
 

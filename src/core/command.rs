@@ -24,6 +24,10 @@ pub enum Command {
     DeleteBlock { id: BlockId },
     /// Block of `kind` with initial `text` directly after `id`.
     InsertBlockAfter { id: BlockId, kind: BlockKind, text: String },
+    /// Block of `kind` at the end of the page, for a page that has no row to
+    /// anchor on. Every other insert speaks of "after this block", so an empty
+    /// page had no way in: this is its front door.
+    AppendBlock { kind: BlockKind, text: String },
     /// Deep copy of one block (flat model: no subtree) right after it.
     DuplicateBlock { id: BlockId },
     SetBlockType { id: BlockId, kind: BlockKind },
@@ -646,6 +650,37 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 id: new_id,
                 page,
                 parent,
+                order,
+                kind,
+                text,
+                checked: false,
+                marks: Vec::new(),
+                color: ColorKind::Default,
+                background: ColorKind::Default,
+                page_ref: None,
+                folded: false,
+                attachment: None,
+                img_percent: 100,
+                columns: 0,
+            };
+            Some(Entry {
+                apply: vec![Change::BlockInserted(new)],
+                revert: vec![Change::BlockDeleted { id: new_id }],
+            })
+        }
+        Command::AppendBlock { kind, text } => {
+            if is_container_kind(kind) {
+                return None; // same rule as InsertBlockAfter
+            }
+            // Appending after a container's last subtree block lands outside
+            // it, because a container's children are ordered right behind it.
+            let last = doc.page_blocks(page).last().map(|b| b.order);
+            let order = OrderKey::between(last, None)?;
+            let new_id = doc.alloc_block_id();
+            let new = Block {
+                id: new_id,
+                page,
+                parent: None,
                 order,
                 kind,
                 text,
@@ -2188,6 +2223,84 @@ mod tests {
         let back = doc.block(ids[1]).unwrap();
         assert_eq!(back.kind, BlockKind::Paragraph);
         assert_eq!(back.attachment, None);
+    }
+
+    /// The empty page had no front door: every insert is anchored to a block,
+    /// and a page the user just created has none.
+    #[test]
+    fn an_empty_page_takes_one_paragraph_and_undo_empties_it_again() {
+        let mut doc = Document::new(1000);
+        let mut hist = History::default();
+        let page = PageId(1);
+        assert!(doc.page_blocks(page).is_empty());
+        let changes = exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::AppendBlock {
+                kind: BlockKind::Paragraph,
+                text: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(changes.len(), 1);
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[0].parent, None);
+        undo(&mut doc, &mut hist, page);
+        assert!(doc.page_blocks(page).is_empty(), "undo gives the empty page back");
+        redo(&mut doc, &mut hist, page);
+        assert_eq!(doc.page_blocks(page).len(), 1);
+    }
+
+    #[test]
+    fn appending_lands_below_a_containers_whole_subtree() {
+        let (mut doc, mut hist, page, ids) = setup();
+        to_table(&mut doc, &mut hist, page, ids[0]);
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::AppendBlock {
+                kind: BlockKind::Paragraph,
+                text: "tail".into(),
+            },
+        )
+        .unwrap();
+        let blocks = doc.page_blocks(page);
+        let tail = blocks.last().unwrap();
+        assert_eq!(tail.text, "tail");
+        assert_eq!(tail.parent, None, "a page-level block, not a cell");
+        // the grid is still one contiguous run behind its own row, which is
+        // what every index reader in the projection assumes
+        let table = blocks.iter().find(|b| b.kind == BlockKind::Table).unwrap();
+        let run: Vec<usize> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.parent == Some(table.id))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(run.len(), 6);
+        assert_eq!(blocks[run[0] - 1].id, table.id);
+        assert!(run.windows(2).all(|w| w[1] == w[0] + 1));
+    }
+
+    #[test]
+    fn a_grid_or_a_layout_is_not_a_bare_append() {
+        let (mut doc, mut hist, page, _) = setup();
+        for kind in [BlockKind::Table, BlockKind::Columns, BlockKind::TableCell] {
+            assert!(
+                exec(
+                    &mut doc,
+                    &mut hist,
+                    page,
+                    Command::AppendBlock { kind, text: "".into() }
+                )
+                .is_none(),
+                "{kind:?} must be built by a command that knows its shape"
+            );
+        }
     }
 
     // ---- table grid (SPEC §三十七 批次 B) ----

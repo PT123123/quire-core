@@ -27,6 +27,7 @@ fn page(id: u64, title: &str) -> Page {
         small_text: false,
         icon: String::new(),
         cover: None,
+        locked: false,
     }
 }
 

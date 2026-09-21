@@ -47,6 +47,10 @@ pub enum Change {
         id: PageId,
         cover: Option<AttachmentId>,
     },
+    /// The page's read-only switch (SPEC §三十八 "lock"). One column, and like
+    /// the look above it a page property rather than an edit of the document —
+    /// which is exactly why undoing it is not on the list (ADR-0044).
+    PageLockedSet { id: PageId, locked: bool },
     /// Storage deletes the page and (recursively) its sub-pages.
     PageDeleted { id: PageId },
 

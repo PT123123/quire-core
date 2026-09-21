@@ -548,6 +548,11 @@ pub struct Page {
     /// be able to ask who points at a file. `None` draws no band at all, so a
     /// v11 library opens exactly as it looked before.
     pub cover: Option<AttachmentId>,
+    /// Read-only switch (SPEC §三十八 "lock"). It lives on the page and not on
+    /// the blocks because it is a statement about the whole document, and the
+    /// gate that honours it is the one funnel every block command passes.
+    /// `false` is the whole migration: a v12 library opens with nothing locked.
+    pub locked: bool,
 }
 
 /// Full state as loaded from (or checkpointed to) storage. Vecs are in no

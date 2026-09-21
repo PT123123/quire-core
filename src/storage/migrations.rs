@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 12;
+pub const CURRENT_VERSION: i32 = 13;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -208,6 +208,17 @@ CREATE TABLE IF NOT EXISTS attachments (
     // default is the whole migration and a v11 library opens unchanged.
     sql: "",
     backfill: Some(add_page_cover_column),
+}, Migration {
+    version: 13,
+    label: "page lock",
+    // SPEC §三十八 "lock": the page's own read-only switch. `0` for every
+    // existing row, which is the whole migration — a v12 library opens with
+    // nothing locked and nothing dimmed. It is one column on `pages` rather
+    // than a flag on each block because the gate that honours it is per page:
+    // storing it per block would let a half-locked document exist, and the
+    // editor has no way to show that honestly.
+    sql: "",
+    backfill: Some(add_page_locked_column),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -243,6 +254,16 @@ fn add_page_icon_column(conn: &mut Connection) -> Result<(), StorageError> {
 /// "attachment id 0" cannot be confused the way `''` and a real emoji cannot.
 fn add_page_cover_column(conn: &mut Connection) -> Result<(), StorageError> {
     add_page_columns(conn, &[("cover", "ALTER TABLE pages ADD COLUMN cover INTEGER")])
+}
+
+/// Migration 13 body. An integer with a `0` default rather than a nullable:
+/// "not locked" is a value, not an absence, and `DEFAULT 0` is what lets the
+/// `ADD COLUMN` stand without a backfill statement of its own.
+fn add_page_locked_column(conn: &mut Connection) -> Result<(), StorageError> {
+    add_page_columns(
+        conn,
+        &[("locked", "ALTER TABLE pages ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")],
+    )
 }
 
 /// Migration 10 body: the two page-appearance columns.

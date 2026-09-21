@@ -379,6 +379,7 @@ mod tests {
             small_text: false,
             icon: String::new(),
             cover: None,
+            locked: false,
         });
         state.settings.insert("theme".into(), "dark".into());
         state.meta.insert("last.page".into(), "1".into());

@@ -294,6 +294,7 @@ fn a_recovered_database_is_searchable_straight_away() {
                 small_text: false,
                 icon: String::new(),
                 cover: None,
+                locked: false,
             }),
             Change::BlockInserted(Block {
                 id: BlockId(11),
@@ -450,6 +451,7 @@ fn snapshot_cost() {
             small_text: false,
             icon: String::new(),
             cover: None,
+            locked: false,
         })
         .collect();
     let blocks: Vec<Block> = (1..=10_000)

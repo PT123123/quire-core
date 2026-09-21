@@ -392,6 +392,7 @@ mod tests {
             small_text: false,
             icon: String::new(),
             cover: None,
+            locked: false,
         })
     }
 

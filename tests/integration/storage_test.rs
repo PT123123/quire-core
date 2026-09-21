@@ -31,6 +31,7 @@ fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
         small_text: false,
         icon: String::new(),
         cover: None,
+        locked: false,
     }
 }
 
@@ -1025,6 +1026,7 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         small_text: false,
         icon: "\u{1f6f0}".into(),
         cover: Some(AttachmentId(42)),
+        locked: false,
     })])
     .unwrap();
     let page = repo.load().unwrap().pages.remove(0);
@@ -1038,6 +1040,106 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         page.cover,
         Some(AttachmentId(42)),
         "and so is the cover: a page written with one must not open without it"
+    );
+}
+
+#[test]
+fn the_v13_step_adds_the_page_lock_to_a_v12_database() {
+    let dir = tempfile();
+    let path = dir.join("lock.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pages DROP COLUMN locked;
+             PRAGMA user_version = 12;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon,
+                                cover)
+             VALUES (1, 'Old', NULL, 1, 0, 0, '', 0, '', NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 12);
+        // control: the column really is gone, or the step never ran and the 0
+        // below is just what a missing read happens to return
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'locked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no lock column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        // Not NULL: the column carries `DEFAULT 0`, so an old page reads as
+        // unlocked rather than as an unknown, and no caller has to guess.
+        let locked: i64 = conn
+            .query_row("SELECT locked FROM pages WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(locked, 0, "a page from before the lock is open for business");
+        // The three columns the earlier steps stored all survive.
+        let (icon, cover): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT icon, cover FROM pages WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((icon.as_str(), cover), ("", None));
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let loaded = || {
+        repo.load()
+            .unwrap()
+            .pages
+            .into_iter()
+            .find(|p| p.id == PageId(1))
+            .unwrap()
+    };
+    assert_eq!(loaded().locked, false);
+
+    repo.apply(&[Change::PageLockedSet {
+        id: PageId(1),
+        locked: true,
+    }])
+    .unwrap();
+    assert!(loaded().locked, "the switch survives a reopen");
+    // Turning it back off is the same write, not a deleted row: the page keeps
+    // every other column through both directions.
+    repo.apply(&[Change::PageLockedSet {
+        id: PageId(1),
+        locked: false,
+    }])
+    .unwrap();
+    assert_eq!(loaded().locked, false);
+    repo.apply(&[Change::PageLockedSet {
+        id: PageId(1),
+        locked: true,
+    }])
+    .unwrap();
+    repo.apply(&[Change::PageTitleSet {
+        id: PageId(1),
+        title: "Renamed".into(),
+    }])
+    .unwrap();
+    let page = loaded();
+    assert!(page.locked);
+    assert_eq!(
+        page.title, "Renamed",
+        "the lock is one column of the page, not a shadow over the rest of it"
     );
 }
 

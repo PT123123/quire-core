@@ -243,6 +243,7 @@ mod tests {
             small_text: false,
             icon: String::new(),
             cover: None,
+            locked: false,
         };
         state.pages.push(page);
         state.blocks.push(Block {

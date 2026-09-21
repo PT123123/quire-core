@@ -169,7 +169,7 @@ impl Repository for SqliteRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, title, parent, ord, favorite, expanded, font, layout, icon,
-                            cover FROM pages",
+                            cover, locked FROM pages",
                 )
                 .map_err(sql)?;
             let rows = stmt
@@ -185,12 +185,14 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(7)?,
                         r.get::<_, String>(8)?,
                         r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, Option<i64>>(10)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
-                let (id, title, parent, ord, favorite, expanded, font, layout, icon, cover) =
-                    row.map_err(sql)?;
+                let (
+                    id, title, parent, ord, favorite, expanded, font, layout, icon, cover, locked,
+                ) = row.map_err(sql)?;
                 pages.push(Page {
                     id: PageId(id as u64),
                     title,
@@ -207,6 +209,11 @@ impl Repository for SqliteRepository {
                     // id 0 is not a row anybody can point at, so a stray reads
                     // as no cover rather than a broken one
                     cover: cover.filter(|c| *c > 0).map(|c| AttachmentId(c as u64)),
+                    // a hand-added or half-migrated column with nothing in it
+                    // reads as unlocked: a page nobody locked is open for
+                    // business, and failing to load the library over a NULL
+                    // would be the worse of the two mistakes
+                    locked: db_to_bool(locked.unwrap_or(0)),
                 });
             }
         }
@@ -480,8 +487,9 @@ fn write_map(
 
 fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon, cover)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon, cover,
+                            locked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             page.id.as_u64() as i64,
             page.title,
@@ -493,6 +501,7 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
             layout_to_db(page.full_width, page.small_text),
             page.icon,
             page.cover.map(|a| a.as_u64() as i64),
+            bool_to_db(page.locked),
         ],
     )
     .map_err(sql)?;
@@ -649,6 +658,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "PageCoverSet", id.as_u64())
+        }
+        Change::PageLockedSet { id, locked } => {
+            let n = tx
+                .execute(
+                    "UPDATE pages SET locked = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, bool_to_db(*locked)],
+                )
+                .map_err(sql)?;
+            require_hit(n, "PageLockedSet", id.as_u64())
         }
         Change::PageDeleted { id } => {
             // Recursive subtree delete; blocks and links cascade via FK.

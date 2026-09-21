@@ -85,6 +85,7 @@ fn page() -> Page {
         small_text: false,
         icon: String::new(),
         cover: None,
+        locked: false,
     }
 }
 
@@ -529,6 +530,7 @@ fn import_emits_page_created_then_one_block_per_line_with_injected_ids() {
             small_text: false,
             icon: String::new(),
             cover: None,
+            locked: false,
         })
     );
 

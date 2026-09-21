@@ -195,6 +195,13 @@ fn fence_close_marker(body: &str) -> Option<char> {
     rest.trim().is_empty().then_some(marker)
 }
 
+/// One address and nothing else, which is the shape an embed card exports as.
+fn is_bare_address(line: &str) -> bool {
+    let t = line.trim();
+    (t.starts_with("http://") || t.starts_with("https://"))
+        && !t.chars().any(char::is_whitespace)
+}
+
 fn classify(line: &str) -> ParsedBlock {
     // The marker `export_page` writes for a contents block. It is checked
     // before anything else because it is the only line shape that is a *block
@@ -202,6 +209,13 @@ fn classify(line: &str) -> ParsedBlock {
     // the whole of what survives an export.
     if line.trim() == "<!-- quire:toc -->" {
         return block(BlockKind::Toc, "");
+    }
+    // A line that is nothing but an address reads back as the card that wrote
+    // it. Deliberately narrow — one token, an explicit scheme — so a paragraph
+    // that merely starts with a url stays a paragraph, and the text is taken
+    // verbatim because there is no Markdown inside an address to eat.
+    if is_bare_address(line) {
+        return block(BlockKind::Embed, line.trim());
     }
     if is_divider(line) {
         return block(BlockKind::Divider, "");

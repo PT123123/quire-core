@@ -1143,3 +1143,49 @@ fn a_contents_block_round_trips_without_a_copy_of_its_list() {
     assert_eq!(blocks[0].kind, BlockKind::Toc);
     assert_eq!(blocks[0].text, "");
 }
+
+// ── embed card (SPEC §三十七 批次 C) ────────────────────────────────
+
+#[test]
+fn a_link_card_exports_the_address_alone_and_reads_back_as_a_card() {
+    let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    let md = export_page(&[block(1, BlockKind::Embed, url)]);
+    assert_eq!(md, format!("{url}\n"));
+    assert_eq!(parse_markdown(&md), vec![parsed(BlockKind::Embed, url)]);
+}
+
+#[test]
+fn an_address_in_a_sentence_stays_a_sentence() {
+    // the control that keeps the import rule narrow: only a line that is
+    // *nothing but* an address becomes a card, or every note that cites one
+    // would change shape on the way back in
+    let md = "See https://example.com/a for the details.\n";
+    let blocks = blocks_of(&import_markdown(md, &page(), &mut counter(1)));
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+    assert_eq!(blocks[0].text, "See https://example.com/a for the details.");
+}
+
+#[test]
+fn a_card_without_a_scheme_exports_the_address_it_would_open() {
+    // the block keeps what was typed; the file says what pressing Open does,
+    // which is also the only spelling that reads back as a card
+    let md = export_page(&[block(1, BlockKind::Embed, "example.com/a")]);
+    assert_eq!(md, "https://example.com/a\n");
+    let blocks = blocks_of(&import_markdown(&md, &page(), &mut counter(1)));
+    assert_eq!(blocks[0].kind, BlockKind::Embed);
+    assert_eq!(blocks[0].text, "https://example.com/a");
+}
+
+#[test]
+fn an_embedded_address_is_not_parsed_for_marks() {
+    // a url full of `_`, `*` and `~` is one token, not an emphasis accident
+    let url = "https://example.com/a_b_c*d~e?f=1&g=2";
+    let blocks = vec![block(1, BlockKind::Embed, url)];
+    let md = export_page(&blocks);
+    assert_eq!(md, format!("{url}\n"));
+    let back = blocks_of(&import_markdown(&md, &page(), &mut counter(1)));
+    assert_eq!(back[0].kind, BlockKind::Embed);
+    assert_eq!(back[0].text, url);
+    assert!(back[0].marks.is_empty(), "marks were parsed out of a url");
+}

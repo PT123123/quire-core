@@ -3,6 +3,7 @@
 
 pub mod command;
 pub mod document;
+pub mod embed;
 pub mod history;
 pub mod math;
 pub mod persistence;

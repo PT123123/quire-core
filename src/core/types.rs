@@ -125,10 +125,17 @@ pub enum BlockKind {
     /// the page's headings *are* its body, read at projection time, so editing
     /// a heading edits the contents and nothing here can go stale.
     Toc,
+    /// A link shown as a card (SPEC §三十七 批次 C). `text` is the address,
+    /// which is what the row edits; the provider name on the card is derived by
+    /// `core::embed` from that string and never stored. There is no iframe and
+    /// no fetch behind this — §二 and §三十三 rule out a WebView and a JS
+    /// runtime, so the card is the whole feature and its one action is "open
+    /// this in the system browser".
+    Embed,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 22] = [
+    pub const ALL: [BlockKind; 23] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -151,6 +158,7 @@ impl BlockKind {
         BlockKind::Column,
         BlockKind::Math,
         BlockKind::Toc,
+        BlockKind::Embed,
     ];
 
     /// Heading level 1..3 for a heading kind; `None` for anything else. A
@@ -188,6 +196,7 @@ impl BlockKind {
             BlockKind::Column => "column",
             BlockKind::Math => "math",
             BlockKind::Toc => "toc",
+            BlockKind::Embed => "embed",
         }
     }
 

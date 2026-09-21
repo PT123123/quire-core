@@ -153,7 +153,9 @@ fn same_list_run(prev: BlockKind, next: BlockKind) -> bool {
 fn render(block: &Block, number: &mut usize) -> String {
     // a code block is source and a divider has no text: markers stay literal
     let text = match block.kind {
-        BlockKind::Code | BlockKind::Divider | BlockKind::Math => block.text.clone(),
+        BlockKind::Code | BlockKind::Divider | BlockKind::Math | BlockKind::Embed => {
+            block.text.clone()
+        }
         _ => render_inline(&block.text, &block.marks),
     };
     let text = text.as_str();
@@ -205,6 +207,17 @@ fn render(block: &Block, number: &mut usize) -> String {
         BlockKind::Toc => {
             *number = 0;
             "<!-- quire:toc -->".to_string()
+        }
+        // An embed's Markdown shape is the address, alone on its line: that is
+        // what a link card *is*, GFM autolinks it, and every other reader at
+        // worst shows a url. No wrapper characters, because a wrapper is
+        // something to corrupt when the text is not a well-formed address.
+        // The scheme is written even when the block's is missing — the same
+        // normalization the card's Open button and the link dialog apply, and
+        // what lets the line read back as a card instead of a paragraph.
+        BlockKind::Embed => {
+            *number = 0;
+            crate::core::embed::with_scheme(text)
         }
         BlockKind::Bullet => {
             *number = 0;

@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 10;
+pub const CURRENT_VERSION: i32 = 11;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -187,23 +187,29 @@ CREATE TABLE IF NOT EXISTS attachments (
     // time from the page. Added conditionally like every other late column.
     sql: "",
     backfill: Some(add_page_appearance_columns),
+}, Migration {
+    version: 11,
+    label: "page icon",
+    // SPEC §三十八 "图标与封面": `pages.icon` holds the emoji a page shows in
+    // its sidebar slot and above its own title. The emoji is stored, not an
+    // index into the picker's list, so the list can grow without rewriting a
+    // page. `''` = unset, and an unset page falls back to the first character
+    // of its title at draw time -- so the default is the whole migration and a
+    // v10 library opens with every page exactly as it looked before.
+    sql: "",
+    backfill: Some(add_page_icon_column),
 }];
 
-/// Migration 10 body: the two page-appearance columns, each added only when it
-/// is missing (same shape as the color pair).
-fn add_page_appearance_columns(conn: &mut Connection) -> Result<(), StorageError> {
-    const COLUMNS: [(&str, &str); 2] = [
-        ("font", "ALTER TABLE pages ADD COLUMN font TEXT NOT NULL DEFAULT ''"),
-        (
-            "layout",
-            "ALTER TABLE pages ADD COLUMN layout INTEGER NOT NULL DEFAULT 0",
-        ),
-    ];
-    for (name, ddl) in COLUMNS {
+/// Add each named column to `pages`, only when that column is missing. Every
+/// late `pages` column goes through this, so a partially-migrated file (a
+/// column an older build added by hand, a backup restored mid-step) converges
+/// instead of erroring on a duplicate name.
+fn add_page_columns(conn: &mut Connection, columns: &[(&str, &str)]) -> Result<(), StorageError> {
+    for (name, ddl) in columns {
         let present: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('pages') WHERE name = ?1",
-                [name],
+                [*name],
                 |row| row.get(0),
             )
             .map_err(|e| StorageError::Sql(e.to_string()))?;
@@ -213,6 +219,28 @@ fn add_page_appearance_columns(conn: &mut Connection) -> Result<(), StorageError
         }
     }
     Ok(())
+}
+
+/// Migration 11 body.
+fn add_page_icon_column(conn: &mut Connection) -> Result<(), StorageError> {
+    add_page_columns(
+        conn,
+        &[("icon", "ALTER TABLE pages ADD COLUMN icon TEXT NOT NULL DEFAULT ''")],
+    )
+}
+
+/// Migration 10 body: the two page-appearance columns.
+fn add_page_appearance_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    add_page_columns(
+        conn,
+        &[
+            ("font", "ALTER TABLE pages ADD COLUMN font TEXT NOT NULL DEFAULT ''"),
+            (
+                "layout",
+                "ALTER TABLE pages ADD COLUMN layout INTEGER NOT NULL DEFAULT 0",
+            ),
+        ],
+    )
 }
 
 /// Migration 9 body: add `blocks.lang` only when it is missing.

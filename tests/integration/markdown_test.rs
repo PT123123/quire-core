@@ -83,6 +83,7 @@ fn page() -> Page {
         font: PageFont::default(),
         full_width: false,
         small_text: false,
+        icon: String::new(),
     }
 }
 
@@ -525,6 +526,7 @@ fn import_emits_page_created_then_one_block_per_line_with_injected_ids() {
             font: PageFont::default(),
             full_width: false,
             small_text: false,
+            icon: String::new(),
         })
     );
 

@@ -29,6 +29,7 @@ fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
         font: PageFont::default(),
         full_width: false,
         small_text: false,
+        icon: String::new(),
     }
 }
 
@@ -823,6 +824,100 @@ fn the_v10_step_adds_the_page_look_to_a_v9_database() {
 }
 
 #[test]
+fn the_v11_step_adds_the_page_icon_to_a_v10_database() {
+    let dir = tempfile();
+    let path = dir.join("icon.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pages DROP COLUMN icon;
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout)
+             VALUES (1, 'Old', NULL, 1, 0, 0, '', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 10);
+        // control: the column really is gone, or the step never ran and the
+        // empty default below proves nothing
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'icon'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no icon column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        let icon: String = conn
+            .query_row("SELECT icon FROM pages WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(icon, "", "a page from before the picker has no icon");
+        // the look the v10 step stored is still there: a new column must not
+        // disturb the old ones
+        let (font, layout): (String, i64) =
+            conn.query_row("SELECT font, layout FROM pages WHERE id = 1", [], |r| {
+                Ok((r.get(0).unwrap(), r.get(1).unwrap()))
+            })
+            .unwrap();
+        assert_eq!((font.as_str(), layout), ("", 0));
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let loaded = || {
+        repo.load()
+            .unwrap()
+            .pages
+            .into_iter()
+            .find(|p| p.id == PageId(1))
+            .unwrap()
+    };
+    assert_eq!(loaded().icon, "");
+
+    // The emoji itself, not an index into the picker's grid.
+    repo.apply(&[Change::PageIconSet {
+        id: PageId(1),
+        icon: "\u{1f680}".into(),
+    }])
+    .unwrap();
+    assert_eq!(loaded().icon, "\u{1f680}");
+    // Clearing is a write like any other, not a no-op that leaves the old one.
+    repo.apply(&[Change::PageIconSet {
+        id: PageId(1),
+        icon: String::new(),
+    }])
+    .unwrap();
+    assert_eq!(loaded().icon, "");
+    // A write that touches only the icon leaves the look alone.
+    repo.apply(&[Change::PageIconSet {
+        id: PageId(1),
+        icon: "\u{1f33f}".into(),
+    }])
+    .unwrap();
+    repo.apply(&[Change::PageFontSet {
+        id: PageId(1),
+        font: PageFont::Serif,
+    }])
+    .unwrap();
+    let page = loaded();
+    assert_eq!(page.icon, "\u{1f33f}");
+    assert_eq!(page.font, PageFont::Serif);
+}
+
+#[test]
 fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
     let repo = SqliteRepository::in_memory().unwrap();
     repo.apply(&[Change::PageCreated(Page {
@@ -835,6 +930,7 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         font: PageFont::Mono,
         full_width: true,
         small_text: false,
+        icon: "\u{1f6f0}".into(),
     })])
     .unwrap();
     let page = repo.load().unwrap().pages.remove(0);
@@ -843,6 +939,7 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         (PageFont::Mono, true, false),
         "the look is written with the page, not only updated later"
     );
+    assert_eq!("\u{1f6f0}", page.icon, "and so is the icon");
 }
 
 #[test]

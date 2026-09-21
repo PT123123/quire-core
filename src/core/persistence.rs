@@ -34,6 +34,11 @@ pub enum Change {
         full_width: bool,
         small_text: bool,
     },
+    /// The page's own icon (SPEC §三十八 "图标与封面"): the emoji, or `""` for
+    /// none. Stored rather than indexed so the picker's list can change without
+    /// touching anybody's page. Like the font above it, this is a page column
+    /// and cannot be expressed against a block.
+    PageIconSet { id: PageId, icon: String },
     /// Storage deletes the page and (recursively) its sub-pages.
     PageDeleted { id: PageId },
 

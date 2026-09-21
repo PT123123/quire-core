@@ -538,6 +538,11 @@ pub struct Page {
     pub font: PageFont,
     pub full_width: bool,
     pub small_text: bool,
+    /// The page's own icon (SPEC §三十八 "图标与封面") — the emoji itself, not
+    /// an index into a catalogue, so a page keeps its icon when the picker's
+    /// list changes. Empty means unset, and the sidebar then shows
+    /// [`icon::initial`] of the title instead.
+    pub icon: String,
 }
 
 /// Full state as loaded from (or checkpointed to) storage. Vecs are in no

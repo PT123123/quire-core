@@ -25,6 +25,7 @@ fn page(id: u64, title: &str) -> Page {
         font: PageFont::default(),
         full_width: false,
         small_text: false,
+        icon: String::new(),
     }
 }
 

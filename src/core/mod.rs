@@ -6,6 +6,7 @@ pub mod document;
 pub mod embed;
 pub mod highlight;
 pub mod history;
+pub mod icon;
 pub mod math;
 pub mod persistence;
 pub mod types;

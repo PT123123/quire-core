@@ -390,6 +390,7 @@ mod tests {
             font: crate::core::PageFont::default(),
             full_width: false,
             small_text: false,
+            icon: String::new(),
         })
     }
 

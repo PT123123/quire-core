@@ -168,7 +168,7 @@ impl Repository for SqliteRepository {
         {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, title, parent, ord, favorite, expanded, font, layout FROM pages",
+                    "SELECT id, title, parent, ord, favorite, expanded, font, layout, icon FROM pages",
                 )
                 .map_err(sql)?;
             let rows = stmt
@@ -182,11 +182,13 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(5)?,
                         r.get::<_, String>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, String>(8)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
-                let (id, title, parent, ord, favorite, expanded, font, layout) = row.map_err(sql)?;
+                let (id, title, parent, ord, favorite, expanded, font, layout, icon) =
+                    row.map_err(sql)?;
                 pages.push(Page {
                     id: PageId(id as u64),
                     title,
@@ -199,6 +201,7 @@ impl Repository for SqliteRepository {
                     font: PageFont::try_from_str(&font).unwrap_or_default(),
                     full_width: layout & LAYOUT_FULL_WIDTH != 0,
                     small_text: layout & LAYOUT_SMALL_TEXT != 0,
+                    icon,
                 });
             }
         }
@@ -472,8 +475,8 @@ fn write_map(
 
 fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             page.id.as_u64() as i64,
             page.title,
@@ -483,6 +486,7 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
             bool_to_db(page.expanded),
             page.font.as_str(),
             layout_to_db(page.full_width, page.small_text),
+            page.icon,
         ],
     )
     .map_err(sql)?;
@@ -621,6 +625,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "PageLayoutSet", id.as_u64())
+        }
+        Change::PageIconSet { id, icon } => {
+            let n = tx
+                .execute(
+                    "UPDATE pages SET icon = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, icon],
+                )
+                .map_err(sql)?;
+            require_hit(n, "PageIconSet", id.as_u64())
         }
         Change::PageDeleted { id } => {
             // Recursive subtree delete; blocks and links cascade via FK.

@@ -471,6 +471,56 @@ pub struct Attachment {
     pub height: u32,
 }
 
+/// The typeface one page's document tier is set to (SPEC §三十八 "页面版式").
+/// A page property, never a block property: the blocks store characters and
+/// this says which family draws them, so `Default` is the empty string and the
+/// whole type scale stays in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PageFont {
+    #[default]
+    Default,
+    Serif,
+    Mono,
+}
+
+impl PageFont {
+    pub const ALL: [PageFont; 3] = [PageFont::Default, PageFont::Serif, PageFont::Mono];
+
+    /// The string the database holds. `""` = the app's default stack, which is
+    /// also what every page written before this column existed means.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageFont::Default => "",
+            PageFont::Serif => "serif",
+            PageFont::Mono => "mono",
+        }
+    }
+
+    /// What the style menu shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            PageFont::Default => "Default",
+            PageFont::Serif => "Serif",
+            PageFont::Mono => "Monospace",
+        }
+    }
+
+    /// An unreadable spelling is no font, and the caller folds it to `Default`
+    /// — a page must not fail to open because of one string.
+    pub fn try_from_str(s: &str) -> Option<PageFont> {
+        PageFont::ALL.into_iter().find(|f| f.as_str() == s.trim())
+    }
+
+    /// The index the editor's `page-font` integer answers to.
+    pub fn slot(self) -> i32 {
+        match self {
+            PageFont::Default => 0,
+            PageFont::Serif => 1,
+            PageFont::Mono => 2,
+        }
+    }
+}
+
 /// One page of the workspace tree.
 /// `expanded` is persisted view state (Notion-like); `search_text` is NOT
 /// here on purpose — it is derived from blocks, never stored.
@@ -482,6 +532,12 @@ pub struct Page {
     pub order: OrderKey,
     pub favorite: bool,
     pub expanded: bool,
+    /// Page appearance (SPEC §三十八): which family the document tier uses,
+    /// and the two layout switches. Both are one column each in `pages`, and
+    /// neither reaches the blocks.
+    pub font: PageFont,
+    pub full_width: bool,
+    pub small_text: bool,
 }
 
 /// Full state as loaded from (or checkpointed to) storage. Vecs are in no
@@ -517,6 +573,20 @@ mod tests {
             let k = OrderKey::between(Some(*seq.last().unwrap()), None).unwrap();
             assert!(k > *seq.last().unwrap());
             seq.push(k);
+        }
+    }
+
+    #[test]
+    fn page_font_strings_round_trip() {
+        for font in PageFont::ALL {
+            assert_eq!(PageFont::try_from_str(font.as_str()), Some(font));
+        }
+        assert_eq!(PageFont::try_from_str("comic sans"), None);
+        assert_eq!(PageFont::default(), PageFont::Default);
+        assert_eq!(PageFont::Default.as_str(), "");
+        // the menu slot and the store string say the same order
+        for (index, font) in PageFont::ALL.iter().enumerate() {
+            assert_eq!(font.slot() as usize, index);
         }
     }
 

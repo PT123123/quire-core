@@ -5,7 +5,7 @@
 
 use quire::core::persistence::Change;
 use quire::core::types::{
-    AttachmentId, Block, BlockId, BlockKind, Lang, Mark, MarkKind, OrderKey, Page, PageId,
+    AttachmentId, Block, BlockId, BlockKind, Lang, Mark, MarkKind, OrderKey, Page, PageFont, PageId,
 };
 use quire::services::export_service::export_page;
 use quire::services::import_service::{import_markdown, parse_inline, parse_markdown, ParsedBlock};
@@ -80,6 +80,9 @@ fn page() -> Page {
         order: OrderKey::FIRST,
         favorite: false,
         expanded: false,
+        font: PageFont::default(),
+        full_width: false,
+        small_text: false,
     }
 }
 
@@ -519,6 +522,9 @@ fn import_emits_page_created_then_one_block_per_line_with_injected_ids() {
             order: OrderKey::FIRST,
             favorite: false,
             expanded: false,
+            font: PageFont::default(),
+            full_width: false,
+            small_text: false,
         })
     );
 

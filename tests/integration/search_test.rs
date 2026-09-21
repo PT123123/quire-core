@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use quire::core::persistence::{Change, Repository};
 use quire::core::types::{
-    Block, BlockId, BlockKind, Lang, OrderKey, Page, PageId, PersistedState,
+    Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId, PersistedState,
 };
 use quire::services::search_service::SearchService;
 use quire::storage::search_index::SearchRequest;
@@ -22,6 +22,9 @@ fn page(id: u64, title: &str) -> Page {
         order: OrderKey(id * 10),
         favorite: false,
         expanded: false,
+        font: PageFont::default(),
+        full_width: false,
+        small_text: false,
     }
 }
 

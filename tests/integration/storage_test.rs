@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 
 use quire::core::persistence::{Change, Repository, StorageError};
 use quire::core::types::{
-    Attachment, AttachmentId, Block, BlockId, BlockKind, Lang, OrderKey, Page, PageId,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId,
     PersistedState,
 };
 use quire::storage::backup;
@@ -26,6 +26,9 @@ fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
         order: OrderKey(ord),
         favorite: false,
         expanded: false,
+        font: PageFont::default(),
+        full_width: false,
+        small_text: false,
     }
 }
 
@@ -711,6 +714,134 @@ fn the_v9_step_adds_lang_to_a_v8_database() {
     assert_eq!(
         repo.load().unwrap().blocks.iter().find(|b| b.id == BlockId(10)).unwrap().lang,
         Lang::Rust
+    );
+}
+
+#[test]
+fn the_v10_step_adds_the_page_look_to_a_v9_database() {
+    let dir = tempfile();
+    let path = dir.join("style.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pages DROP COLUMN font;
+             ALTER TABLE pages DROP COLUMN layout;
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded)
+             VALUES (1, 'Old', NULL, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 9);
+        // control: both columns must really be gone, or the step never ran and
+        // the defaults below prove nothing
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('pages')
+                 WHERE name IN ('font', 'layout')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has neither column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        let (font, layout): (String, i64) =
+            conn.query_row("SELECT font, layout FROM pages WHERE id = 1", [], |r| {
+                Ok((r.get(0).unwrap(), r.get(1).unwrap()))
+            })
+            .unwrap();
+        assert_eq!((font.as_str(), layout), ("", 0), "an old page looks the default");
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let loaded = || {
+        repo.load()
+            .unwrap()
+            .pages
+            .into_iter()
+            .find(|p| p.id == PageId(1))
+            .unwrap()
+    };
+    assert_eq!(loaded().font, PageFont::Default);
+
+    repo.apply(&[Change::PageFontSet {
+        id: PageId(1),
+        font: PageFont::Serif,
+    }])
+    .unwrap();
+    assert_eq!(loaded().font, PageFont::Serif);
+
+    // The two switches share one column, so each write says both bits; the
+    // load must read back exactly the pair that was stored.
+    repo.apply(&[Change::PageLayoutSet {
+        id: PageId(1),
+        full_width: true,
+        small_text: false,
+    }])
+    .unwrap();
+    let page = loaded();
+    assert!(page.full_width && !page.small_text);
+    repo.apply(&[Change::PageLayoutSet {
+        id: PageId(1),
+        full_width: true,
+        small_text: true,
+    }])
+    .unwrap();
+    let page = loaded();
+    assert!(page.full_width && page.small_text);
+    let bits: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT layout FROM pages WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(bits, 3, "the two switches pack into 1 | 2");
+    assert!(page.font == PageFont::Serif, "the layout write left the font alone");
+
+    // An unreadable spelling is no font, not a page that cannot open.
+    repo.apply(&[Change::PageFontSet {
+        id: PageId(1),
+        font: PageFont::Mono,
+    }])
+    .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE pages SET font = 'Georgia-ish' WHERE id = 1", [])
+        .unwrap();
+    drop(conn);
+    assert_eq!(loaded().font, PageFont::Default);
+}
+
+#[test]
+fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.apply(&[Change::PageCreated(Page {
+        id: PageId(3),
+        title: "Written".into(),
+        parent: None,
+        order: OrderKey(1),
+        favorite: false,
+        expanded: false,
+        font: PageFont::Mono,
+        full_width: true,
+        small_text: false,
+    })])
+    .unwrap();
+    let page = repo.load().unwrap().pages.remove(0);
+    assert_eq!(
+        (page.font, page.full_width, page.small_text),
+        (PageFont::Mono, true, false),
+        "the look is written with the page, not only updated later"
     );
 }
 

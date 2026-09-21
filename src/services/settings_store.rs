@@ -374,6 +374,9 @@ mod tests {
             order: OrderKey::FIRST,
             favorite: false,
             expanded: true,
+            font: crate::core::PageFont::default(),
+            full_width: false,
+            small_text: false,
         });
         state.settings.insert("theme".into(), "dark".into());
         state.meta.insert("last.page".into(), "1".into());

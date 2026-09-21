@@ -238,6 +238,9 @@ mod tests {
             order: OrderKey::FIRST,
             favorite: false,
             expanded: false,
+            font: crate::core::PageFont::default(),
+            full_width: false,
+            small_text: false,
         };
         state.pages.push(page);
         state.blocks.push(Block {

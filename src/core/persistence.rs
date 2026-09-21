@@ -11,7 +11,7 @@ use std::fmt;
 
 use super::types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, OrderKey, Page,
-    PageId, PersistedState,
+    PageFont, PageId, PersistedState,
 };
 
 /// Ordered list of persisted mutations.
@@ -22,6 +22,18 @@ pub enum Change {
     PageMoved { id: PageId, parent: Option<PageId>, order: OrderKey },
     PageFavoriteSet { id: PageId, favorite: bool },
     PageExpandedSet { id: PageId, expanded: bool },
+    /// The typeface one page's document tier uses (SPEC §三十八). Page-level on
+    /// purpose: the blocks store no font, so this cannot be expressed as a
+    /// block change even though it is read while drawing them.
+    PageFontSet { id: PageId, font: PageFont },
+    /// The two page layout switches (SPEC §三十八). They travel together
+    /// because they share one column, and a switch that does not move simply
+    /// keeps its bit.
+    PageLayoutSet {
+        id: PageId,
+        full_width: bool,
+        small_text: bool,
+    },
     /// Storage deletes the page and (recursively) its sub-pages.
     PageDeleted { id: PageId },
 

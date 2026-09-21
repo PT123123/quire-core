@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use quire::core::persistence::{Change, Repository, StorageError};
-use quire::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, Page, PageId};
+use quire::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId};
 use quire::services::search_service::SearchService;
 use quire::services::settings_store::{Settings, SettingsStore};
 use quire::storage::backup::{self, KEEP};
@@ -289,6 +289,9 @@ fn a_recovered_database_is_searchable_straight_away() {
                 order: OrderKey(10),
                 favorite: false,
                 expanded: false,
+                font: PageFont::default(),
+                full_width: false,
+                small_text: false,
             }),
             Change::BlockInserted(Block {
                 id: BlockId(11),
@@ -440,6 +443,9 @@ fn snapshot_cost() {
             order: OrderKey(i as u64 * 10),
             favorite: false,
             expanded: false,
+            font: PageFont::default(),
+            full_width: false,
+            small_text: false,
         })
         .collect();
     let blocks: Vec<Block> = (1..=10_000)

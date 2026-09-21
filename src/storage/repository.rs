@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, Transaction};
 use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey,
-    Page, PageId, PersistedState,
+    Page, PageFont, PageId, PersistedState,
 };
 
 use super::backup::{self, OpenReport};
@@ -35,6 +35,16 @@ fn bool_to_db(value: bool) -> i64 {
 
 fn db_to_bool(value: i64) -> bool {
     value != 0
+}
+
+/// `pages.layout` is a bit field (SPEC §三十八): the two page switches share
+/// one column, so a page that sets neither stores 0 and reads back as the
+/// default look.
+const LAYOUT_FULL_WIDTH: i64 = 1;
+const LAYOUT_SMALL_TEXT: i64 = 2;
+
+fn layout_to_db(full_width: bool, small_text: bool) -> i64 {
+    (i64::from(full_width) * LAYOUT_FULL_WIDTH) | (i64::from(small_text) * LAYOUT_SMALL_TEXT)
 }
 
 impl SqliteRepository {
@@ -157,7 +167,9 @@ impl Repository for SqliteRepository {
         let mut pages = Vec::new();
         {
             let mut stmt = conn
-                .prepare("SELECT id, title, parent, ord, favorite, expanded FROM pages")
+                .prepare(
+                    "SELECT id, title, parent, ord, favorite, expanded, font, layout FROM pages",
+                )
                 .map_err(sql)?;
             let rows = stmt
                 .query_map([], |r| {
@@ -168,11 +180,13 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
                         r.get::<_, i64>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, i64>(7)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
-                let (id, title, parent, ord, favorite, expanded) = row.map_err(sql)?;
+                let (id, title, parent, ord, favorite, expanded, font, layout) = row.map_err(sql)?;
                 pages.push(Page {
                     id: PageId(id as u64),
                     title,
@@ -180,6 +194,11 @@ impl Repository for SqliteRepository {
                     order: OrderKey(ord_from_db(ord)),
                     favorite: db_to_bool(favorite),
                     expanded: db_to_bool(expanded),
+                    // an unreadable font string is no font, not a page that
+                    // cannot open
+                    font: PageFont::try_from_str(&font).unwrap_or_default(),
+                    full_width: layout & LAYOUT_FULL_WIDTH != 0,
+                    small_text: layout & LAYOUT_SMALL_TEXT != 0,
                 });
             }
         }
@@ -453,8 +472,8 @@ fn write_map(
 
 fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO pages (id, title, parent, ord, favorite, expanded)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             page.id.as_u64() as i64,
             page.title,
@@ -462,6 +481,8 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
             ord_to_db(page.order.0),
             bool_to_db(page.favorite),
             bool_to_db(page.expanded),
+            page.font.as_str(),
+            layout_to_db(page.full_width, page.small_text),
         ],
     )
     .map_err(sql)?;
@@ -575,6 +596,31 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "PageExpandedSet", id.as_u64())
+        }
+        Change::PageFontSet { id, font } => {
+            let n = tx
+                .execute(
+                    "UPDATE pages SET font = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, font.as_str()],
+                )
+                .map_err(sql)?;
+            require_hit(n, "PageFontSet", id.as_u64())
+        }
+        Change::PageLayoutSet {
+            id,
+            full_width,
+            small_text,
+        } => {
+            let n = tx
+                .execute(
+                    "UPDATE pages SET layout = ?2 WHERE id = ?1",
+                    params![
+                        id.as_u64() as i64,
+                        layout_to_db(*full_width, *small_text)
+                    ],
+                )
+                .map_err(sql)?;
+            require_hit(n, "PageLayoutSet", id.as_u64())
         }
         Change::PageDeleted { id } => {
             // Recursive subtree delete; blocks and links cascade via FK.

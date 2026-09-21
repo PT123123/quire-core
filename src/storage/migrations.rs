@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 9;
+pub const CURRENT_VERSION: i32 = 10;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -176,7 +176,44 @@ CREATE TABLE IF NOT EXISTS attachments (
     // Added conditionally like every other late column.
     sql: "",
     backfill: Some(add_lang_column),
+}, Migration {
+    version: 10,
+    label: "page appearance",
+    // SPEC §三十八: a page's own look, which §十七's tree never stored.
+    // `pages.font` is the document tier's typeface ('' = the default stack)
+    // and `pages.layout` is a bit field -- 1 = full width, 2 = small text.
+    // Both are page-level and neither is per-block: the block text keeps
+    // storing characters, and the size that draws them is derived at paint
+    // time from the page. Added conditionally like every other late column.
+    sql: "",
+    backfill: Some(add_page_appearance_columns),
 }];
+
+/// Migration 10 body: the two page-appearance columns, each added only when it
+/// is missing (same shape as the color pair).
+fn add_page_appearance_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    const COLUMNS: [(&str, &str); 2] = [
+        ("font", "ALTER TABLE pages ADD COLUMN font TEXT NOT NULL DEFAULT ''"),
+        (
+            "layout",
+            "ALTER TABLE pages ADD COLUMN layout INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (name, ddl) in COLUMNS {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('pages') WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if present == 0 {
+            conn.execute(ddl, [])
+                .map_err(|e| StorageError::Sql(format!("add {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
 
 /// Migration 9 body: add `blocks.lang` only when it is missing.
 fn add_lang_column(conn: &mut Connection) -> Result<(), StorageError> {

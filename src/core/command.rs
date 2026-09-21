@@ -8,7 +8,7 @@ use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
 use super::types::{
-    Attachment, Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, PageId,
+    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, PageId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,10 @@ pub enum Command {
     SetBlockFile { id: BlockId, attachment: Attachment },
     /// Display width of an `Image` block, in percent of the editor column.
     SetImageWidth { id: BlockId, percent: u16 },
+    /// The language a `Code` block is coloured as (SPEC §三十七 批次 C). A
+    /// colour choice and not a content one: the characters never move, so the
+    /// undo of it cannot disagree with anything that was typed since.
+    SetCodeLang { id: BlockId, lang: Lang },
     /// One empty row at index `row` (`0..=rows`; `rows` appends at the bottom).
     TableAddRow { id: BlockId, row: usize },
     /// One empty column at index `col` (`0..=columns`; `columns` appends).
@@ -267,6 +271,7 @@ fn new_child(doc: &mut Document, page: PageId, parent: BlockId, order: OrderKey,
         attachment: None,
         img_percent: 100,
         columns: 0,
+        lang: Lang::Plain,
     }
 }
 
@@ -419,6 +424,7 @@ fn insert_attachment(
         attachment: Some(aid),
         img_percent: 100,
         columns: 0,
+        lang: Lang::Plain,
     };
     Some(Entry {
         apply: vec![Change::AttachmentAdded(attachment), Change::BlockInserted(new)],
@@ -662,6 +668,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 attachment: None,
                 img_percent: 100,
                 columns: 0,
+                lang: Lang::Plain,
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
@@ -693,6 +700,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 attachment: None,
                 img_percent: 100,
                 columns: 0,
+                lang: Lang::Plain,
             };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
@@ -724,6 +732,17 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry {
                 apply: vec![Change::BlockImageWidthSet { id, percent }],
                 revert: vec![Change::BlockImageWidthSet { id, percent: old }],
+            })
+        }
+
+        Command::SetCodeLang { id, lang } => {
+            let old = doc.block(id)?.lang;
+            if old == lang {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::BlockLangSet { id, lang }],
+                revert: vec![Change::BlockLangSet { id, lang: old }],
             })
         }
 
@@ -1500,6 +1519,7 @@ mod tests {
                 attachment: None,
                 img_percent: 100,
                 columns: 0,
+                lang: Lang::Plain,
             });
             doc.set_page_blocks(page, v);
             prev = Some(order);
@@ -1609,6 +1629,7 @@ mod tests {
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         };
         let c1 = doc.alloc_block_id();
         let c2 = doc.alloc_block_id();
@@ -1665,6 +1686,7 @@ mod tests {
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         };
         let a = doc.alloc_block_id();
         let b = doc.alloc_block_id();
@@ -1921,6 +1943,7 @@ mod tests {
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         };
         let p = mk(&mut doc, source, "p", 10, None);
         let c = mk(&mut doc, source, "c", 12, Some(p.id));
@@ -2124,6 +2147,26 @@ mod tests {
 
         // back at the default there is nothing left to record
         assert!(plan(&mut doc, page, Command::SetImageWidth { id, percent: 100 }).is_none());
+    }
+
+    #[test]
+    fn a_language_is_undoable_and_the_language_it_already_has_plans_nothing() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let id = ids[0];
+
+        let changes =
+            exec(&mut doc, &mut hist, page, Command::SetCodeLang { id, lang: Lang::Rust }).unwrap();
+        assert_eq!(changes, vec![Change::BlockLangSet { id, lang: Lang::Rust }]);
+        assert_eq!(doc.block(id).unwrap().lang, Lang::Rust);
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(
+            doc.block(id).unwrap().lang,
+            Lang::Plain,
+            "undo puts back the uncoloured block it found"
+        );
+
+        // a pick that changes nothing is not a step in the history either
+        assert!(plan(&mut doc, page, Command::SetCodeLang { id, lang: Lang::Plain }).is_none());
     }
 
     /// A non-picture attachment: the stored file is named apart from the

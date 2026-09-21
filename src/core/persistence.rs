@@ -10,8 +10,8 @@
 use std::fmt;
 
 use super::types::{
-    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Mark, OrderKey, Page, PageId,
-    PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, OrderKey, Page,
+    PageId, PersistedState,
 };
 
 /// Ordered list of persisted mutations.
@@ -59,6 +59,10 @@ pub enum Change {
     /// table; adding/removing a column is one of these plus the cell inserts
     /// or deletes it implies.
     BlockColumnsSet { id: BlockId, columns: u16 },
+    /// The language a `Code` block is coloured as (SPEC §三十七 批次 C). Colour
+    /// only: a block this build cannot lex stores `Plain`, so an imported fence
+    /// never fails and never loses a character either.
+    BlockLangSet { id: BlockId, lang: Lang },
     /// Upsert one attachment row. The bytes are already on disk by the time
     /// this is recorded, so undo removes the *reference* only and never the
     /// file: an orphaned picture is recoverable, a deleted one is not.

@@ -186,7 +186,11 @@ fn render(block: &Block, number: &mut usize) -> String {
         }
         BlockKind::Code => {
             *number = 0;
-            format!("```\n{text}\n```")
+            // The info string is the language the block is coloured with, so a
+            // page that leaves as Markdown comes back with its colour intact.
+            // `Plain` writes nothing, which is the bare fence it matches.
+            let info = block.lang.as_str();
+            format!("```{info}\n{text}\n```")
         }
         // The formula's own delimiters, on their own lines, which is the shape
         // every Markdown math reader accepts. The source stays verbatim: a

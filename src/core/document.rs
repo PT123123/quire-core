@@ -215,6 +215,11 @@ impl Document {
                         b.columns = *columns;
                     }
                 }
+                Change::BlockLangSet { id, lang } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.lang = *lang;
+                    }
+                }
                 _ => {}
             }
         }
@@ -241,6 +246,7 @@ impl Document {
 mod tests {
     use super::*;
     use super::super::types::BlockKind;
+    use super::super::types::Lang;
 
     fn block(doc: &mut Document, page: PageId, text: &str, order: u64) -> Block {
         Block {
@@ -259,6 +265,7 @@ mod tests {
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         }
     }
 

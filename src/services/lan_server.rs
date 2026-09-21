@@ -225,7 +225,7 @@ mod tests {
     use crate::core::persistence::Repository;
     use crate::services::lan_client::pull_workspace;
     use std::io::Read;
-    use crate::core::types::{Block, BlockKind, ColorKind, Mark, OrderKey};
+    use crate::core::types::{Block, BlockKind, ColorKind, Lang, Mark, OrderKey};
     use std::collections::HashMap;
 
     fn seeded_repo() -> Arc<SqliteRepository> {
@@ -256,6 +256,7 @@ mod tests {
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         });
         state.settings.insert("theme".into(), "dark".into());
         repo.replace_all(&state).unwrap();

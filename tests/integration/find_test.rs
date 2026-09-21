@@ -3,7 +3,7 @@
 // Chinese offsets on char boundaries, and the empty-term shapes the bar hits
 // while the user types.
 
-use quire::core::types::{Block, BlockId, BlockKind, OrderKey, PageId};
+use quire::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, PageId};
 use quire::services::find_service::{FindHit, FindSession};
 
 fn block(id: u64, text: &str) -> Block {
@@ -23,6 +23,7 @@ fn block(id: u64, text: &str) -> Block {
         attachment: None,
         img_percent: 100,
         columns: 0,
+        lang: Lang::Plain,
     }
 }
 

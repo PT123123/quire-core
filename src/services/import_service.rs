@@ -19,8 +19,8 @@
 // - nested list indentation is recognized and flattened one level (the M4
 //   editor only renders top-level blocks)
 // - `####`..`######` become heading_3 (the block set has three levels)
-// - code fences may carry an info string (```rs); it is dropped, the model
-//   has no language field yet
+// - code fences may carry an info string (```rs); it names the language the
+//   block is coloured with, and one this build cannot lex is no colour at all
 // - inside a code fence and inside a code span nothing is parsed: those runs
 //   keep their markers as text, because `Mark` has no nesting to describe it
 // - `\*` and friends un-escape ASCII punctuation, so text that *literally*
@@ -29,7 +29,9 @@
 //   generator, services never invent them (ADR-0012)
 
 use crate::core::persistence::Change;
-use crate::core::types::{Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page};
+use crate::core::types::{
+    Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page,
+};
 
 /// One parsed block, before ids and order keys exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,10 @@ pub struct ParsedBlock {
     pub checked: bool,
     /// Inline marks over `text` (M6), byte offsets, sorted by start.
     pub marks: Vec<Mark>,
+    /// A code fence's info string, folded through `Lang`: what colours the
+    /// block. `Plain` for every other kind, and for a language this build
+    /// does not know.
+    pub lang: Lang,
 }
 
 /// Parse Markdown into the page's block list (display order).
@@ -46,29 +52,21 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
     let mut out: Vec<ParsedBlock> = Vec::new();
     // `str::lines()` already normalizes CRLF, so a Windows file imports as
     // is; a lone '\r' (old Mac) is treated as ordinary text.
-    let mut fence: Option<Vec<String>> = None;
+    let mut fence: Option<(Lang, Vec<String>)> = None;
     let mut math: Option<Vec<String>> = None;
     for raw in src.lines() {
         let body = raw.trim_start();
-        if let Some(code) = fence.as_mut() {
-            match fence_close_marker(body) {
-                Some(_) => {
-                    let taken = std::mem::take(code);
-                    out.push(ParsedBlock {
-                        kind: BlockKind::Code,
-                        text: taken.join("\n"),
-                        checked: false,
-                        // a code block is verbatim source: no marks, ever
-                        marks: Vec::new(),
-                    });
-                    fence = None;
-                }
-                None => code.push(body.to_string()),
+        if fence.is_some() {
+            if fence_close_marker(body).is_some() {
+                let (lang, code) = fence.take().expect("just checked");
+                out.push(code_block(lang, code));
+            } else if let Some((_, code)) = fence.as_mut() {
+                code.push(body.to_string());
             }
             continue;
         }
         if fence_open_marker(body).is_some() {
-            fence = Some(Vec::new());
+            fence = Some((fence_lang(body), Vec::new()));
             continue;
         }
         // `$$ … $$` is a formula's fence, and like a code fence its lines are
@@ -82,6 +80,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
                     text: taken.join("\n"),
                     checked: false,
                     marks: Vec::new(),
+                    lang: Lang::Plain,
                 });
                 math = None;
             } else {
@@ -99,6 +98,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
                 text: body[2..body.len() - 2].trim().to_string(),
                 checked: false,
                 marks: Vec::new(),
+                lang: Lang::Plain,
             });
             continue;
         }
@@ -108,13 +108,8 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
         out.push(classify(body.trim_end()));
     }
     // unterminated fence: keep what was collected rather than lose it
-    if let Some(code) = fence {
-        out.push(ParsedBlock {
-            kind: BlockKind::Code,
-            text: code.join("\n"),
-            checked: false,
-            marks: Vec::new(),
-        });
+    if let Some((lang, code)) = fence {
+        out.push(code_block(lang, code));
     }
     if let Some(src) = math {
         out.push(ParsedBlock {
@@ -122,6 +117,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
             text: src.join("\n"),
             checked: false,
             marks: Vec::new(),
+            lang: Lang::Plain,
         });
     }
     out
@@ -153,6 +149,7 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: parsed.lang,
         }));
     }
     changes
@@ -193,6 +190,30 @@ fn fence_close_marker(body: &str) -> Option<char> {
     let marker = fence_open_marker(body)?;
     let rest = body.trim_start_matches(marker);
     rest.trim().is_empty().then_some(marker)
+}
+
+/// What follows an opening fence's markers — the `rs` of "```rs" — as the
+/// language to colour the block with. No info string, and an unknown one, are
+/// both `Plain`: the text is what matters, and a language this build cannot
+/// lex must not cost a reader its code.
+fn fence_lang(body: &str) -> Lang {
+    let Some(marker) = fence_open_marker(body) else {
+        return Lang::Plain;
+    };
+    let info = body.trim_start_matches(marker);
+    Lang::try_from_str(info).unwrap_or(Lang::Plain)
+}
+
+/// A code block from the lines its fence held. Verbatim source, so no marks,
+/// ever — and the only kind whose parsed form carries a language.
+fn code_block(lang: Lang, lines: Vec<String>) -> ParsedBlock {
+    ParsedBlock {
+        kind: BlockKind::Code,
+        text: lines.join("\n"),
+        checked: false,
+        marks: Vec::new(),
+        lang,
+    }
 }
 
 /// One address and nothing else, which is the shape an embed card exports as.
@@ -243,6 +264,7 @@ fn classify(line: &str) -> ParsedBlock {
                         text,
                         checked: flag.eq_ignore_ascii_case("x"),
                         marks,
+                        lang: Lang::Plain,
                     };
                 }
             }
@@ -262,6 +284,7 @@ fn block(kind: BlockKind, text: &str) -> ParsedBlock {
         text,
         checked: false,
         marks,
+        lang: Lang::Plain,
     }
 }
 

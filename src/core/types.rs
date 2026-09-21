@@ -272,6 +272,83 @@ impl ColorKind {
     }
 }
 
+/// The language a code block is written in, which is what its colour keys on
+/// (SPEC §三十七 批次 C). Stored as a short stable string like every other kind
+/// here; `Plain` means "no colour on this block", and it is also what an
+/// unknown fence folds to, so a `sql` block imported from somewhere else is not
+/// a broken block but an uncoloured one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lang {
+    Plain,
+    Rust,
+    Python,
+    Js,
+    Ts,
+    Md,
+    Json,
+    Bash,
+}
+
+impl Lang {
+    pub const ALL: [Lang; 8] = [
+        Lang::Plain,
+        Lang::Rust,
+        Lang::Python,
+        Lang::Js,
+        Lang::Ts,
+        Lang::Md,
+        Lang::Json,
+        Lang::Bash,
+    ];
+
+    /// The string this build stores and the lexer switches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lang::Plain => "",
+            Lang::Rust => "rust",
+            Lang::Python => "python",
+            Lang::Js => "js",
+            Lang::Ts => "ts",
+            Lang::Md => "md",
+            Lang::Json => "json",
+            Lang::Bash => "bash",
+        }
+    }
+
+    /// What the menu shows. The names are the languages' own, not the store's.
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::Plain => "Plain text",
+            Lang::Rust => "Rust",
+            Lang::Python => "Python",
+            Lang::Js => "JavaScript",
+            Lang::Ts => "TypeScript",
+            Lang::Md => "Markdown",
+            Lang::Json => "JSON",
+            Lang::Bash => "Bash",
+        }
+    }
+
+    /// Folds the spellings a fence or a hand-written file may use — `py`,
+    /// `tsx`, `shell` — onto the one this build colours, so the picker and the
+    /// importer land on the same block. `None` for a language with no lexer.
+    pub fn try_from_str(s: &str) -> Option<Lang> {
+        let l = s.trim().to_ascii_lowercase();
+        let lang = match l.as_str() {
+            "" => Lang::Plain,
+            "rs" => Lang::Rust,
+            "py" | "python3" => Lang::Python,
+            "js" | "javascript" | "jsx" => Lang::Js,
+            "ts" | "typescript" | "tsx" => Lang::Ts,
+            "md" | "markdown" => Lang::Md,
+            "json" | "jsonc" => Lang::Json,
+            "sh" | "bash" | "shell" | "zsh" => Lang::Bash,
+            other => Lang::ALL.into_iter().find(|k| k.as_str() == other)?,
+        };
+        Some(lang)
+    }
+}
+
 /// Inline mark styling (M6). Offsets are byte offsets into the block's
 /// UTF-8 text (char boundaries — the caret model guarantees it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +445,10 @@ pub struct Block {
     /// of it, so its row count is derived rather than stored, and a columns
     /// block's `Column` children are counted the same way.
     pub columns: u16,
+    /// The language a `Code` block is written in (SPEC §三十七 批次 C), which
+    /// is only ever read as the key for its colour. Meaningless for other kinds,
+    /// where it stays `Plain` — a colour on a paragraph is `color`/`background`.
+    pub lang: Lang,
 }
 
 /// One file that lives next to the database (SPEC §三十七 批次 A, §十八's
@@ -461,8 +542,21 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_distinct_types() {
-        // compile-time intent: PageId and BlockId never mix accidentally
+    fn lang_strings_round_trip_and_aliases_fold() {
+        for lang in Lang::ALL {
+            assert_eq!(Lang::try_from_str(lang.as_str()), Some(lang));
+        }
+        assert_eq!(Lang::try_from_str("PY"), Some(Lang::Python));
+        assert_eq!(Lang::try_from_str(" tsx "), Some(Lang::Ts));
+        assert_eq!(Lang::try_from_str("shell"), Some(Lang::Bash));
+        assert_eq!(Lang::try_from_str(""), Some(Lang::Plain));
+        // A language with no lexer is not a language the store keeps.
+        assert_eq!(Lang::try_from_str("sql"), None);
+        assert!(!Lang::ALL.iter().any(|l| l.label().is_empty()));
+    }
+
+    #[test]
+    fn ids_are_distinct_types() {        // compile-time intent: PageId and BlockId never mix accidentally
         let p = PageId(7);
         let b = BlockId(7);
         assert_eq!(p.as_u64(), b.as_u64());

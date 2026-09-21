@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 
 use quire::core::persistence::{Change, Repository, StorageError};
 use quire::core::types::{
-    Attachment, AttachmentId, Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, Lang, OrderKey, Page, PageId,
+    PersistedState,
 };
 use quire::storage::backup;
 use quire::storage::migrations;
@@ -45,6 +46,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         attachment: None,
         img_percent: 100,
         columns: 0,
+        lang: Lang::Plain,
     }
 }
 
@@ -648,6 +650,70 @@ fn the_v8_step_adds_columns_to_a_v7_database() {
     assert_eq!(state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().columns, 0);
 }
 
+/// v9 is a conditional ALTER like the four before it, so it has to run against
+/// a database that really lacks the column.
+#[test]
+fn the_v9_step_adds_lang_to_a_v8_database() {
+    let dir = tempfile();
+    let path = dir.join("lang.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE blocks DROP COLUMN lang;
+             PRAGMA user_version = 8;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded)
+             VALUES (1, 'Old', NULL, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocks (id, page, kind, text, checked, color, bg, folded, attachment, img_percent, columns)
+             VALUES (10, 1, 'code', 'fn main() {}', 0, '', '', 0, NULL, 100, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO block_children (block, parent, ord) VALUES (10, NULL, 100)", [])
+            .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 8);
+        // control: the column must really be gone, or the test passes without
+        // the v9 step ever running
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'lang'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no lang column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), migrations::CURRENT_VERSION);
+        let lang: String =
+            conn.query_row("SELECT lang FROM blocks WHERE id = 10", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(lang, "", "a code block from before the picker is uncoloured");
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let state = repo.load().unwrap();
+    assert_eq!(state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().lang, Lang::Plain);
+    // and the column carries a real language through the same file
+    repo.apply(&[Change::BlockLangSet { id: BlockId(10), lang: Lang::Rust }])
+        .unwrap();
+    assert_eq!(
+        repo.load().unwrap().blocks.iter().find(|b| b.id == BlockId(10)).unwrap().lang,
+        Lang::Rust
+    );
+}
+
 #[test]
 fn attachments_round_trip_and_a_dangling_reference_still_loads() {
     let repo = SqliteRepository::in_memory().unwrap();
@@ -668,6 +734,7 @@ fn attachments_round_trip_and_a_dangling_reference_still_loads() {
             attachment: Some(AttachmentId(4)),
             img_percent: 50,
             columns: 0,
+            lang: Lang::Plain,
             ..block(10, 1, None, 100, "Sunset photo.png")
         }),
     ])

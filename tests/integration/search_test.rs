@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use quire::core::persistence::{Change, Repository};
-use quire::core::types::{Block, BlockId, BlockKind, OrderKey, Page, PageId, PersistedState};
+use quire::core::types::{
+    Block, BlockId, BlockKind, Lang, OrderKey, Page, PageId, PersistedState,
+};
 use quire::services::search_service::SearchService;
 use quire::storage::search_index::SearchRequest;
 use quire::storage::SqliteRepository;
@@ -40,6 +42,7 @@ fn block(id: u64, page_id: u64, text: &str) -> Block {
         attachment: None,
         img_percent: 100,
         columns: 0,
+        lang: Lang::Plain,
     }
 }
 

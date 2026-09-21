@@ -194,7 +194,7 @@ fn diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{Block, BlockId, BlockKind, ColorKind, OrderKey, Page};
+    use crate::core::types::{Block, BlockId, BlockKind, ColorKind, Lang, OrderKey, Page};
     use std::sync::Mutex;
 
     /// In-memory stand-in: applies each change set to its own
@@ -365,6 +365,7 @@ mod tests {
             attachment: None,
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         });
         state.pages.push(Page {
             id: PageId(1),

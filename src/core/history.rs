@@ -73,7 +73,7 @@ mod tests {
     use super::*;
     use crate::core::persistence::Change;
     use crate::core::types::{
-        Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, OrderKey,
+        Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, OrderKey,
     };
     use std::iter::FromIterator;
 
@@ -107,6 +107,7 @@ mod tests {
             attachment: Some(AttachmentId(att)),
             img_percent: 100,
             columns: 0,
+            lang: Lang::Plain,
         })
     }
 

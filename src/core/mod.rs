@@ -4,6 +4,7 @@
 pub mod command;
 pub mod document;
 pub mod embed;
+pub mod highlight;
 pub mod history;
 pub mod math;
 pub mod persistence;
@@ -14,7 +15,7 @@ pub use document::Document;
 pub use history::History;
 pub use persistence::{Change, Repository, StorageError};
 pub use types::{
-    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page,
-    PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey,
+    Page, PageId, PersistedState,
 };
 

@@ -5,7 +5,7 @@
 
 use quire::core::persistence::Change;
 use quire::core::types::{
-    AttachmentId, Block, BlockId, BlockKind, Mark, MarkKind, OrderKey, Page, PageId,
+    AttachmentId, Block, BlockId, BlockKind, Lang, Mark, MarkKind, OrderKey, Page, PageId,
 };
 use quire::services::export_service::export_page;
 use quire::services::import_service::{import_markdown, parse_inline, parse_markdown, ParsedBlock};
@@ -27,6 +27,7 @@ fn block(id: u64, kind: BlockKind, text: &str) -> Block {
         attachment: None,
         img_percent: 100,
         columns: 0,
+        lang: Lang::Plain,
     }
 }
 
@@ -67,6 +68,7 @@ fn parsed(kind: BlockKind, text: &str) -> ParsedBlock {
         text: text.into(),
         checked: false,
         marks: Vec::new(),
+        lang: Lang::Plain,
     }
 }
 
@@ -110,6 +112,7 @@ fn parsed_of(blocks: &[Block]) -> Vec<ParsedBlock> {
             text: b.text.clone(),
             checked: b.checked,
             marks: b.marks.clone(),
+            lang: b.lang,
         })
         .collect()
 }
@@ -449,7 +452,41 @@ fn import_handles_crlf_and_an_unterminated_fence() {
 }
 
 #[test]
-fn import_chinese_survives_unchanged() {
+fn a_fence_info_string_is_the_language_it_comes_back_with() {
+    // The colour a code block shows is derived from this string, so what an
+    // importer reads has to be what an exporter writes: the two directions are
+    // one fact about the block, not two.
+    let src = "```rs\nfn a() {}\n```\n```sql\nx\n```\n```\nplain\n```\n~~~python\npass\n~~~\n";
+    let parsed = parse_markdown(src);
+    let read: Vec<(BlockKind, Lang, &str)> = parsed
+        .iter()
+        .map(|b| (b.kind, b.lang, b.text.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (BlockKind::Code, Lang::Rust, "fn a() {}"),
+            // a language this build cannot lex costs a reader its colour, never
+            // its code
+            (BlockKind::Code, Lang::Plain, "x"),
+            (BlockKind::Code, Lang::Plain, "plain"),
+            (BlockKind::Code, Lang::Python, "pass"),
+        ]
+    );
+    let mut alloc = counter(10);
+    let blocks = blocks_of(&import_markdown(src, &page(), &mut alloc));
+    assert_eq!(parsed_of(&blocks), parsed, "the change list carries it too");
+    // Export writes the canonical spelling and one marker, so a tilde fence
+    // comes back as a backtick one -- and re-reads as the same blocks.
+    let again = export_page(&blocks);
+    assert_eq!(
+        again,
+        "```rust\nfn a() {}\n```\n\n```\nx\n```\n\n```\nplain\n```\n\n```python\npass\n```\n"
+    );
+    assert_eq!(parse_markdown(&again), parsed, "and reads back the same");
+}
+
+#[test]fn import_chinese_survives_unchanged() {
     let src =
         "## 写作与中文测试\n\n中文段落用于验证字体回退与行高。\n- 检查行高\n- [x] 完成引号方向\n";
     let parsed = parse_markdown(src);
@@ -973,6 +1010,7 @@ fn a_layout_round_trips_as_its_lines_losing_only_the_shape() {
             text: "right".into(),
             checked: true,
             marks: Vec::new(),
+            lang: Lang::Plain,
         },
         parsed(BlockKind::Paragraph, "after"),
     ];

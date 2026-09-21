@@ -9,8 +9,8 @@ use rusqlite::{params, Connection, Transaction};
 
 use crate::core::persistence::{Change, Repository, StorageError};
 use crate::core::types::{
-    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Mark, MarkKind, OrderKey, Page,
-    PageId, PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey,
+    Page, PageId, PersistedState,
 };
 
 use super::backup::{self, OpenReport};
@@ -190,7 +190,7 @@ impl Repository for SqliteRepository {
                 .prepare(
                     "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
                             b.color, b.bg, b.page_ref, b.folded, b.attachment, b.img_percent,
-                            b.columns
+                            b.columns, b.lang
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -212,6 +212,7 @@ impl Repository for SqliteRepository {
                         r.get::<_, Option<i64>>(11)?,
                         r.get::<_, i64>(12)?,
                         r.get::<_, i64>(13)?,
+                        r.get::<_, String>(14)?,
                     ))
                 })
                 .map_err(sql)?;
@@ -231,6 +232,7 @@ impl Repository for SqliteRepository {
                     attachment,
                     img_percent,
                     columns,
+                    lang,
                 ) = row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
@@ -257,6 +259,9 @@ impl Repository for SqliteRepository {
                     attachment: attachment.map(|a| AttachmentId(a as u64)),
                     img_percent: img_percent.clamp(1, u16::MAX as i64) as u16,
                     columns: columns.clamp(0, u16::MAX as i64) as u16,
+                    // Like the colors: a string this build does not know is a
+                    // plain block, not a failed load.
+                    lang: Lang::try_from_str(&lang).unwrap_or(Lang::Plain),
                 });
             }
         }
@@ -466,8 +471,8 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref, folded,
-                             attachment, img_percent, columns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                             attachment, img_percent, columns, lang)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
@@ -481,6 +486,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
             block.attachment.map(|a| a.as_u64() as i64),
             block.img_percent as i64,
             block.columns as i64,
+            block.lang.as_str(),
         ],
     )
     .map_err(sql)?;
@@ -609,6 +615,7 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 attachment: None,
                 img_percent: 100,
                 columns: 0,
+                lang: Lang::Plain,
             };
             for m in &block.marks {
                 tx.execute(
@@ -746,6 +753,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockColumnsSet", id.as_u64())
+        }
+        Change::BlockLangSet { id, lang } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET lang = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, lang.as_str()],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockLangSet", id.as_u64())
         }
         Change::AttachmentAdded(attachment) => {
             // `INSERT OR REPLACE`, not a plain INSERT: undoing an insert and

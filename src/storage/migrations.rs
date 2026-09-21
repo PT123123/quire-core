@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 8;
+pub const CURRENT_VERSION: i32 = 9;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -165,7 +165,37 @@ CREATE TABLE IF NOT EXISTS attachments (
     // no new migration. Added conditionally like every other late column.
     sql: "",
     backfill: Some(add_columns_column),
+}, Migration {
+    version: 9,
+    label: "code language",
+    // SPEC §三十七 批次 C: `blocks.lang` is the language a code block is
+    // coloured as, and the only thing the colour keys on — the characters stay
+    // in `text`, and every coloured layer is derived from them at paint time.
+    // `''` = no colour on this block, which is also what a code block is
+    // before anyone picks one, so the default is the whole migration.
+    // Added conditionally like every other late column.
+    sql: "",
+    backfill: Some(add_lang_column),
 }];
+
+/// Migration 9 body: add `blocks.lang` only when it is missing.
+fn add_lang_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'lang'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE blocks ADD COLUMN lang TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| StorageError::Sql(format!("add lang: {e}")))?;
+    }
+    Ok(())
+}
 
 /// Migration 8 body: add `blocks.columns` only when it is missing.
 fn add_columns_column(conn: &mut Connection) -> Result<(), StorageError> {

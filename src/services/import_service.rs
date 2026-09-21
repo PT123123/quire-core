@@ -1,14 +1,21 @@
 // Markdown import (SPEC §二十六): CommonMark text -> a change list that
 // creates one new page.
 //
-// The importer covers exactly the M4 block set (headings 1-3, bullet,
-// numbered, todo, quote, code, divider, paragraph) and the M6 inline marks
-// (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)`). What it
-// does not recognize — tables, images, setext headings, footnotes — is kept as
+// The importer covers the M4 block set (headings 1-3, bullet, numbered,
+// todo, quote, code, divider, paragraph) plus math (SPEC §三十七), and the M6
+// inline marks (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`,
+// `[text](url)`, `$…$`). What it does not
+// recognize — tables, images, setext headings, footnotes — is kept as
 // literal paragraph text, which is what makes `export_page(import(x))`
 // semantically stable: text we cannot represent is never thrown away.
 //
 // Scope notes:
+// - a `$$ … $$` fence and a `$…$` span hold a LaTeX subset as *source*; the
+//   renderer (`core::math`) turns it into Unicode at paint time, and nothing
+//   here parses inside it
+// - a `$` opens a span only the way TeX delimiters work — followed by a
+//   non-space, closed by a `$` preceded by a non-space — so "costs $5 and
+//   $10" stays prose instead of becoming a formula
 // - nested list indentation is recognized and flattened one level (the M4
 //   editor only renders top-level blocks)
 // - `####`..`######` become heading_3 (the block set has three levels)
@@ -40,6 +47,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
     // `str::lines()` already normalizes CRLF, so a Windows file imports as
     // is; a lone '\r' (old Mac) is treated as ordinary text.
     let mut fence: Option<Vec<String>> = None;
+    let mut math: Option<Vec<String>> = None;
     for raw in src.lines() {
         let body = raw.trim_start();
         if let Some(code) = fence.as_mut() {
@@ -63,6 +71,37 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
             fence = Some(Vec::new());
             continue;
         }
+        // `$$ … $$` is a formula's fence, and like a code fence its lines are
+        // verbatim: `\alpha` must survive with one backslash, so no inline pass
+        // runs over it.
+        if let Some(lines) = math.as_mut() {
+            if body.trim_end() == "$$" {
+                let taken = std::mem::take(lines);
+                out.push(ParsedBlock {
+                    kind: BlockKind::Math,
+                    text: taken.join("\n"),
+                    checked: false,
+                    marks: Vec::new(),
+                });
+                math = None;
+            } else {
+                lines.push(body.to_string());
+            }
+            continue;
+        }
+        if body.trim_end() == "$$" {
+            math = Some(Vec::new());
+            continue;
+        }
+        if body.len() > 4 && body.starts_with("$$") && body.ends_with("$$") {
+            out.push(ParsedBlock {
+                kind: BlockKind::Math,
+                text: body[2..body.len() - 2].trim().to_string(),
+                checked: false,
+                marks: Vec::new(),
+            });
+            continue;
+        }
         if body.trim_end().is_empty() {
             continue;
         }
@@ -73,6 +112,14 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
         out.push(ParsedBlock {
             kind: BlockKind::Code,
             text: code.join("\n"),
+            checked: false,
+            marks: Vec::new(),
+        });
+    }
+    if let Some(src) = math {
+        out.push(ParsedBlock {
+            kind: BlockKind::Math,
+            text: src.join("\n"),
             checked: false,
             marks: Vec::new(),
         });
@@ -283,6 +330,7 @@ fn mark_order(kind: MarkKind) -> u8 {
         MarkKind::Strike => 2,
         MarkKind::Code => 3,
         MarkKind::Link => 4,
+        MarkKind::Math => 5,
     }
 }
 
@@ -383,8 +431,44 @@ fn inline(src: &str, out: &mut String, marks: &mut Vec<Mark>) {
                 continue;
             }
         }
+        // `$x$`: one dollar that both opens and closes around a non-space-
+        // flanked run. The content is verbatim — a formula is source, and
+        // un-escaping `\,` inside it would change the LaTeX.
+        if c == '$' && run_len(bytes, at, b'$') == 1 && !src[i..].starts_with(char::is_whitespace) {
+            if let Some(close) = math_closer(bytes, i) {
+                let start = out.len();
+                out.push_str(&src[i..close]);
+                let end = out.len();
+                marks.push(Mark {
+                    start,
+                    end,
+                    kind: MarkKind::Math,
+                    url: String::new(),
+                });
+                i = close + 1;
+                continue;
+            }
+        }
         out.push(c);
     }
+}
+
+/// The byte index of the `$` closing an inline formula started before `from`:
+/// the first one with a non-space character in front of it, which is the rule
+/// that keeps "costs $5 and $10" prose. Escaped dollars are skipped.
+fn math_closer(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut j = from;
+    while j < bytes.len() {
+        j += escape_len(bytes, j);
+        if j >= bytes.len() {
+            return None;
+        }
+        if bytes[j] == b'$' && j > from && !bytes[j - 1].is_ascii_whitespace() {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
 }
 
 /// `***x***` carries both styles over one span; the model has no combined

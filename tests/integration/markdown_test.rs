@@ -980,3 +980,120 @@ fn a_layout_round_trips_as_its_lines_losing_only_the_shape() {
     // and exporting that again is byte-identical
     assert_eq!(export_page(&again), md);
 }
+
+// ── math (SPEC §三十七 批次 C, ADR-0038) ────────────────────────────
+
+#[test]
+fn a_math_block_exports_inside_its_own_fence() {
+    let blocks = vec![block(1, BlockKind::Math, r"\frac{a+b}{2}")];
+    let md = export_page(&blocks);
+    assert_eq!(md, "$$\n\\frac{a+b}{2}\n$$\n");
+    assert_eq!(
+        parse_markdown(&md),
+        vec![parsed(BlockKind::Math, r"\frac{a+b}{2}")]
+    );
+}
+
+#[test]
+fn a_math_fence_is_verbatim_where_prose_would_unescape() {
+    // the control that says the fence really is a fence: the same bytes as a
+    // paragraph lose the backslash in front of a comma, as a formula they do
+    // not, because `\,` is a spacing command and not an escaped comma
+    let fenced = parse_markdown(r#"$$
+\alpha \, \beta
+$$"#);
+    assert_eq!(fenced[0].text, r"\alpha \, \beta");
+    let prose = parse_markdown(r"\alpha \, \beta");
+    assert_eq!(prose[0].text, r"\alpha , \beta");
+}
+
+#[test]
+fn an_inline_formula_marks_its_span_and_reads_back_the_same_bytes() {
+    let (text, marks) = parse_inline("mass $E = mc^2$ here");
+    assert_eq!(text, "mass E = mc^2 here");
+    assert_eq!(marks, vec![mark(5, 13, MarkKind::Math)]);
+    let md = export_page(&[with_marks(
+        block(1, BlockKind::Paragraph, &text),
+        marks,
+    )]);
+    assert_eq!(md, "mass $E = mc^2$ here\n");
+}
+
+#[test]
+fn prose_holding_two_dollars_is_not_a_formula() {
+    // what makes `$…$` safe to read at all: a dollar needs a non-space on the
+    // inside of both its delimiters, which money amounts never present
+    let (text, marks) = parse_inline("costs $5 and $10 today");
+    assert_eq!(text, "costs $5 and $10 today");
+    assert!(marks.is_empty(), "{marks:?}");
+}
+
+#[test]
+fn export_escapes_the_dollar_that_would_otherwise_re_form_as_math() {
+    let md = export_page(&[block(1, BlockKind::Paragraph, "a$b$c")]);
+    assert_eq!(md, "a\\$b$c\n");
+    let back = &parse_markdown(&md)[0];
+    assert_eq!(back.text, "a$b$c");
+    assert!(back.marks.is_empty(), "{:?}", back.marks);
+    // and prose that only *has* dollars keeps them bare
+    assert_eq!(
+        export_page(&[block(1, BlockKind::Paragraph, "costs $5 and $10")]),
+        "costs $5 and $10\n"
+    );
+}
+
+#[test]
+fn a_formula_span_holds_no_other_style() {
+    // the `$…$` content is source, so a bold sharing it has no spelling: the
+    // mark goes and the text stays exact, like inside a code span
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "ab"),
+        vec![mark(0, 2, MarkKind::Bold), mark(0, 2, MarkKind::Math)],
+    );
+    let md = export_page(&[b]);
+    assert_eq!(md, "$ab$\n");
+    assert_eq!(
+        parse_markdown(&md)[0].marks,
+        vec![mark(0, 2, MarkKind::Math)]
+    );
+}
+
+#[test]
+fn a_space_padded_formula_exports_as_text_not_as_a_broken_fence() {
+    // `$ x $` never imports back as a formula, so writing it would move two
+    // dollars into the user's text; the mark goes instead
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "start x end"),
+        vec![mark(5, 8, MarkKind::Math)],
+    );
+    let md = export_page(&[b]);
+    assert_eq!(md, "start x end\n");
+    assert_eq!(parse_markdown(&md)[0].text, "start x end");
+    assert!(parse_markdown(&md)[0].marks.is_empty());
+}
+
+#[test]
+fn a_math_block_imports_from_both_fence_shapes() {
+    let fenced = parse_markdown("$$\nx^2\n$$\n");
+    let inline = parse_markdown("$$x^2$$\n");
+    assert_eq!(fenced, inline);
+    assert_eq!(fenced[0].text, "x^2");
+    // an unclosed fence keeps what it collected, like a code fence does
+    let loose = parse_markdown("$$\nx^2\n");
+    assert_eq!(loose, vec![parsed(BlockKind::Math, "x^2")]);
+}
+
+#[test]
+fn math_round_trips_in_both_shapes() {
+    // a raw literal with real line breaks, because the bytes that matter here
+    // are backslashes and `\n` would have to survive two readers to get wrong
+    assert_round_trip(
+        "math",
+        r#"$$
+\frac{a+b}{2} \leq \sqrt{ab}
+$$
+
+The mass is $E = mc^2$ here.
+"#,
+    );
+}

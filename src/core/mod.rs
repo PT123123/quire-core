@@ -4,6 +4,7 @@
 pub mod command;
 pub mod document;
 pub mod history;
+pub mod math;
 pub mod persistence;
 pub mod types;
 

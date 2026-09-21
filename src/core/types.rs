@@ -117,10 +117,14 @@ pub enum BlockKind {
     /// content. Never gets its own editor row — the delegate of the `Columns`
     /// block projects it, so a column's whole subtree stays hidden.
     Column,
+    /// A formula (SPEC §三十七 批次 C). `text` is the LaTeX subset source,
+    /// which is what the row edits and what persists; the glyphs a row shows
+    /// are derived at paint time by `core::math`, never stored.
+    Math,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 20] = [
+    pub const ALL: [BlockKind; 21] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -141,6 +145,7 @@ impl BlockKind {
         BlockKind::TableCell,
         BlockKind::Columns,
         BlockKind::Column,
+        BlockKind::Math,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -165,6 +170,7 @@ impl BlockKind {
             BlockKind::TableCell => "table_cell",
             BlockKind::Columns => "columns",
             BlockKind::Column => "column",
+            BlockKind::Math => "math",
         }
     }
 
@@ -249,6 +255,10 @@ pub enum MarkKind {
     Strike,
     Code,
     Link,
+    /// `$E=mc^2$` (SPEC §三十七 批次 C). The span holds the LaTeX subset
+    /// source without its delimiters, so the mark is the only place math knows
+    /// about; `url` is unused.
+    Math,
 }
 
 impl MarkKind {
@@ -259,6 +269,7 @@ impl MarkKind {
             MarkKind::Strike => "strike",
             MarkKind::Code => "code",
             MarkKind::Link => "link",
+            MarkKind::Math => "math",
         }
     }
 
@@ -269,6 +280,7 @@ impl MarkKind {
             "strike" => Some(MarkKind::Strike),
             "code" => Some(MarkKind::Code),
             "link" => Some(MarkKind::Link),
+            "math" => Some(MarkKind::Math),
             _ => None,
         }
     }

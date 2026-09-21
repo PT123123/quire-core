@@ -153,7 +153,7 @@ fn same_list_run(prev: BlockKind, next: BlockKind) -> bool {
 fn render(block: &Block, number: &mut usize) -> String {
     // a code block is source and a divider has no text: markers stay literal
     let text = match block.kind {
-        BlockKind::Code | BlockKind::Divider => block.text.clone(),
+        BlockKind::Code | BlockKind::Divider | BlockKind::Math => block.text.clone(),
         _ => render_inline(&block.text, &block.marks),
     };
     let text = text.as_str();
@@ -185,6 +185,14 @@ fn render(block: &Block, number: &mut usize) -> String {
         BlockKind::Code => {
             *number = 0;
             format!("```\n{text}\n```")
+        }
+        // The formula's own delimiters, on their own lines, which is the shape
+        // every Markdown math reader accepts. The source stays verbatim: a
+        // LaTeX `\alpha` has no CommonMark spelling, and escaping it would
+        // change what the formula *is*.
+        BlockKind::Math => {
+            *number = 0;
+            format!("$$\n{text}\n$$")
         }
         BlockKind::Divider => {
             *number = 0;
@@ -303,9 +311,9 @@ fn render_inline(text: &str, marks: &[Mark]) -> String {
             open.push(&spans[next]);
             next += 1;
         }
-        // inside a code span the text is verbatim: escaping there would put
-        // the backslash in the document
-        if open.iter().any(|m| m.kind == MarkKind::Code) {
+        // inside a code span or a formula the text is verbatim: escaping there
+        // would put the backslash in the document
+        if open.iter().any(|m| m.kind == MarkKind::Code || m.kind == MarkKind::Math) {
             out.push_str(&text[a..b]);
         } else {
             escape_text(&text[a..b], &mut out);
@@ -341,14 +349,16 @@ fn normalize(text: &str, marks: &[Mark]) -> Vec<Mark> {
             _ => joined.push(m),
         }
     }
-    // a code span's content is literal, so nothing inside it can be styled
+    // a code span's or a formula's content is literal, so nothing strictly
+    // inside one can be styled
     let code: Vec<(usize, usize)> = joined
         .iter()
-        .filter(|m| m.kind == MarkKind::Code)
+        .filter(|m| m.kind == MarkKind::Code || m.kind == MarkKind::Math)
         .map(|m| (m.start, m.end))
         .collect();
     joined.retain(|m| {
         m.kind == MarkKind::Code
+            || m.kind == MarkKind::Math
             || !code
                 .iter()
                 .any(|&(s, e)| s <= m.start && m.end <= e && (s, e) != (m.start, m.end))
@@ -380,6 +390,27 @@ fn normalize(text: &str, marks: &[Mark]) -> Vec<Mark> {
     while let Some((_, j)) = find_crossing(&joined) {
         joined.remove(j);
     }
+    // a formula also swallows whatever *shares* its range: `**a**` under a
+    // `$…$` over the same two characters has no spelling, and writing both
+    // would export `$**a**$` and import the stars into the formula's source
+    let math: Vec<(usize, usize)> = joined
+        .iter()
+        .filter(|m| m.kind == MarkKind::Math)
+        .map(|m| (m.start, m.end))
+        .collect();
+    joined.retain(|m| {
+        m.kind == MarkKind::Math || !math.iter().any(|&(s, e)| s <= m.start && m.end <= e)
+    });
+    // a formula whose source starts or ends with a space has no `$…$` spelling
+    // — the importer needs a non-space on the inside of both delimiters — so
+    // the mark goes and the text stays, which is the same deal as above
+    joined.retain(|m| {
+        if m.kind != MarkKind::Math {
+            return true;
+        }
+        let src = &text[m.start..m.end];
+        !src.starts_with(char::is_whitespace) && !src.ends_with(char::is_whitespace)
+    });
     // outer span first at each boundary, so nesting matches the importer
     joined.sort_by_key(|m| (m.start, std::cmp::Reverse(m.end), kind_order(m.kind)));
     joined
@@ -392,6 +423,7 @@ fn kind_order(kind: MarkKind) -> u8 {
         MarkKind::Strike => 2,
         MarkKind::Code => 3,
         MarkKind::Link => 4,
+        MarkKind::Math => 5,
     }
 }
 
@@ -440,6 +472,7 @@ fn opener_into(out: &mut String, m: &Mark, text: &str) {
             }
         }
         MarkKind::Link => out.push('['),
+        MarkKind::Math => out.push('$'),
     }
 }
 
@@ -455,6 +488,7 @@ fn closer_into(out: &mut String, m: &Mark, text: &str) {
             out.push_str(&"`".repeat(code_run(text, m)));
         }
         MarkKind::Link => out.push_str(&format!("]({})", link_target(&m.url))),
+        MarkKind::Math => out.push('$'),
     }
 }
 
@@ -505,6 +539,7 @@ fn escape_text(text: &str, out: &mut String) {
         let escape = match c {
             '*' | '`' | '~' | '[' => true,
             '_' => !prev_alnum && !opens_space(tail) && tail.contains('_'),
+            '$' => !opens_space(tail) && dollar_pair_ahead(tail),
             '\\' => tail
                 .chars()
                 .next()
@@ -518,6 +553,20 @@ fn escape_text(text: &str, out: &mut String) {
         prev_alnum = c.is_alphanumeric();
         rest = tail;
     }
+}
+
+/// Could a `$` further ahead close this one as a formula? The importer's own
+/// rule, so prose that merely *has* two dollars ("costs $5 and $10") exports
+/// without backslashes while `a$b$c`, which would come back as math, does not.
+fn dollar_pair_ahead(tail: &str) -> bool {
+    let mut prev: Option<char> = None;
+    for c in tail.chars() {
+        if c == '$' && prev.is_some_and(|p| !p.is_whitespace()) {
+            return true;
+        }
+        prev = Some(c);
+    }
+    false
 }
 
 /// An emphasis opener needs something that is not a space right behind it.

@@ -196,6 +196,13 @@ fn fence_close_marker(body: &str) -> Option<char> {
 }
 
 fn classify(line: &str) -> ParsedBlock {
+    // The marker `export_page` writes for a contents block. It is checked
+    // before anything else because it is the only line shape that is a *block
+    // kind* rather than text: the contents themselves are derived, so this is
+    // the whole of what survives an export.
+    if line.trim() == "<!-- quire:toc -->" {
+        return block(BlockKind::Toc, "");
+    }
     if is_divider(line) {
         return block(BlockKind::Divider, "");
     }

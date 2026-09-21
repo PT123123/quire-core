@@ -1097,3 +1097,49 @@ The mass is $E = mc^2$ here.
 "#,
     );
 }
+
+// ── contents block (SPEC §三十七 批次 C) ────────────────────────────
+
+#[test]
+fn a_contents_block_exports_one_marker_line_and_reads_back() {
+    // the list is derived from the page's headings, so the file carries only
+    // the fact that a contents block sits here — writing its lines would put
+    // block ids from this library into a document that has none
+    let md = export_page(&[block(1, BlockKind::Toc, "")]);
+    assert_eq!(md, "<!-- quire:toc -->\n");
+    assert_eq!(parse_markdown(&md), vec![parsed(BlockKind::Toc, "")]);
+}
+
+#[test]
+fn a_marker_line_neither_vanishes_nor_swallows_its_neighbours() {
+    // the control for "an HTML comment is dropped by a Markdown reader": the
+    // line survives as one block and the prose around it stays where it was
+    let blocks = vec![
+        block(1, BlockKind::Heading1, "Top"),
+        block(2, BlockKind::Toc, ""),
+        block(3, BlockKind::Paragraph, "below"),
+    ];
+    let md = export_page(&blocks);
+    assert_eq!(md, "# Top\n\n<!-- quire:toc -->\n\nbelow\n");
+    assert_eq!(
+        parse_markdown(&md),
+        vec![
+            parsed(BlockKind::Heading1, "Top"),
+            parsed(BlockKind::Toc, ""),
+            parsed(BlockKind::Paragraph, "below"),
+        ]
+    );
+}
+
+#[test]
+fn a_contents_block_round_trips_without_a_copy_of_its_list() {
+    assert_round_trip("contents marker", "<!-- quire:toc -->\n\n# H\n");
+    let blocks = blocks_of(&import_markdown(
+        "<!-- quire:toc -->\n",
+        &page(),
+        &mut counter(1),
+    ));
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].kind, BlockKind::Toc);
+    assert_eq!(blocks[0].text, "");
+}

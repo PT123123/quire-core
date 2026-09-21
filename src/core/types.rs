@@ -121,10 +121,14 @@ pub enum BlockKind {
     /// which is what the row edits and what persists; the glyphs a row shows
     /// are derived at paint time by `core::math`, never stored.
     Math,
+    /// A table of contents (SPEC §三十七 批次 C). Holds no content of its own:
+    /// the page's headings *are* its body, read at projection time, so editing
+    /// a heading edits the contents and nothing here can go stale.
+    Toc,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 21] = [
+    pub const ALL: [BlockKind; 22] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -146,7 +150,19 @@ impl BlockKind {
         BlockKind::Columns,
         BlockKind::Column,
         BlockKind::Math,
+        BlockKind::Toc,
     ];
+
+    /// Heading level 1..3 for a heading kind; `None` for anything else. A
+    /// `Toc` lists exactly these, and its indent is this number.
+    pub fn heading_level(self) -> Option<u8> {
+        match self {
+            BlockKind::Heading1 => Some(1),
+            BlockKind::Heading2 => Some(2),
+            BlockKind::Heading3 => Some(3),
+            _ => None,
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -171,6 +187,7 @@ impl BlockKind {
             BlockKind::Columns => "columns",
             BlockKind::Column => "column",
             BlockKind::Math => "math",
+            BlockKind::Toc => "toc",
         }
     }
 

@@ -198,6 +198,14 @@ fn render(block: &Block, number: &mut usize) -> String {
             *number = 0;
             "---".to_string()
         }
+        // A contents block has no Markdown shape, and writing its *lines* would
+        // put derived data in the document — with block ids that mean nothing
+        // in whichever library the file lands in. One marker line says what the
+        // block is, renders as nothing anywhere, and reads back as itself.
+        BlockKind::Toc => {
+            *number = 0;
+            "<!-- quire:toc -->".to_string()
+        }
         BlockKind::Bullet => {
             *number = 0;
             prefix_lines("- ", text)

@@ -1899,11 +1899,7 @@ mod database_layer {
             catalog.title_property(db.id).cloned().unwrap(),
             properties[1].clone(),
         ];
-        let req = RowRequest {
-            db: db.id,
-            title: PropertyId(1),
-            columns: &columns,
-        };
+        let req = RowRequest::new(db.id, PropertyId(1), &columns);
         assert_eq!(reopened.record_count(db.id).unwrap(), 3);
         let rows = reopened.window_rows(&req, RowWindow { start: 0, end: 3 }).unwrap();
         assert_eq!(rows.len(), 3);
@@ -1990,11 +1986,7 @@ mod database_layer {
         let live: Vec<u64> = state.pages.iter().map(|p| p.id.as_u64()).collect();
         let rows = repo
             .window_rows(
-                &RowRequest {
-                    db: db.id,
-                    title: PropertyId(1),
-                    columns: &[],
-                },
+                &RowRequest::new(db.id, PropertyId(1), &[]),
                 RowWindow { start: 0, end: 31 },
             )
             .unwrap();
@@ -2134,6 +2126,243 @@ mod database_layer {
         assert_eq!(
             repo.record_title(records[0]).unwrap().as_deref(),
             Some("Kept by the state")
+        );
+    }
+}
+
+// ─── Track 3 · D2: the property system ──────────────────────────────────────
+//
+// D1's integration tests (and Track 2's, which reuse its helpers) live in
+// `database_layer` above. D2's live here, in a module of their own appended at
+// the end of this file: in a working tree four tracks share, a slice's diff is
+// easiest to stage — and to prove — when it is a pure addition, and a v17
+// fixture needs ten lines of helper that nothing else has a use for.
+mod database_property_layer {
+    use super::*;
+    use quire::core::database::{
+        CellValue, Database, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId,
+        ValueKind, ViewId,
+    };
+    use quire::core::database_property::iso_date;
+    use std::path::PathBuf;
+
+    /// A real file at `CURRENT_VERSION`, migrated by the app itself: standing in
+    /// front of a step means a real older file, not a stub (D1's rule, and the
+    /// reason `roll_back` above drops what the later steps added).
+    fn migrated(name: &str) -> (ScratchDir, PathBuf) {
+        let dir = ScratchDir::new(name);
+        let path = dir.join("quire.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    /// Stand in front of step 17: drop the two columns it adds and put the
+    /// version number back. Step 17 is a column-only step, so this is the whole
+    /// fixture — and `ALTER TABLE … DROP COLUMN` is what makes it a *real* v16
+    /// file rather than a v17 one pretending (SQLite needs 3.35+ for it, which
+    /// the bundled engine is; nothing indexes these columns, which is what makes
+    /// the drop legal).
+    fn roll_back_timestamps(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        for column in ["created", "edited"] {
+            conn.execute(&format!("ALTER TABLE db_records DROP COLUMN {column}"), [])
+                .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 16).unwrap();
+    }
+
+    /// A column of database 1, in the shape the store takes.
+    fn column(id: u64, name: &str, kind: PropertyKind, ordinal: u64) -> Property {
+        Property {
+            id: PropertyId(id),
+            db: DatabaseId(1),
+            name: name.into(),
+            kind,
+            config: String::new(),
+            ord: OrderKey(OrderKey::FIRST.0 + ordinal * 0x100),
+        }
+    }
+
+    /// The two column names step 17 adds, as the file really has them.
+    fn record_columns(path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('db_records') ORDER BY cid")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        names
+    }
+
+    /// SPEC §三十九's two derived kinds (ADR-0068), end to end on a real file:
+    /// a record written *before* the step has no stamps and shows empty cells
+    /// rather than 1970, the rows it already had are untouched by the upgrade,
+    /// and a record written after it is stamped in the stored date shape.
+    #[test]
+    fn the_v17_step_adds_the_record_timestamps_to_a_v16_database() {
+        let (_dir, path) = migrated("d2-v17");
+        // A v16 library: a database, a column, a row with a value, and no
+        // timestamps anywhere.
+        {
+            let repo = SqliteRepository::open(&path).unwrap();
+            let db = Database::new(DatabaseId(1), "Tasks");
+            repo.apply(&[
+                Change::DatabaseCreated(db.clone()),
+                Change::PropertyAdded(db.title_property(PropertyId(1))),
+                Change::PropertyAdded(column(2, "Notes", PropertyKind::Text, 1)),
+                Change::ViewAdded(db.first_view(ViewId(1))),
+                Change::RecordCreated(Record::bare(
+                    RecordId(1),
+                    db.id,
+                    OrderKey::FIRST,
+                )),
+                Change::CellSet {
+                    record: RecordId(1),
+                    property: PropertyId(1),
+                    value: CellValue::Text("Written before the step".into()),
+                },
+            ])
+            .unwrap();
+        }
+        roll_back_timestamps(&path);
+        assert_eq!(record_columns(&path), vec!["id", "db", "page", "ord"]);
+
+        // Open it: the upgrade runs.
+        let repo = SqliteRepository::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+        drop(conn);
+        assert_eq!(
+            record_columns(&path),
+            vec!["id", "db", "page", "ord", "created", "edited"],
+            "the step added exactly the two columns"
+        );
+
+        // The row that existed at v16 is exactly what it was, and its stamps are
+        // empty: no upgrade invents a birthday.
+        let stamps = repo.record_timestamps(RecordId(1)).unwrap().unwrap();
+        assert_eq!(stamps.created, "");
+        assert_eq!(stamps.edited, "");
+        assert_eq!(
+            repo.record_title(RecordId(1)).unwrap().as_deref(),
+            Some("Written before the step"),
+            "the title is the value row it was (ADR-0063)"
+        );
+
+        // And a row written now is stamped, in the shape ADR-0062 stores a date
+        // in — which is what makes the two derived kinds sortable at all.
+        repo.apply(&[Change::RecordCreated(Record::bare(
+            RecordId(2),
+            DatabaseId(1),
+            OrderKey(OrderKey::FIRST.0 + 0x100),
+        ))])
+        .unwrap();
+        let fresh = repo.record_timestamps(RecordId(2)).unwrap().unwrap();
+        assert_eq!(fresh.created.len(), 16, "{}", fresh.created);
+        assert_eq!(fresh.created, fresh.edited, "one statement, one instant");
+        assert!(iso_date(&fresh.created).is_some(), "{}", fresh.created);
+
+        // A property of a derived kind reads *that* column of the record, and a
+        // file written by this build can hold the kind even though ADR-0061's
+        // fold is what the catalog shows (the kind string is the file's).
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO db_properties (id, db, name, kind, config, ord)
+                 VALUES (3, 1, 'Created', 'created_time', '', 5120)",
+                [],
+            )
+            .unwrap();
+        }
+        let repo = SqliteRepository::open(&path).unwrap();
+        assert_eq!(
+            repo.cell(RecordId(2), PropertyId(3)).unwrap(),
+            CellValue::Text(fresh.created.clone())
+        );
+        assert_eq!(
+            repo.cell(RecordId(1), PropertyId(3)).unwrap(),
+            CellValue::Empty,
+            "a v16 row's empty stamp is an empty cell, not a 1970 one"
+        );
+        assert_eq!(
+            column(3, "Created", PropertyKind::CreatedTime, 5).kind.value_kind(),
+            ValueKind::Derived
+        );
+    }
+
+    /// The bulk path, end to end on a real file: `replace_all` replaces the
+    /// *document*, and it deletes the pages a record is the face of — which
+    /// cascades through `db_records.page` (ADR-0066). A record the incoming state
+    /// keeps keeps the birthday it had, not the moment the file was rewritten.
+    #[test]
+    fn a_bulk_replace_keeps_the_birthday_of_the_records_it_keeps() {
+        let dir = ScratchDir::new("d2-bulk-timestamps");
+        let path = dir.join("quire.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+        let db = Database::new(DatabaseId(1), "Tasks");
+        repo.apply(&[
+            Change::DatabaseCreated(db.clone()),
+            Change::PropertyAdded(db.title_property(PropertyId(1))),
+            Change::PropertyAdded(column(2, "Notes", PropertyKind::Text, 1)),
+            Change::ViewAdded(db.first_view(ViewId(1))),
+            Change::PageCreated(page(50, "Kept by the state", None, OrderKey::FIRST.0)),
+            Change::PageCreated(page(51, "Dropped by the state", None, OrderKey::FIRST.0 + 0x100)),
+            // One page-backed row (its page survives the state) and one that
+            // carries its own values, so both paths through `restore_tables` are
+            // walked with a stamp on them.
+            Change::RecordCreated(Record {
+                id: RecordId(1),
+                db: db.id,
+                page: Some(PageId(50)),
+                ord: OrderKey::FIRST,
+            }),
+            Change::RecordCreated(Record {
+                id: RecordId(2),
+                db: db.id,
+                page: Some(PageId(51)),
+                ord: OrderKey(OrderKey::FIRST.0 + 0x100),
+            }),
+            Change::CellSet {
+                record: RecordId(2),
+                property: PropertyId(2),
+                value: CellValue::Text("goes with its page".into()),
+            },
+        ])
+        .unwrap();
+        // An old birthday, so "kept" is distinguishable from "stamped again".
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE db_records SET created = '2020-01-01T00:00', edited = '2020-01-01T00:00'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let kept = PersistedState {
+            pages: vec![page(50, "Kept by the state", None, OrderKey::FIRST.0)],
+            blocks: vec![],
+            meta: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        repo.replace_all(&kept).unwrap();
+
+        let stamps = repo.record_timestamps(RecordId(1)).unwrap().unwrap();
+        assert_eq!(stamps.created, "2020-01-01T00:00");
+        assert_eq!(stamps.edited, "2020-01-01T00:00");
+        assert_eq!(
+            repo.record(RecordId(2)).unwrap(),
+            None,
+            "the row whose page the state dropped is gone (ADR-0066)"
         );
     }
 }

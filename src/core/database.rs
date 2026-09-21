@@ -22,6 +22,14 @@
 // (`storage::database_store`) reads and writes it, and `RowRequest` is what it
 // needs to run a windowed read. ADR-0066/0067 are where D1's two new decisions
 // are written down.
+//
+// D2 adds the property system's two halves and neither is in this file: *what a
+// cell means* is `core::database_property` (the parse and paint rules, the
+// option list, the one JSON reader), and *what a sort asks SQL for* is
+// `SortSpec` below — the compiled form of "order by this column", which the
+// store turns into an `ORDER BY` (ADR-0069). What changes here is what the
+// fourteen kinds *are*: the two derived time kinds stop pretending to be text
+// values (ADR-0068), and `RowRequest` grows the sort the view will compile.
 
 use super::types::{OrderKey, PageId};
 
@@ -319,9 +327,10 @@ pub struct Property {
     pub kind: PropertyKind,
     /// The type's own settings, as one JSON document (ADR-0061) — exactly what
     /// SQL never filters on: a select's option list (options carry their own
-    /// ids), a number's format, a rollup's target. D1 stores it verbatim and
-    /// never parses it: the option reader is D2's and the filter compiler that
-    /// has to *ignore* ids of deleted properties is D4's.
+    /// ids), a number's format, a rollup's target. D1 stores it verbatim; D2
+    /// reads it through `core::database_property` (the option list, the two
+    /// formats) and writes it back in the same shape, and the filter compiler
+    /// that has to *ignore* ids of deleted properties is D4's.
     pub config: String,
     /// Where the column sits in the view's column list. A dense key like
     /// `pages.ord`, because `ord` being an app invariant is the price ADR-0061
@@ -423,15 +432,6 @@ impl PropertyKind {
         matches!(self, PropertyKind::MultiSelect | PropertyKind::Files)
     }
 
-    /// Whether this kind stores nothing at all and is computed for the window
-    /// at projection time — `formula` / `rollup` / `relation` (ADR-0062).
-    pub fn is_computed(self) -> bool {
-        matches!(
-            self,
-            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation
-        )
-    }
-
     /// The one kind a database has exactly one of, at `ord = 0` (ADR-0061) —
     /// and the column whose value is `pages.title` for a record that has a page
     /// (ADR-0063).
@@ -439,11 +439,66 @@ impl PropertyKind {
         self == PropertyKind::Title
     }
 
-    /// The value the store can hold for a kind, given a cell to write. `None`
-    /// means the kind stores nothing and the write is dropped rather than
-    /// double-written (ADR-0039/ADR-0062). The title column is text: its
-    /// *storage* differs per record (page title or value row, ADR-0063) but
-    /// what a caller writes into it is a string either way.
+    /// Whether this kind stores nothing at all and is computed for the window
+    /// at projection time — `formula` / `rollup` / `relation` (ADR-0062). These
+    /// are the kinds this build has no engine for yet, so a cell of one of them
+    /// paints nothing.
+    pub fn is_computed(self) -> bool {
+        matches!(
+            self,
+            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation
+        )
+    }
+
+    /// Whether this kind's value is derived from something the store already
+    /// keeps, and therefore is **never** written into `db_values` (ADR-0039's
+    /// discipline, ADR-0068's landing): `created time` and `last edited time`
+    /// are the record's own two instants, which live on `db_records` and are
+    /// stamped by the write path. A cell of one of these paints the record's
+    /// column and nothing else, whatever a rogue caller wrote.
+    pub fn is_derived(self) -> bool {
+        matches!(
+            self,
+            PropertyKind::CreatedTime | PropertyKind::LastEditedTime
+        )
+    }
+
+    /// Which SQL column this kind's sort is an order over (ADR-0069), or `None`
+    /// when the kind has no order a user would recognise. The distinction
+    /// matters because the *column* decides the comparison: `number` sorts in
+    /// SQLite's `REAL` column and `2` comes before `10`, while a text-stored
+    /// kind sorts its bytes — which is right for a date only because ADR-0062
+    /// stores one fixed-width.
+    ///
+    /// `None` for the list kinds: "sort by multi-select" means an order over
+    /// the *options*, which is a question about the column's settings and not
+    /// about the value, and D4/D5 is where that gets a meaning.
+    pub fn sort_column(self) -> Option<SortColumn> {
+        match self {
+            PropertyKind::Title
+            | PropertyKind::Text
+            | PropertyKind::Url
+            | PropertyKind::Email
+            | PropertyKind::Phone
+            | PropertyKind::Select
+            | PropertyKind::Status
+            | PropertyKind::Date => Some(SortColumn::Text),
+            PropertyKind::Number => Some(SortColumn::Number),
+            PropertyKind::Checkbox => Some(SortColumn::Flag),
+            PropertyKind::CreatedTime => Some(SortColumn::Created),
+            PropertyKind::LastEditedTime => Some(SortColumn::Edited),
+            PropertyKind::MultiSelect
+            | PropertyKind::Files
+            | PropertyKind::Formula
+            | PropertyKind::Rollup
+            | PropertyKind::Relation => None,
+        }
+    }
+
+    /// The value the store can hold for a kind, given a cell to write. The
+    /// title column is text: its *storage* differs per record (page title or
+    /// value row, ADR-0063) but what a caller writes into it is a string either
+    /// way.
     pub fn value_kind(self) -> ValueKind {
         match self {
             PropertyKind::Number => ValueKind::Number,
@@ -452,14 +507,16 @@ impl PropertyKind {
             PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation => {
                 ValueKind::Computed
             }
+            PropertyKind::CreatedTime | PropertyKind::LastEditedTime => ValueKind::Derived,
             _ => ValueKind::Text,
         }
     }
 }
 
 /// Which of ADR-0062's storage shapes a kind's value takes: the `text` column,
-/// the `num` column, the `flag` column, the `db_value_items` table, or nothing
-/// at all because the column is computed.
+/// the `num` column, the `flag` column, the `db_value_items` table, nothing at
+/// all because the column is computed, or nothing at all because the value is
+/// derived from the record itself (ADR-0068).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
     Text,
@@ -467,6 +524,65 @@ pub enum ValueKind {
     Flag,
     Items,
     Computed,
+    Derived,
+}
+
+/// Which column one sort orders by (ADR-0069). `Created` / `Edited` are the
+/// record's own two instants, which is why a sort by them needs no join at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+    /// The `text` column — bytes, which is time order for the two date-shaped
+    /// kinds because ADR-0062 stores them fixed-width.
+    Text,
+    /// The `num` column: numbers, not the strings that spell them.
+    Number,
+    /// The `flag` column: `false` before `true`.
+    Flag,
+    /// `db_records.created`.
+    Created,
+    /// `db_records.edited`.
+    Edited,
+}
+
+/// One compiled `ORDER BY` term: which stored column of which property, and
+/// which way. Compiled in `core` (this is the *decision*) and turned into SQL by
+/// `storage::database_store` (that is the *statement*) — §三十九's "filter and
+/// sort happen in SQL, not in the UI" is only true if the order is emitted
+/// there, so nothing in this crate sorts a `Vec` of rows.
+///
+/// One term, not a list: D2 sorts by one column, and the view document's
+/// `sorts` array (ADR-0064) is D4's to compile into as many terms as it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortSpec {
+    pub property: PropertyId,
+    pub column: SortColumn,
+    pub descending: bool,
+}
+
+impl SortSpec {
+    /// The sort a column can offer, or `None` when the kind has no order a user
+    /// would recognise. Asking for a sort a kind cannot give is a caller error
+    /// with no sensible fallback (silently ordering by row position would look
+    /// like it worked), so the answer is the absence of a `SortSpec` rather
+    /// than a defaulted one.
+    pub fn of(property: &Property, descending: bool) -> Option<SortSpec> {
+        property.kind.sort_column().map(|column| SortSpec {
+            property: property.id,
+            column,
+            descending,
+        })
+    }
+}
+
+/// A record's two instants, in ADR-0062's stored date shape — `YYYY-MM-DDTHH:MM`
+/// local wall time, `""` for a record from before ADR-0068's step (which is
+/// also what "unknown" paints as). Read-only on purpose: nothing hands these to
+/// a `Change` (ADR-0068), so no caller can invent a birthday — the write path
+/// stamps them and the derived kinds project them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordTimestamps {
+    pub created: String,
+    pub edited: String,
 }
 
 /// One row of one database (SPEC §三十九 "record：一行，可以同时是一个 page").
@@ -610,11 +726,13 @@ impl CellValue {
         matches!(self, CellValue::Empty)
     }
 
-    /// The painted form of a cell. **D1's placeholder**, and the one place this
-    /// slice renders anything: the per-type rendering (a select shows its
-    /// option's *name*, a date its format, files their file names, a
-    /// multi-select its names joined) needs the property's `config`, which D2
-    /// reads. Until then a list cell shows the ids it stores.
+    /// The painted form of a cell **with no column around it** — the value's own
+    /// form, which is what a caller with no `Property` in hand can ask for. A
+    /// cell on screen goes through `core::database_property::paint` instead,
+    /// which is this plus the column's settings (an option's *name*, a number's
+    /// format, a file's name), and which falls back to this for every kind that
+    /// has no settings (ADR-0069). The two agree about a number by construction:
+    /// both print it with `Display`.
     pub fn display(&self) -> String {
         match self {
             CellValue::Empty => String::new(),
@@ -687,14 +805,32 @@ impl DatabaseCatalog {
 
 /// What one window read needs to know: which database, which `title` column
 /// (the caller read it out of the catalog a moment ago, and ADR-0063's
-/// `COALESCE` cannot be written without it), and the columns the view shows, in
-/// the order the row's cells come back in. The title column may appear in
-/// `columns` or not — a row's title is [`RowView::title`] either way.
+/// `COALESCE` cannot be written without it), the columns the view shows, in
+/// the order the row's cells come back in, and the column the view is ordered
+/// by. The title column may appear in `columns` or not — a row's title is
+/// [`RowView::title`] either way.
 #[derive(Debug, Clone, Copy)]
 pub struct RowRequest<'a> {
     pub db: DatabaseId,
     pub title: PropertyId,
     pub columns: &'a [Property],
+    /// The order the rows come back in, as SQL was told to produce it
+    /// (ADR-0069). `None` is the database's own listing order — `db_records.ord`
+    /// — which is also every sort's tie-break, so a view is never in an order
+    /// nothing defined.
+    pub sort: Option<SortSpec>,
+}
+
+impl<'a> RowRequest<'a> {
+    /// The request a fresh view makes: the columns, no sort.
+    pub fn new(db: DatabaseId, title: PropertyId, columns: &'a [Property]) -> Self {
+        RowRequest {
+            db,
+            title,
+            columns,
+            sort: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +995,15 @@ mod tests {
         ] {
             assert_eq!(kind.value_kind(), ValueKind::Computed);
             assert!(kind.is_computed());
+            assert!(!kind.is_derived(), "computed and derived are two answers");
+        }
+        // D2's landing of §三十九's last two kinds (ADR-0068): they store no
+        // cell either, and D1's placeholder ("a derived kind is text until D2
+        // says otherwise") is exactly what this assertion replaces.
+        for kind in [PropertyKind::CreatedTime, PropertyKind::LastEditedTime] {
+            assert_eq!(kind.value_kind(), ValueKind::Derived);
+            assert!(kind.is_derived());
+            assert!(!kind.is_computed(), "computed and derived are two answers");
         }
         // Everything else is a string in the `text` column — including the
         // title, whose *storage* differs per record (ADR-0063) but whose value
@@ -872,8 +1017,6 @@ mod tests {
             PropertyKind::Url,
             PropertyKind::Email,
             PropertyKind::Phone,
-            PropertyKind::CreatedTime,
-            PropertyKind::LastEditedTime,
         ] {
             assert_eq!(kind.value_kind(), ValueKind::Text);
         }
@@ -883,10 +1026,66 @@ mod tests {
             1,
             "the title kind exists once, and a database has one of it"
         );
-        // A value lives in exactly one place: no kind is both a list and a
-        // computed column.
+        // A value lives in exactly one place: no kind is two of text, number,
+        // flag, list, computed and derived at once.
         for kind in PropertyKind::ALL {
             assert!(!(kind.is_list() && kind.is_computed()), "{kind:?}");
+            assert!(!(kind.is_list() && kind.is_derived()), "{kind:?}");
+            assert!(!(kind.is_computed() && kind.is_derived()), "{kind:?}");
+        }
+    }
+
+    /// Which column a sort orders by, and which kinds refuse to offer one
+    /// (ADR-0069). The refusal matters as much as the answer: ordering a
+    /// multi-select by "the bytes of its first option" would look like it
+    /// worked, which is why the caller gets no `SortSpec` to pass on.
+    #[test]
+    fn a_sort_names_the_stored_column_its_kind_compares_in() {
+        let of = |kind| SortSpec::of(&property(7, kind), false);
+        for kind in [
+            PropertyKind::Title,
+            PropertyKind::Text,
+            PropertyKind::Url,
+            PropertyKind::Email,
+            PropertyKind::Phone,
+            PropertyKind::Select,
+            PropertyKind::Status,
+            PropertyKind::Date,
+        ] {
+            assert_eq!(of(kind).unwrap().column, SortColumn::Text, "{kind:?}");
+        }
+        assert_eq!(of(PropertyKind::Number).unwrap().column, SortColumn::Number);
+        assert_eq!(of(PropertyKind::Checkbox).unwrap().column, SortColumn::Flag);
+        assert_eq!(
+            of(PropertyKind::CreatedTime).unwrap().column,
+            SortColumn::Created
+        );
+        assert_eq!(
+            of(PropertyKind::LastEditedTime).unwrap().column,
+            SortColumn::Edited
+        );
+        for kind in [
+            PropertyKind::MultiSelect,
+            PropertyKind::Files,
+            PropertyKind::Formula,
+            PropertyKind::Rollup,
+            PropertyKind::Relation,
+        ] {
+            assert_eq!(of(kind), None, "{kind:?} offered a sort");
+        }
+        let spec = SortSpec::of(&property(7, PropertyKind::Number), true).unwrap();
+        assert_eq!(spec.property, PropertyId(7), "the column, not the kind alone");
+        assert!(spec.descending, "the direction is part of the term");
+    }
+
+    fn property(id: u64, kind: PropertyKind) -> Property {
+        Property {
+            id: PropertyId(id),
+            db: DatabaseId(1),
+            name: "P".into(),
+            kind,
+            config: String::new(),
+            ord: OrderKey::FIRST,
         }
     }
 

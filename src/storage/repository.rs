@@ -584,6 +584,13 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "PageTitleSet", id.as_u64())?;
+            // A page-backed record's title *is* `pages.title` (ADR-0063), so
+            // this write is a change to the row a database shows — and
+            // `last edited time` is the column that has to say so (ADR-0068).
+            // The record's own write path cannot see this one, which is why it
+            // is called here; a page no record owns updates zero rows, which is
+            // the ordinary answer rather than a missing row.
+            database_store::touch_edited_by_page(tx, *id)?;
             search_index::index_page_title(tx, *id, title)
         }
         Change::PageMoved { id, parent, order } => {

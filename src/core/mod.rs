@@ -3,6 +3,7 @@
 
 pub mod command;
 pub mod database;
+pub mod database_property;
 pub mod document;
 pub mod embed;
 pub mod highlight;

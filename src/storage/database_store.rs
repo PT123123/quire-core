@@ -21,20 +21,50 @@
 // `repository::apply_one` (which is where the exhaustive match lives, so a new
 // variant cannot be forgotten). Everything runs inside the caller's transaction
 // and nothing commits on its own (SPEC §十八).
+//
+// D2 adds the property system's SQL half, and two of its three pieces are
+// shapes rather than code:
+//
+//   3. **A cell is painted through its column** (`core::database_property`):
+//      an option id becomes a name, a number goes through its format, a file id
+//      through the one query that names attachments for this window. The store
+//      owns exactly the part the core cannot do — the query — and hands the
+//      answer over.
+//   4. **The sort is an `ORDER BY` in the statement** (§三十九's red line:
+//      nothing in the UI filters or sorts). `RowRequest::sort` is compiled into
+//      the same query the window already runs, so the rows that come back are
+//      the sorted window's rows and no Rust `sort_by` exists anywhere on the
+//      read path. `row_query` is where the comparison's *column* is chosen, and
+//      that choice is what makes `2` sort before `10`.
+//   5. **The derived kinds read the record's own columns** (ADR-0068): a
+//      `created time` / `last edited time` cell is `db_records.created` /
+//      `.edited`, never a `db_values` row, and the write path is what stamps
+//      them.
 
 use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
 use crate::core::database::{
-    CellValue, Database, DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind, RealizedRows,
-    Record, RecordId, RowRequest, RowView, RowWindow, ValueKind, View, ViewGeometry, ViewId,
+    CellValue, Database, DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind,
+    RealizedRows, Record, RecordId, RecordTimestamps, RowRequest, RowView, RowWindow, SortColumn,
+    SortSpec, ValueKind, View, ViewGeometry, ViewId,
 };
 use crate::core::persistence::StorageError;
 use crate::core::types::{OrderKey, PageId};
 
 use super::database::{ord_from_db, ord_to_db};
 use super::repository::{require_hit, SqliteRepository};
+
+/// The one clock in the database layer (ADR-0068): SQLite's own, read as the
+/// stored date shape — `YYYY-MM-DDTHH:MM`, local wall time, fixed width. A
+/// record's `created` / `edited` are stamped by statements that use this
+/// expression, never by a caller passing a time in: the write path is the only
+/// thing that can keep an instant honest, so it is the only thing that writes
+/// one. `localtime` is the same clock the user's files carry; `COALESCE` is
+/// there because a machine whose zone SQLite cannot read returns NULL, and a
+/// NULL in a `NOT NULL` column is a failed write rather than a blank stamp.
+const NOW: &str = "COALESCE(strftime('%Y-%m-%dT%H:%M','now','localtime'), strftime('%Y-%m-%dT%H:%M','now'))";
 
 fn sql(e: rusqlite::Error) -> StorageError {
     StorageError::Sql(e.to_string())
@@ -207,11 +237,31 @@ impl SqliteRepository {
         Ok(title.map(|t| t.unwrap_or_default()))
     }
 
+    /// A record's two instants, as step 17 stores them (ADR-0068), or `None`
+    /// when there is no such record. `""` is a record that predates the step —
+    /// an upgrade invents no birthdays — and paints as an empty cell.
+    ///
+    /// Deliberately **not** a field of `Record`: `Record` is what a `Change`
+    /// carries, and a change that could name a birthday would be a caller that
+    /// can invent one. The store is the write path, so the store is what stamps
+    /// them (see [`NOW`]).
+    pub fn record_timestamps(
+        &self,
+        id: RecordId,
+    ) -> Result<Option<RecordTimestamps>, StorageError> {
+        read_record_timestamps(&self.database().conn(), id)
+    }
+
     /// One cell, in the shape its column stores (ADR-0062): the `text` column,
     /// the `num` column, the `flag` column, or `db_value_items`. A property
     /// that does not exist, a column that stores nothing (`formula` / `rollup`
     /// / `relation`), and a cell nobody ever wrote all answer `Empty` — which is
     /// this design's single representation of "no value".
+    ///
+    /// The two derived kinds (ADR-0068) are read from the record's own row and
+    /// never from `db_values`. That is what makes "no double write" structural
+    /// rather than promised: a `db_values` row written at a derived column by a
+    /// caller that ignored the contract is not a value any read path consults.
     pub fn cell(&self, record: RecordId, property: PropertyId) -> Result<CellValue, StorageError> {
         let conn = self.database().conn();
         let kind: Option<String> = conn
@@ -225,8 +275,15 @@ impl SqliteRepository {
         let Some(kind) = kind else {
             return Ok(CellValue::Empty);
         };
-        match PropertyKind::from_stored(&kind).value_kind() {
-            ValueKind::Computed => Ok(CellValue::Empty),
+        let kind = PropertyKind::from_stored(&kind);
+        if kind.is_derived() {
+            // The guard is already held: the read goes through the free
+            // function rather than back through `self`, because this mutex is
+            // not reentrant (a hung test is what taught this slice that).
+            return derived_cell(&conn, record, kind);
+        }
+        match kind.value_kind() {
+            ValueKind::Computed | ValueKind::Derived => Ok(CellValue::Empty),
             ValueKind::Items => {
                 let items = read_cell_items(&conn, record, property)?;
                 if items.is_empty() {
@@ -258,6 +315,34 @@ impl SqliteRepository {
                 })
             }
         }
+    }
+
+    /// **The workspace's local member list** — SPEC §三十九's `person` 降级, and
+    /// ADR-0071's shape for it: no accounts, no member table, no ids. A person
+    /// is a name in a text cell, and the list a picker offers is the distinct
+    /// names the file already holds, read out of the values rather than kept
+    /// beside them (a second copy is a second thing to go stale).
+    ///
+    /// The predicate is the **stored** kind string, which is why this is a
+    /// query and not a walk over the catalog: `PropertyKind::from_stored` folds
+    /// `person` to `text` (ADR-0061 — this build has no account model and no
+    /// person-specific behaviour to hang on a variant), while SQL still sees the
+    /// word the file was written with. A file this build created has no such
+    /// column, so an empty answer is the honest one here; a file written by a
+    /// build that knows `person` gets its names back, and the day this build
+    /// grows the variant the same query starts answering for its own cells.
+    pub fn workspace_people(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.database().conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT v.text FROM db_values v
+                   JOIN db_properties p ON p.id = v.property
+                  WHERE p.kind = 'person' AND v.text <> ''
+                  ORDER BY v.text COLLATE NOCASE, v.text",
+            )
+            .map_err(sql)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
     }
 
     /// The rows of one window, and only those: the query ends in the window's
@@ -312,78 +397,273 @@ impl SqliteRepository {
     }
 }
 
-/// The one query a row read runs.
+/// A record's two instants, or `None` when there is no such record. The free
+/// function takes the connection its caller already holds — the method on the
+/// repository is this plus the lock — because a store method that reached back
+/// through `self` while holding the guard would deadlock on a mutex that is not
+/// reentrant.
+fn read_record_timestamps(
+    conn: &Connection,
+    id: RecordId,
+) -> Result<Option<RecordTimestamps>, StorageError> {
+    conn.query_row(
+        "SELECT created, edited FROM db_records WHERE id = ?1",
+        params![id.as_u64() as i64],
+        |r| {
+            Ok(RecordTimestamps {
+                created: r.get(0)?,
+                edited: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sql)
+}
+
+/// One record's stamp as a cell, for the two derived kinds — ADR-0068's
+/// "derived from the record itself and from nothing else". The empty string is
+/// a record from before step 17, and paints as an empty cell rather than 1970.
+fn derived_cell(
+    conn: &Connection,
+    record: RecordId,
+    kind: PropertyKind,
+) -> Result<CellValue, StorageError> {
+    let Some(stamps) = read_record_timestamps(conn, record)? else {
+        return Ok(CellValue::Empty);
+    };
+    let stamp = if kind == PropertyKind::CreatedTime {
+        stamps.created
+    } else {
+        stamps.edited
+    };
+    Ok(if stamp.is_empty() {
+        CellValue::Empty
+    } else {
+        CellValue::Text(stamp)
+    })
+}
+
+/// The `db_records` column a derived kind projects (ADR-0068), or `None` for
+/// every other kind. A derived cell costs no `db_values` join at all: the stamp
+/// is already on the row the query is walking.
+fn derived_column(kind: PropertyKind) -> Option<&'static str> {
+    match kind {
+        PropertyKind::CreatedTime => Some("created"),
+        PropertyKind::LastEditedTime => Some("edited"),
+        _ => None,
+    }
+}
+
+/// One statement under construction: its `SELECT`, its `FROM`, and the binds its
+/// placeholders take *in the order they were emitted*.
 ///
-/// One `LEFT JOIN` per visible property against `db_values` on
+/// The counter is why this is a struct at all. A sort term is a join and a bind
+/// that arrive *after* the visible columns, and hand-counted `?N`s are how a
+/// window read would silently bind a property id into a `LIMIT`.
+struct Sql {
+    select: String,
+    from: String,
+    binds: Vec<i64>,
+}
+
+impl Sql {
+    /// The next placeholder, and the bind it stands for.
+    fn bind(&mut self, value: i64) -> String {
+        self.binds.push(value);
+        format!("?{}", self.binds.len())
+    }
+}
+
+/// A statement and the binds that go with it, built together so the two cannot
+/// disagree about what `?4` is.
+struct RowQuery {
+    sql: String,
+    binds: Vec<i64>,
+}
+
+/// The query a row read runs, with its binds.
+///
+/// One `LEFT JOIN` per *visible* property against `db_values` on
 /// `(record, property)` — the primary key, so every join is an index probe
-/// rather than a scan — plus the record's page. The row's title is ADR-0063's
+/// rather than a scan — plus the record's page, plus one more join when the
+/// view sorts by a column it does not show. The row's title is ADR-0063's
 /// `COALESCE(p.title, t.text)`, and a *visible* title column reads through the
 /// same expression: a page-backed record's title is `pages.title` and nothing
 /// else, whether the view shows the column or not.
 ///
+/// A derived kind (`created time` / `last edited time`) joins **nothing**: its
+/// value is `db_records.created` / `.edited`, a column of the row already being
+/// walked (ADR-0068). Its three slots keep every other column's shape — the
+/// stamp in the `text` slot, two NULLs beside it — so nothing downstream needs
+/// a special case to read one.
+///
+/// A sort becomes this statement's `ORDER BY`, emitted here and nowhere else:
+/// §三十九 puts the order in SQL, and the reason shows in the window clause — a
+/// window is a *slice of an order*, so rows sliced in Rust and sorted afterwards
+/// would be the wrong 31 rows. Which column the comparison runs in is
+/// `SortColumn`'s choice (`v1.num` for a number, `v1.text` for a date), and that
+/// choice is the whole reason `2` sorts before `10`.
+///
 /// `LIMIT`/`OFFSET` are the window. They are appended only when a window was
 /// asked for, so the control read is the same query minus those two clauses and
 /// the difference between the two numbers is the window and nothing else.
-fn row_query(req: &RowRequest<'_>, window: Option<RowWindow>) -> String {
-    let mut select = String::from("SELECT r.id, COALESCE(p.title, t.text)");
-    let mut from = String::from(
-        " FROM db_records r \
-         LEFT JOIN pages p ON p.id = r.page \
-         LEFT JOIN db_values t ON t.record = r.id AND t.property = ?1",
-    );
-    for (index, column) in req.columns.iter().enumerate() {
-        let alias = format!("v{index}");
-        let text = if column.id == req.title {
-            format!("COALESCE(p.title, {alias}.text)")
-        } else {
-            format!("{alias}.text")
-        };
-        select.push_str(&format!(", {text}, {alias}.num, {alias}.flag"));
-        from.push_str(&format!(
-            " LEFT JOIN db_values {alias} ON {alias}.record = r.id AND {alias}.property = ?{}",
-            index + 2
-        ));
-    }
-    let mut query = format!("{select}{from} WHERE r.db = ?{} ORDER BY r.ord, r.id", req.columns.len() + 2);
-    if window.is_some() {
-        query.push_str(&format!(
-            " LIMIT ?{} OFFSET ?{}",
-            req.columns.len() + 3,
-            req.columns.len() + 4
-        ));
-    }
-    query
-}
+fn row_query_plan(req: &RowRequest<'_>, window: Option<RowWindow>) -> RowQuery {
+    let mut sql = Sql {
+        select: String::from("SELECT r.id, COALESCE(p.title, t.text)"),
+        from: String::from(" FROM db_records r LEFT JOIN pages p ON p.id = r.page"),
+        binds: Vec::new(),
+    };
+    let title_bind = sql.bind(id(req.title.as_u64()));
+    sql.from.push_str(&format!(
+        " LEFT JOIN db_values t ON t.record = r.id AND t.property = {title_bind}"
+    ));
 
-/// The bind values `row_query`'s placeholders take, in order: the title
-/// property, the visible properties, the database, then the window.
-fn row_binds(req: &RowRequest<'_>, window: Option<RowWindow>) -> Vec<i64> {
-    let mut binds = Vec::with_capacity(req.columns.len() + 4);
-    binds.push(id(req.title.as_u64()));
-    binds.extend(req.columns.iter().map(|c| id(c.id.as_u64())));
-    binds.push(id(req.db.as_u64()));
+    // The (text, num, flag) triple each visible column's cell is read from. The
+    // alias names stay dense even when a derived column takes no join, so the
+    // numbering a plan prints is the numbering of the joins it really made.
+    let mut slots: Vec<(String, String, String)> = Vec::with_capacity(req.columns.len());
+    for column in req.columns {
+        match derived_column(column.kind) {
+            Some(stamp) => slots.push((format!("r.{stamp}"), "NULL".into(), "NULL".into())),
+            None => {
+                let alias = format!("v{}", slots.len());
+                let bind = sql.bind(id(column.id.as_u64()));
+                sql.from.push_str(&format!(
+                    " LEFT JOIN db_values {alias} ON {alias}.record = r.id \
+                     AND {alias}.property = {bind}"
+                ));
+                let text = if column.id == req.title {
+                    format!("COALESCE(p.title, {alias}.text)")
+                } else {
+                    format!("{alias}.text")
+                };
+                slots.push((text, format!("{alias}.num"), format!("{alias}.flag")));
+            }
+        }
+    }
+    for (text, num, flag) in &slots {
+        sql.select.push_str(&format!(", {text}, {num}, {flag}"));
+    }
+
+    let order = match req.sort {
+        Some(sort) => {
+            let expr = sort_expression(req, sort, &mut sql, &slots);
+            // Where the blanks go, said out loud (ADR-0062's rule, ADR-0069's
+            // statement of it): "sort by number" does not mean "float the rows
+            // with no number to the top", and SQLite puts NULLs first. The
+            // nullness term is always ascending, so a *descending* sort does not
+            // turn the blanks around either; the last term is the database's own
+            // listing order, so equal rows always come back in one order.
+            let empty = match sort.column {
+                SortColumn::Text => format!("({expr} IS NULL OR {expr} = '')"),
+                SortColumn::Number | SortColumn::Flag => format!("({expr} IS NULL)"),
+                SortColumn::Created => "(r.created = '')".to_string(),
+                SortColumn::Edited => "(r.edited = '')".to_string(),
+            };
+            let direction = if sort.descending { "DESC" } else { "ASC" };
+            format!(" ORDER BY {empty} ASC, {expr} {direction}, r.ord, r.id")
+        }
+        None => " ORDER BY r.ord, r.id".to_string(),
+    };
+
+    let database = sql.bind(id(req.db.as_u64()));
+    let mut text = format!("{}{} WHERE r.db = {database}{order}", sql.select, sql.from);
     if let Some(window) = window {
-        binds.push(window.len() as i64);
-        binds.push(window.start as i64);
+        let limit = sql.bind(window.len() as i64);
+        let offset = sql.bind(window.start as i64);
+        text.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
     }
-    binds
+    RowQuery {
+        sql: text,
+        binds: sql.binds,
+    }
 }
 
-/// Run `row_query` and assemble the rows. Cells come back in `columns` order
-/// and are painted through `CellValue::display` — D1's placeholder rendering,
-/// which D2 replaces with the per-type one.
+/// The SQL expression one sort compares. Four cases, in the order they are
+/// asked, and each is a decision:
+///
+/// * a derived kind is `r.created` / `r.edited` — no join;
+/// * the title column is ADR-0063's `COALESCE`, because a page-backed record's
+///   title is `pages.title` and its value row may not exist at all;
+/// * a column the view shows reuses the alias its cell is read through;
+/// * a column the view *hides* gets a join of its own — a view document may sort
+///   by one (ADR-0064), and one extra index probe per row is what that costs.
+fn sort_expression(
+    req: &RowRequest<'_>,
+    sort: SortSpec,
+    sql: &mut Sql,
+    slots: &[(String, String, String)],
+) -> String {
+    // Which slot of the triple the comparison wants: 0 text, 1 num, 2 flag. The
+    // two derived columns are not read through a slot at all.
+    let slot = match sort.column {
+        SortColumn::Text => 0,
+        SortColumn::Number => 1,
+        SortColumn::Flag => 2,
+        SortColumn::Created => return "r.created".to_string(),
+        SortColumn::Edited => return "r.edited".to_string(),
+    };
+    if sort.property == req.title {
+        // The title's one home is the `COALESCE` — whether the column is visible
+        // or not, and `t` is joined either way.
+        return match slot {
+            0 => "COALESCE(p.title, t.text)".to_string(),
+            1 => "t.num".to_string(),
+            _ => "t.flag".to_string(),
+        };
+    }
+    if let Some(visible) = req.columns.iter().position(|c| c.id == sort.property) {
+        let (text, num, flag) = &slots[visible];
+        return match slot {
+            0 => text.clone(),
+            1 => num.clone(),
+            _ => flag.clone(),
+        };
+    }
+    // One hidden sort column, so one alias. `s` rather than `v` to keep the
+    // visible joins' numbering readable in a plan.
+    let alias = "s0";
+    let bind = sql.bind(id(sort.property.as_u64()));
+    sql.from.push_str(&format!(
+        " LEFT JOIN db_values {alias} ON {alias}.record = r.id AND {alias}.property = {bind}"
+    ));
+    match slot {
+        0 => format!("{alias}.text"),
+        1 => format!("{alias}.num"),
+        _ => format!("{alias}.flag"),
+    }
+}
+
+/// The statement one row read runs, and its binds — for the probe, which prints
+/// the query it measured (D1's evidence table). The read path itself goes
+/// through [`row_query_plan`] directly, because it needs both halves at once.
+#[cfg(test)]
+fn row_query(req: &RowRequest<'_>, window: Option<RowWindow>) -> String {
+    row_query_plan(req, window).sql
+}
+
+/// The bind values `row_query`'s placeholders take, in the order the plan
+/// emitted them: the title property, the visible properties, the sorted property
+/// when the view hides it, the database, then the window.
+#[cfg(test)]
+fn row_binds(req: &RowRequest<'_>, window: Option<RowWindow>) -> Vec<i64> {
+    row_query_plan(req, window).binds
+}
+
+/// Run `row_query`, assemble the rows, and paint every cell through its column
+/// (`core::database_property::paint`: an option id becomes a name, a number
+/// goes through its format, a file id through the window's attachment names).
 fn read_rows(
     conn: &Connection,
     req: &RowRequest<'_>,
     window: Option<RowWindow>,
 ) -> Result<Vec<RowView>, StorageError> {
-    let query = row_query(req, window);
-    let binds = row_binds(req, window);
-    let mut stmt = conn.prepare(&query).map_err(sql)?;
+    let plan = row_query_plan(req, window);
+    let mut stmt = conn.prepare(&plan.sql).map_err(sql)?;
     let mut raw: Vec<RawRow> = Vec::new();
     {
         let mut rows = stmt
-            .query(params_from_iter(binds.iter().copied()))
+            .query(params_from_iter(plan.binds.iter().copied()))
             .map_err(sql)?;
         while let Some(row) = rows.next().map_err(sql)? {
             let record = row.get::<_, i64>(0).map_err(sql)?;
@@ -418,6 +698,7 @@ fn read_rows(
         let records: Vec<i64> = raw.iter().map(|(record, _, _)| *record).collect();
         read_items(conn, &records, &list_columns)?
     };
+    let names = read_attachment_names(req, &items, conn)?;
 
     let mut out = Vec::with_capacity(raw.len());
     for (record, title, cells) in raw {
@@ -432,7 +713,7 @@ fn read_rows(
                 },
                 _ => cell_from_columns(column.kind, text, num, flag),
             };
-            painted.push(value.display());
+            painted.push(column.paint(&value, &names));
         }
         out.push(RowView {
             record: record as u64,
@@ -465,7 +746,69 @@ fn cell_from_columns(
             .map(|f| CellValue::Flag(f != 0))
             .unwrap_or(CellValue::Empty),
         ValueKind::Text => text.map(CellValue::Text).unwrap_or(CellValue::Empty),
+        // A derived kind's stamp arrives in the text slot (it is a column of
+        // the record, not of `db_values`), and step 17's `''` means "not known"
+        // — the absence of a value, exactly as `cell` reads it (ADR-0068).
+        ValueKind::Derived => match text {
+            Some(stamp) if !stamp.is_empty() => CellValue::Text(stamp),
+            _ => CellValue::Empty,
+        },
     }
+}
+
+/// The names of the attachments this window's `files` cells point at (ADR-0029/
+/// ADR-0030's store, ADR-0062's "files is the same channel"): one query for the
+/// whole window, and only when the view shows a files column.
+///
+/// The ids come from the rows already in hand, never from the table, so the
+/// window bounds this query the way it bounds the row read. An id whose row is
+/// gone is simply absent from the answer, and the cell paints the id itself
+/// (ADR-0069) — a visible missing file rather than a blank cell.
+fn read_attachment_names(
+    req: &RowRequest<'_>,
+    items: &HashMap<(i64, i64), Vec<String>>,
+    conn: &Connection,
+) -> Result<HashMap<String, String>, StorageError> {
+    let file_columns: Vec<i64> = req
+        .columns
+        .iter()
+        .filter(|c| c.kind == PropertyKind::Files)
+        .map(|c| id(c.id.as_u64()))
+        .collect();
+    if file_columns.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut wanted: BTreeSet<i64> = BTreeSet::new();
+    for ((_, property), ids) in items {
+        if !file_columns.contains(property) {
+            continue;
+        }
+        for item in ids {
+            if let Ok(id) = item.parse::<i64>() {
+                wanted.insert(id);
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<i64> = wanted.into_iter().collect();
+    let query = format!(
+        "SELECT id, name FROM attachments WHERE id IN ({})",
+        placeholders(ids.len())
+    );
+    let mut stmt = conn.prepare(&query).map_err(sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(ids.iter().copied()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(sql)?;
+    let mut names = HashMap::new();
+    for row in rows {
+        let (id, name) = row.map_err(sql)?;
+        names.insert(id.to_string(), name);
+    }
+    Ok(names)
 }
 
 /// The items of every (record, property) among `records` and `properties`.
@@ -645,14 +988,53 @@ pub(crate) fn delete_property(tx: &Transaction, property: PropertyId) -> Result<
 }
 
 pub(crate) fn insert_record(tx: &Transaction, record: &Record) -> Result<(), StorageError> {
+    // The record's birthday (ADR-0068): stamped by the one statement that
+    // creates a record, and never written again — a rename, a cell edit and a
+    // drag all leave it where it is. A *redo* of the creation stamps a new
+    // moment, which is the honest answer to "when was this row made": it was
+    // just made again.
     tx.execute(
-        "INSERT INTO db_records (id, db, page, ord) VALUES (?1, ?2, ?3, ?4)",
+        &format!(
+            "INSERT INTO db_records (id, db, page, ord, created, edited)
+             VALUES (?1, ?2, ?3, ?4, {NOW}, {NOW})"
+        ),
         params![
             id(record.id.as_u64()),
             id(record.db.as_u64()),
             record.page.map(|p| id(p.as_u64())),
             ord_to_db(record.ord.0),
         ],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// Move a record's `edited` stamp to now (ADR-0068). **Content is the rule**: a
+/// cell write is content, and so is a page title (a page-backed record's title
+/// *is* `pages.title`, ADR-0063, which is why [`touch_edited_by_page`] exists
+/// for the one write that comes in through another module). Moving a row in the
+/// listing, or pointing it at a page, is the record's *frame*, and dragging a
+/// row is not editing it — so those two leave the stamp alone, which is a
+/// decision and not an oversight.
+fn touch_record(tx: &Transaction, record: i64) -> Result<(), StorageError> {
+    tx.execute(
+        &format!("UPDATE db_records SET edited = {NOW} WHERE id = ?1"),
+        params![record],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// The record whose page was just renamed has its `edited` stamp moved
+/// (ADR-0068). Called from `repository::apply_one`'s `PageTitleSet` arm, which
+/// is the one write path outside this module that changes a record's content.
+///
+/// No `require_hit`: most pages are not a record's face, and zero rows updated
+/// is the ordinary answer rather than a missing row.
+pub(crate) fn touch_edited_by_page(tx: &Transaction, page: PageId) -> Result<(), StorageError> {
+    tx.execute(
+        &format!("UPDATE db_records SET edited = {NOW} WHERE page = ?1"),
+        params![id(page.as_u64())],
     )
     .map_err(sql)?;
     Ok(())
@@ -764,6 +1146,11 @@ pub(crate) fn set_cell(
             tx.execute(clear_items, params![record, property]).map_err(sql)?;
         }
     }
+    // A cell is the record's content, so writing one moves `last edited time`
+    // (ADR-0068) — including a write that *clears* a cell, because clearing is
+    // an edit. One statement more per cell write, and it is the price of the
+    // stamp not being a lie; D8's "cost of editing one cell" number includes it.
+    touch_record(tx, record)?;
     Ok(())
 }
 
@@ -858,11 +1245,14 @@ pub(crate) fn delete_view(tx: &Transaction, view: ViewId) -> Result<(), StorageE
 // incoming state dropped, and then the record goes with its page exactly as it
 // does on the ordinary delete path.
 
-/// Raw rows of the six tables, exactly as they were.
+/// Raw rows of the six tables, exactly as they were — including the two record
+/// timestamps (ADR-0068): a checkpoint, a repair or a LAN pull replaces the
+/// document, and a record that survives it keeps the birthday it had, not the
+/// moment the file was rewritten.
 pub(crate) struct DatabaseSnapshot {
     databases: Vec<(i64, String)>,
     properties: Vec<(i64, i64, String, String, String, i64)>,
-    records: Vec<(i64, i64, Option<i64>, i64)>,
+    records: Vec<(i64, i64, Option<i64>, i64, String, String)>,
     values: Vec<(i64, i64, String, Option<f64>, i64)>,
     items: Vec<(i64, i64, i64, String)>,
     views: Vec<(i64, i64, String, String, String, i64)>,
@@ -901,10 +1291,19 @@ pub(crate) fn snapshot_tables(conn: &Connection) -> Result<DatabaseSnapshot, Sto
     }
     {
         let mut stmt = conn
-            .prepare("SELECT id, db, page, ord FROM db_records")
+            .prepare("SELECT id, db, page, ord, created, edited FROM db_records")
             .map_err(sql)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
             .map_err(sql)?;
         for row in rows {
             snapshot.records.push(row.map_err(sql)?);
@@ -975,13 +1374,14 @@ pub(crate) fn restore_tables(
         .map_err(sql)?;
     }
     let mut kept: BTreeSet<i64> = BTreeSet::new();
-    for (id, db, page, ord) in &snapshot.records {
+    for (id, db, page, ord, created, edited) in &snapshot.records {
         if page.is_some_and(|p| !kept_pages.contains(&p)) {
             continue;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO db_records (id, db, page, ord) VALUES (?1, ?2, ?3, ?4)",
-            params![id, db, page, ord],
+            "INSERT OR REPLACE INTO db_records (id, db, page, ord, created, edited)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, db, page, ord, created, edited],
         )
         .map_err(sql)?;
         kept.insert(*id);
@@ -1025,8 +1425,9 @@ pub(crate) fn restore_tables(
 mod tests {
     use super::*;
     use crate::core::database::{ViewLayout, TITLE_PROPERTY_NAME};
+    use crate::core::database_property::OptionId;
     use crate::core::persistence::{Change, Repository};
-    use crate::core::types::{Page, PageFont};
+    use crate::core::types::{Attachment, AttachmentId, Page, PageFont};
 
     fn store() -> SqliteRepository {
         SqliteRepository::in_memory().expect("in-memory repository")
@@ -1366,11 +1767,7 @@ mod tests {
         let db = seed(&repo, &[property(2, PropertyKind::Text, 1)]);
         let ids = rows(&repo, 100);
         let columns = vec![property(2, PropertyKind::Text, 1)];
-        let req = RowRequest {
-            db: db.id,
-            title: PropertyId(1),
-            columns: &columns,
-        };
+        let req = RowRequest::new(db.id, PropertyId(1), &columns);
         let geometry = ViewGeometry::new(32.0, 720.0);
 
         assert_eq!(repo.record_count(db.id).unwrap(), 100);
@@ -1460,11 +1857,7 @@ mod tests {
             property(2, PropertyKind::MultiSelect, 1),
             property(3, PropertyKind::Checkbox, 2),
         ];
-        let req = RowRequest {
-            db: db.id,
-            title: PropertyId(1),
-            columns: &columns,
-        };
+        let req = RowRequest::new(db.id, PropertyId(1), &columns);
         let geometry = ViewGeometry::new(32.0, 720.0);
 
         // No rows: the count is zero, the window is empty, and the read is a
@@ -1621,11 +2014,7 @@ mod tests {
             db.title_property(PropertyId(1)),
             property(2, PropertyKind::Text, 1),
         ];
-        let req = RowRequest {
-            db: db.id,
-            title: PropertyId(1),
-            columns: &columns,
-        };
+        let req = RowRequest::new(db.id, PropertyId(1), &columns);
         let ids = rows(&repo, 1);
         repo.apply(&[
             Change::PageCreated(page(50, "Page title")),
@@ -1857,6 +2246,977 @@ mod tests {
             "the view the batch inserted did not survive the batch that failed"
         );
     }
+
+    // ─── D2: the property system ───────────────────────────────────────────
+    //
+    // `core::database_property`'s tests are about the rules; these are about
+    // what lands in SQLite and comes back — one round trip per kind, the
+    // borders, and the two things this slice exists for: the order of a window
+    // is SQL's, and the two derived kinds read the record rather than a value
+    // row (ADR-0068/ADR-0069).
+
+    /// A column with settings, for the kinds whose round trip is about them.
+    fn with_config(id: u64, kind: PropertyKind, config: &str, ordinal: u64) -> Property {
+        Property {
+            config: config.into(),
+            ..property(id, kind, ordinal)
+        }
+    }
+
+    /// The status/select list the tests share: one option with a colour, one
+    /// without, exactly the document ADR-0061 writes down.
+    const OPTIONS: &str =
+        r#"{"options":[{"id":7,"name":"Done","color":"green"},{"id":2,"name":"Doing"}]}"#;
+
+    /// Records written through the app's own change path: one `RecordCreated`
+    /// and one `CellSet` per (property, value) given. Returns their ids in
+    /// listing order.
+    fn write_rows(repo: &SqliteRepository, values: &[Vec<(u64, CellValue)>]) -> Vec<RecordId> {
+        let mut changes = Vec::new();
+        for (index, cells) in values.iter().enumerate() {
+            let record = RecordId(1_000 + index as u64);
+            changes.push(Change::RecordCreated(Record::bare(
+                record,
+                DatabaseId(1),
+                OrderKey(((index as u64) + 1) << 32),
+            )));
+            for (property, value) in cells {
+                changes.push(Change::CellSet {
+                    record,
+                    property: PropertyId(*property),
+                    value: value.clone(),
+                });
+            }
+        }
+        repo.apply(&changes).unwrap();
+        (0..values.len()).map(|i| RecordId(1_000 + i as u64)).collect()
+    }
+
+    /// The first visible cell of every row, in the order a window read returns
+    /// them — which is the only order these tests care about.
+    fn column_read(
+        repo: &SqliteRepository,
+        columns: &[Property],
+        sort: Option<SortSpec>,
+        window: RowWindow,
+    ) -> Vec<String> {
+        let mut req = RowRequest::new(DatabaseId(1), PropertyId(1), columns);
+        req.sort = sort;
+        repo.window_rows(&req, window)
+            .unwrap()
+            .iter()
+            .map(|row| row.cells[0].clone())
+            .collect()
+    }
+
+    /// Every kind §三十九 lists, once: the value is built by the column's own
+    /// `parse` (the input path), written as a `CellSet`, read back typed
+    /// (`cell`) and painted in a window — so one test covers "stored and read
+    /// back is itself" for text-shaped, numeric, flag, list and derived kinds
+    /// at once.
+    #[test]
+    fn a_cell_of_every_kind_round_trips_through_the_store() {
+        let repo = store();
+        let columns = vec![
+            property(2, PropertyKind::Text, 1),
+            property(3, PropertyKind::Number, 2),
+            with_config(4, PropertyKind::Number, r#"{"format":"percent"}"#, 3),
+            with_config(5, PropertyKind::Select, OPTIONS, 4),
+            with_config(6, PropertyKind::Status, OPTIONS, 5),
+            property(7, PropertyKind::Date, 6),
+            with_config(8, PropertyKind::Date, r#"{"format":"datetime"}"#, 7),
+            property(9, PropertyKind::Checkbox, 8),
+            property(10, PropertyKind::Url, 9),
+            property(11, PropertyKind::Email, 10),
+            property(12, PropertyKind::Phone, 11),
+            with_config(13, PropertyKind::MultiSelect, OPTIONS, 12),
+            property(14, PropertyKind::Files, 13),
+            property(15, PropertyKind::CreatedTime, 14),
+            property(16, PropertyKind::LastEditedTime, 15),
+        ];
+        // The title column is ADR-0061's one `title` kind: `seed` writes it, so
+        // it is not one of the view's columns below — and its painted form is
+        // the row's own title rather than a cell.
+        let title = Database::new(DatabaseId(1), "Tasks").title_property(PropertyId(1));
+        let db = seed(&repo, &columns);
+        // The attachment the files cell points at, through the one channel
+        // attachments have (ADR-0029/ADR-0030): a files column stores the id
+        // and the *name* a user reads comes from the row.
+        repo.apply(&[Change::AttachmentAdded(Attachment {
+            id: AttachmentId(12),
+            name: "report.pdf".into(),
+            file: "a1b2.pdf".into(),
+            thumb: String::new(),
+            mime: "application/pdf".into(),
+            bytes: 4_096,
+            width: 0,
+            height: 0,
+        })])
+        .unwrap();
+        let record = write_rows(&repo, &[vec![]])[0];
+
+        // (property, input, what the store holds, what a cell paints). The
+        // painted form is the part D2 owns: an option id becomes a name, a
+        // number goes through its format.
+        let scalars: Vec<(u64, &str, CellValue, &str)> = vec![
+            (1, "Write the brief", CellValue::Text("Write the brief".into()), "Write the brief"),
+            (2, "  a note  ", CellValue::Text("  a note  ".into()), "  a note  "),
+            (3, "-2.5", CellValue::Number(-2.5), "-2.5"),
+            (3, "0", CellValue::Number(0.0), "0"),
+            (4, "0.25", CellValue::Number(0.25), "25%"),
+            (5, "Done", CellValue::Text("7".into()), "Done"),
+            (6, "doing", CellValue::Text("2".into()), "Doing"),
+            (7, "2026-09-22T14:03", CellValue::Text("2026-09-22T14:03".into()), "2026-09-22"),
+            (8, "2026-09-22T14:03", CellValue::Text("2026-09-22T14:03".into()), "2026-09-22T14:03"),
+            (9, "no", CellValue::Flag(false), "No"),
+            (9, "yes", CellValue::Flag(true), "Yes"),
+            (10, "not a url", CellValue::Text("not a url".into()), "not a url"),
+            (11, "a@b", CellValue::Text("a@b".into()), "a@b"),
+            (12, "+86 138 0000 0000", CellValue::Text("+86 138 0000 0000".into()), "+86 138 0000 0000"),
+        ];
+        let table = |property: u64| -> Property {
+            if property == 1 {
+                return title.clone();
+            }
+            columns
+                .iter()
+                .find(|c| c.id == PropertyId(property))
+                .unwrap()
+                .clone()
+        };
+        let cell_at = |property: u64| {
+            columns
+                .iter()
+                .position(|c| c.id == PropertyId(property))
+                .unwrap()
+        };
+        for (property, input, stored, painted) in &scalars {
+            let column = table(*property);
+            let value = match column.parse(input) {
+                Ok(value) => value,
+                // The two derived kinds take no write at all, and this is the
+                // input path refusing rather than the store silently dropping
+                // one (ADR-0068).
+                Err(e) if column.kind.is_derived() => {
+                    assert!(e.message().contains("stores no cell"), "{e}");
+                    CellValue::Empty
+                }
+                Err(e) => panic!("{e}"),
+            };
+            assert_eq!(&value, stored, "{input:?} parsed into the wrong cell");
+            repo.apply(&[Change::CellSet {
+                record,
+                property: PropertyId(*property),
+                value: value.clone(),
+            }])
+            .unwrap();
+            assert_eq!(
+                &repo.cell(record, PropertyId(*property)).unwrap(),
+                stored,
+                "cell {property} did not round trip"
+            );
+            let req = RowRequest::new(db.id, PropertyId(1), &columns);
+            let row = &repo.window_rows(&req, RowWindow { start: 0, end: 1 }).unwrap()[0];
+            if *property == 1 {
+                assert_eq!(&row.title, painted, "the title column painted wrong");
+            } else {
+                assert_eq!(&row.cells[cell_at(*property)], painted, "cell {property} painted wrong");
+            }
+        }
+
+        // The list kinds: multi-select takes option names, files takes
+        // attachment ids, and both paint the names a user reads.
+        for (property, inputs, stored, painted) in [
+            (
+                13u64,
+                vec!["Done".to_string(), "Doing".to_string()],
+                CellValue::Items(vec!["7".into(), "2".into()]),
+                "Done, Doing",
+            ),
+            (
+                14,
+                vec!["12".to_string()],
+                CellValue::Items(vec!["12".into()]),
+                "report.pdf",
+            ),
+        ] {
+            let column = table(property);
+            let value = column.parse_many(&inputs).unwrap();
+            assert_eq!(value, stored);
+            repo.apply(&[Change::CellSet {
+                record,
+                property: PropertyId(property),
+                value: value.clone(),
+            }])
+            .unwrap();
+            assert_eq!(repo.cell(record, PropertyId(property)).unwrap(), stored);
+            let req = RowRequest::new(db.id, PropertyId(1), &columns);
+            let painted_now = repo
+                .window_rows(&req, RowWindow { start: 0, end: 1 })
+                .unwrap()[0]
+                .cells[cell_at(property)]
+                .clone();
+            assert_eq!(painted_now, painted, "column {property} painted wrong");
+        }
+
+        // And the two derived kinds read the record itself (ADR-0068): the
+        // stamp the write path gave it, not a value row.
+        let stamps = repo.record_timestamps(record).unwrap().unwrap();
+        assert!(
+            crate::core::database_property::iso_date(&stamps.created).is_some(),
+            "{}",
+            stamps.created
+        );
+        assert_eq!(
+            repo.cell(record, PropertyId(15)).unwrap(),
+            CellValue::Text(stamps.created.clone())
+        );
+        assert_eq!(
+            repo.cell(record, PropertyId(16)).unwrap(),
+            CellValue::Text(stamps.edited.clone())
+        );
+    }
+
+    /// The borders the task asks to be explicit about: a negative, a decimal
+    /// and a zero number; an empty string against an absent cell; a very long
+    /// text; the three kinds whose invalid forms are **stored anyway**; and the
+    /// shapes each kind refuses by name.
+    #[test]
+    fn the_borders_of_every_type_are_stored_or_refused_by_name() {
+        let repo = store();
+        let columns = vec![
+            property(2, PropertyKind::Text, 1),
+            property(3, PropertyKind::Number, 2),
+            property(4, PropertyKind::Date, 3),
+            property(5, PropertyKind::Url, 4),
+            property(6, PropertyKind::Email, 5),
+            property(7, PropertyKind::Phone, 6),
+            with_config(8, PropertyKind::MultiSelect, OPTIONS, 7),
+        ];
+        seed(&repo, &columns);
+        let record = write_rows(&repo, &[vec![]])[0];
+
+        // A number is a number whatever its sign or size, and zero is a value:
+        // "no number" is the absence of a row and never `0` (ADR-0062).
+        for (input, stored) in [
+            ("-2", -2.0),
+            ("-0.5", -0.5),
+            ("0", 0.0),
+            ("0.0", 0.0),
+            ("1e3", 1000.0),
+            ("-3.25e-2", -0.0325),
+        ] {
+            let value = columns[1].parse(input).unwrap();
+            assert_eq!(value, CellValue::Number(stored), "{input}");
+            repo.apply(&[Change::CellSet {
+                record,
+                property: PropertyId(3),
+                value,
+            }])
+            .unwrap();
+            assert_eq!(
+                repo.cell(record, PropertyId(3)).unwrap(),
+                CellValue::Number(stored),
+                "{input} did not round trip"
+            );
+            assert!(
+                repo.cell(record, PropertyId(3)).unwrap() != CellValue::Empty,
+                "a written zero is a row, not an empty cell"
+            );
+        }
+        for bad in ["inf", "-inf", "NaN", "2,5", "two"] {
+            assert!(columns[1].parse(bad).is_err(), "{bad} was stored");
+        }
+
+        // Clearing: every kind's empty input is the absence of a row.
+        for input in ["", "   "] {
+            assert_eq!(columns[1].parse(input).unwrap(), CellValue::Empty);
+        }
+        repo.apply(&[Change::CellSet {
+            record,
+            property: PropertyId(3),
+            value: CellValue::Empty,
+        }])
+        .unwrap();
+        assert_eq!(repo.cell(record, PropertyId(3)).unwrap(), CellValue::Empty);
+        assert_eq!(
+            raw_count(&repo, "db_values"),
+            0,
+            "clearing deletes the row rather than blanking it"
+        );
+
+        // A text cell with a space in it is content; a very long one is stored
+        // whole (the column is TEXT, and no cap here means no silent cut).
+        assert_eq!(
+            columns[0].parse("   ").unwrap(),
+            CellValue::Text("   ".into())
+        );
+        let long = "長".repeat(50_000);
+        let value = columns[0].parse(&long).unwrap();
+        repo.apply(&[Change::CellSet {
+            record,
+            property: PropertyId(2),
+            value,
+        }])
+        .unwrap();
+        assert_eq!(
+            repo.cell(record, PropertyId(2)).unwrap(),
+            CellValue::Text(long.clone()),
+            "a 50 000-character cell round trips unchanged"
+        );
+
+        // The three string kinds store what was typed even when it is not what
+        // it claims to be: a link the user typed is theirs (ADR-0069), and the
+        // hint is a hint.
+        for (property, typed) in [
+            (5u64, "not a url"),
+            (5, "HTTP://EXAMPLE.COM"),
+            (6, "a@b"),
+            (6, "nope"),
+            (7, "1234"),
+            (7, "call me maybe"),
+        ] {
+            let value = columns[(property - 2) as usize].parse(typed).unwrap();
+            assert_eq!(value, CellValue::Text(typed.into()));
+            repo.apply(&[Change::CellSet {
+                record,
+                property: PropertyId(property),
+                value,
+            }])
+            .unwrap();
+            assert_eq!(
+                repo.cell(record, PropertyId(property)).unwrap(),
+                CellValue::Text(typed.into()),
+                "{typed:?} was rewritten or refused"
+            );
+        }
+        use crate::core::database_property::looks_valid;
+        assert!(!looks_valid(PropertyKind::Url, "not a url"));
+        assert!(looks_valid(PropertyKind::Url, "https://example.com"));
+        assert!(!looks_valid(PropertyKind::Email, "a@b"));
+        assert!(!looks_valid(PropertyKind::Phone, "call me maybe"));
+
+        // A date's *shape* is the gate (the sort depends on it) and its
+        // calendar is not: the padded form is stored, a leap-shaped one is
+        // stored, an unpadded one is refused.
+        for (input, stored) in [
+            ("2026-09-22", "2026-09-22"),
+            ("2026-02-30", "2026-02-30"),
+            ("2026-09-22T00:00", "2026-09-22T00:00"),
+        ] {
+            assert_eq!(columns[2].parse(input).unwrap(), CellValue::Text(stored.into()));
+        }
+        for bad in ["2026-9-2", "22/09/2026", "2026-09-22 14:03", "today"] {
+            assert!(columns[2].parse(bad).is_err(), "{bad} was stored as a date");
+        }
+
+        // A list keeps duplicates and its order: it is what the user picked,
+        // and `db_value_items`' key is (record, property, ord) — not the value,
+        // so picking one option twice is two rows and reads back as two.
+        let value = columns[6]
+            .parse_many(&["Done".to_string(), "Done".to_string()])
+            .unwrap();
+        assert_eq!(value, CellValue::Items(vec!["7".into(), "7".into()]));
+        repo.apply(&[Change::CellSet {
+            record,
+            property: PropertyId(8),
+            value: value.clone(),
+        }])
+        .unwrap();
+        assert_eq!(repo.cell(record, PropertyId(8)).unwrap(), value);
+    }
+
+    /// §三十九's easiest silent mistake, told apart in one test: the same two
+    /// characters (`2`, `10`) in a number column and in a text column. SQLite
+    /// orders the number column by `REAL` and the text column by bytes, and the
+    /// two answers are the two orders.
+    #[test]
+    fn a_number_sorts_as_a_number_and_a_text_column_sorts_as_bytes() {
+        let repo = store();
+        let number = property(2, PropertyKind::Number, 1);
+        let text = property(3, PropertyKind::Text, 2);
+        let columns = vec![number.clone(), text.clone()];
+        let db = seed(&repo, &columns);
+        write_rows(
+            &repo,
+            &[
+                vec![
+                    (2, CellValue::Number(2.0)),
+                    (3, CellValue::Text("2".into())),
+                ],
+                vec![
+                    (2, CellValue::Number(10.0)),
+                    (3, CellValue::Text("10".into())),
+                ],
+                vec![
+                    (2, CellValue::Number(-1.0)),
+                    (3, CellValue::Text("-1".into())),
+                ],
+                vec![(3, CellValue::Text("".into()))],
+            ],
+        );
+        let whole = RowWindow { start: 0, end: 10 };
+
+        assert_eq!(
+            column_read(&repo, &columns, None, whole),
+            vec!["2", "10", "-1", ""],
+            "with no sort the order is the database's own listing"
+        );
+        // A number column: -1, 2, 10 — the blank last, because "sort by number"
+        // does not mean "float the rows with no number to the top" (ADR-0062).
+        assert_eq!(
+            column_read(&repo, &columns, SortSpec::of(&number, false), whole),
+            vec!["-1", "2", "10", ""],
+        );
+        assert_eq!(
+            column_read(&repo, &columns, SortSpec::of(&number, true), whole),
+            vec!["10", "2", "-1", ""],
+            "and a descending sort leaves the blanks at the bottom too"
+        );
+        // The same characters as text: 10 before 2, because bytes are not
+        // numbers — which is exactly what ADR-0062's typed column exists to
+        // avoid, shown rather than asserted.
+        assert_eq!(
+            column_read(&repo, &columns, SortSpec::of(&text, false), whole),
+            vec!["-1", "10", "2", ""],
+        );
+
+        // The order really is the statement's: nothing in this crate sorts a
+        // `Vec` of rows, and the SQL says which column it compares.
+        let mut req = RowRequest::new(db.id, PropertyId(1), &columns);
+        req.sort = SortSpec::of(&number, false);
+        let query = row_query(&req, Some(whole));
+        assert!(
+            query.contains("ORDER BY (v0.num IS NULL) ASC, v0.num ASC, r.ord, r.id"),
+            "{query}"
+        );
+        assert!(
+            !query.contains("CAST"),
+            "a number is never cast text: {query}"
+        );
+        req.sort = SortSpec::of(&text, true);
+        let query = row_query(&req, Some(whole));
+        assert!(
+            query.contains("ORDER BY (v1.text IS NULL OR v1.text = '') ASC, v1.text DESC, r.ord, r.id"),
+            "{query}"
+        );
+    }
+
+    /// A date's order is time's order *because* the stored shape is fixed
+    /// width — so this test writes the shape that breaks it and watches the
+    /// order break, which is what makes the parse rule load-bearing rather than
+    /// pedantic (ADR-0062/ADR-0069).
+    #[test]
+    fn a_date_sorts_as_a_time_because_the_stored_shape_is_fixed_width() {
+        let repo = store();
+        // `datetime`, so the painted cell is the whole stored text: a day-shaped
+        // column would print ten bytes of both `2026-09-02` values and the
+        // assertion could not tell the two rows apart (ADR-0069's formats).
+        let date = with_config(2, PropertyKind::Date, r#"{"format":"datetime"}"#, 1);
+        let columns = vec![date.clone()];
+        let _db = seed(&repo, &columns);
+        write_rows(
+            &repo,
+            &[
+                vec![(2, CellValue::Text("2026-09-10".into()))],
+                vec![(2, CellValue::Text("2026-09-02".into()))],
+                vec![(2, CellValue::Text("2026-09-02T23:59".into()))],
+                vec![(2, CellValue::Text("2026-09-03T00:00".into()))],
+                vec![],
+            ],
+        );
+        let whole = RowWindow { start: 0, end: 10 };
+        assert_eq!(
+            column_read(&repo, &columns, SortSpec::of(&date, false), whole),
+            vec!["2026-09-02", "2026-09-02T23:59", "2026-09-03T00:00", "2026-09-10", ""],
+            "a string order over the stored bytes is the chronological order"
+        );
+        assert_eq!(
+            column_read(&repo, &columns, SortSpec::of(&date, true), whole),
+            vec!["2026-09-10", "2026-09-03T00:00", "2026-09-02T23:59", "2026-09-02", ""],
+        );
+
+        // Now the shape the parser refuses, written past it (a build that had
+        // no parser, a hand-edited file): `2026-9-2` sorts *after* everything,
+        // because "2026-9" is past "2026-1". The rule that refuses it on the
+        // way in is the rule that keeps the order right.
+        {
+            let conn = repo.database().conn();
+            conn.execute(
+                "UPDATE db_values SET text = '2026-9-2' WHERE record = 1001",
+                [],
+            )
+            .unwrap();
+        }
+        let sorted = column_read(&repo, &columns, SortSpec::of(&date, false), whole);
+        assert_eq!(
+            sorted[0], "2026-09-02T23:59",
+            "the earliest value left, now that the plain date became an unpadded one"
+        );
+        assert_eq!(
+            sorted[3], "2026-9-2",
+            "an unpadded date is not a date: {sorted:?}"
+        );
+        assert!(
+            crate::core::database_property::iso_date("2026-9-2").is_none(),
+            "and the input path refuses to store one"
+        );
+
+        // A window is a slice of the *order*, not a slice that is then sorted:
+        // rows 1..3 of the sorted read are rows 1..3 of that order.
+        let all = column_read(&repo, &columns, SortSpec::of(&date, false), whole);
+        let middle = column_read(
+            &repo,
+            &columns,
+            SortSpec::of(&date, false),
+            RowWindow { start: 1, end: 3 },
+        );
+        assert_eq!(middle, all[1..3].to_vec());
+    }
+
+    /// Sorting by a column the view does not show: one extra join, and the
+    /// order is still SQL's (ADR-0064 lets a view document sort by any column).
+    #[test]
+    fn a_sort_by_a_hidden_column_joins_it_and_orders_in_sql() {
+        let repo = store();
+        let visible = property(2, PropertyKind::Text, 1);
+        let hidden = property(3, PropertyKind::Number, 2);
+        let columns = vec![visible.clone()];
+        let db = seed(&repo, &[visible, hidden.clone()]);
+        write_rows(
+            &repo,
+            &[
+                vec![
+                    (2, CellValue::Text("second".into())),
+                    (3, CellValue::Number(10.0)),
+                ],
+                vec![
+                    (2, CellValue::Text("first".into())),
+                    (3, CellValue::Number(2.0)),
+                ],
+            ],
+        );
+        let mut req = RowRequest::new(db.id, PropertyId(1), &columns);
+        req.sort = SortSpec::of(&hidden, false);
+        let query = row_query(&req, Some(RowWindow { start: 0, end: 10 }));
+        assert!(query.contains("LEFT JOIN db_values s0 "), "{query}");
+        assert!(
+            query.contains("ORDER BY (s0.num IS NULL) ASC, s0.num ASC, r.ord, r.id"),
+            "{query}"
+        );
+        let rows = repo
+            .window_rows(&req, RowWindow { start: 0, end: 10 })
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.cells[0].clone()).collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "the visible column follows the hidden one's order"
+        );
+
+        // The plan, which is the evidence the order is the statement's: the
+        // join is an index probe on `db_values`' primary key, and the order is
+        // a temp B-tree SQLite builds (no index could serve a LEFT JOIN's
+        // order for every row). Printed by the probe as well; here it is
+        // asserted, because "the sort happens in SQL" is a red line.
+        let plan = explain(&repo, &req, RowWindow { start: 0, end: 10 });
+        assert!(
+            plan.iter().any(|line| line.contains("TEMP B-TREE")),
+            "the plan does not show SQL sorting: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|line| !line.contains("SCAN db_values")),
+            "the join is a probe, not a scan: {plan:?}"
+        );
+    }
+
+    /// One row read's plan, as SQLite explains it — the same call the probe
+    /// prints, so a failing assertion carries the plan it is about.
+    fn explain(repo: &SqliteRepository, req: &RowRequest<'_>, window: RowWindow) -> Vec<String> {
+        let conn = repo.database().conn();
+        let query = row_query(req, Some(window));
+        let binds = row_binds(req, Some(window));
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    /// ADR-0068's whole point, in one test: the two time columns are the
+    /// record's own, nothing a caller writes can move `created`, and only a
+    /// *content* change moves `edited`.
+    #[test]
+    fn a_derived_column_is_the_records_own_and_never_a_value_row() {
+        let repo = store();
+        let created = property(2, PropertyKind::CreatedTime, 1);
+        let edited = property(3, PropertyKind::LastEditedTime, 2);
+        let number = property(4, PropertyKind::Number, 3);
+        seed(&repo, &[created.clone(), edited.clone(), number.clone()]);
+        let record = write_rows(&repo, &[vec![(4, CellValue::Number(1.0))]])[0];
+
+        // Stamped by the insert, in the stored date shape, and the same instant
+        // for both because one statement wrote them.
+        let stamps = repo.record_timestamps(record).unwrap().unwrap();
+        assert_eq!(stamps.created.len(), 16, "{}", stamps.created);
+        assert_eq!(stamps.created, stamps.edited);
+        assert!(crate::core::database_property::iso_date(&stamps.created).is_some());
+
+        // Set the pair back, so "moved" and "did not move" are both visible in
+        // a test that runs in well under a minute.
+        let age = |column: &str| {
+            let conn = repo.database().conn();
+            conn.execute(
+                &format!("UPDATE db_records SET {column} = '2020-01-01T00:00'"),
+                [],
+            )
+            .unwrap();
+        };
+        let stamps_now = || repo.record_timestamps(record).unwrap().unwrap();
+        age("created");
+        age("edited");
+
+        // A cell write is content: it moves `edited` and leaves `created`.
+        repo.apply(&[Change::CellSet {
+            record,
+            property: PropertyId(4),
+            value: CellValue::Number(2.0),
+        }])
+        .unwrap();
+        assert_eq!(stamps_now().created, "2020-01-01T00:00", "a birthday is a birthday");
+        assert_ne!(stamps_now().edited, "2020-01-01T00:00", "editing a cell moved it");
+
+        // Frame, not content: moving a row in the listing and pointing it at a
+        // page both leave the stamp alone — dragging a row is not editing it.
+        age("edited");
+        let page = page(50, "Row");
+        repo.apply(&[
+            Change::PageCreated(page.clone()),
+            Change::RecordOrdSet {
+                id: record,
+                ord: OrderKey(9 << 32),
+            },
+            Change::RecordPageSet {
+                id: record,
+                page: Some(page.id),
+            },
+        ])
+        .unwrap();
+        assert_eq!(stamps_now().edited, "2020-01-01T00:00");
+
+        // The record's title now lives in `pages.title` (ADR-0063), and a
+        // rename comes in through another module: `repository::apply_one` calls
+        // back into this one so the stamp still moves.
+        repo.apply(&[Change::PageTitleSet {
+            id: page.id,
+            title: "Renamed".into(),
+        }])
+        .unwrap();
+        assert_ne!(
+            stamps_now().edited,
+            "2020-01-01T00:00",
+            "the title is this record's content too"
+        );
+        assert_eq!(stamps_now().created, "2020-01-01T00:00");
+
+        // And the read never consults `db_values` for a derived kind: a rogue
+        // writer's row sits there and changes nothing (ADR-0039's discipline,
+        // made structural rather than promised).
+        age("created");
+        age("edited");
+        repo.apply(&[Change::CellSet {
+            record,
+            property: PropertyId(2),
+            value: CellValue::Text("1999-12-31T23:59".into()),
+        }])
+        .unwrap();
+        assert_eq!(raw_count(&repo, "db_values"), 2, "the row was written anyway");
+        assert_eq!(
+            repo.cell(record, PropertyId(2)).unwrap(),
+            CellValue::Text("2020-01-01T00:00".into()),
+            "the cell still reads the record"
+        );
+        let columns = vec![created, edited, number];
+        let mut req = RowRequest::new(DatabaseId(1), PropertyId(1), &columns);
+        req.sort = Some(SortSpec::of(&columns[1], true).unwrap());
+        let rows = repo
+            .window_rows(&req, RowWindow { start: 0, end: 1 })
+            .unwrap();
+        assert_ne!(
+            rows[0].cells[0], "1999-12-31T23:59",
+            "and the window's painted cell does not either"
+        );
+        assert_eq!(
+            rows[0].cells[0],
+            crate::core::database_property::paint(
+                PropertyKind::CreatedTime,
+                "",
+                &CellValue::Text("2020-01-01T00:00".into()),
+                &()
+            )
+        );
+
+        // A row from before step 17 (or a hand-made one) has no stamp, and that
+        // paints as an empty cell rather than as 1970.
+        {
+            let conn = repo.database().conn();
+            conn.execute("UPDATE db_records SET created = ''", []).unwrap();
+        }
+        assert_eq!(repo.cell(record, PropertyId(2)).unwrap(), CellValue::Empty);
+        // A derived kind refuses every write, clear included (ADR-0068).
+        assert!(columns[0].parse("2026-09-22").is_err());
+        assert!(columns[0].parse("").is_err());
+    }
+
+    /// A `files` cell stores attachment ids (ADR-0062's `db_value_items`) and
+    /// paints the names from ADR-0029/ADR-0030's one attachment channel — with
+    /// the id itself when the row is gone, because a file whose bytes were
+    /// deleted is not an empty cell.
+    #[test]
+    fn a_files_cell_paints_the_attachment_names_and_an_id_with_no_row_paints_itself() {
+        let repo = store();
+        let files = property(2, PropertyKind::Files, 1);
+        let columns = vec![files.clone()];
+        let db = seed(&repo, &columns);
+        repo.apply(&[Change::AttachmentAdded(Attachment {
+            id: AttachmentId(12),
+            name: "report.pdf".into(),
+            file: "a1b2.pdf".into(),
+            thumb: String::new(),
+            mime: "application/pdf".into(),
+            bytes: 4_096,
+            width: 0,
+            height: 0,
+        })])
+        .unwrap();
+        let record = write_rows(&repo, &[vec![]])[0];
+        repo.apply(&[Change::CellSet {
+            record,
+            property: PropertyId(2),
+            value: files.parse_many(&["12".to_string()]).unwrap(),
+        }])
+        .unwrap();
+
+        let req = RowRequest::new(db.id, PropertyId(1), &columns);
+        let painted = || {
+            repo.window_rows(&req, RowWindow { start: 0, end: 1 }).unwrap()[0].cells[0].clone()
+        };
+        assert_eq!(painted(), "report.pdf", "the name, not the id");
+        assert_eq!(
+            repo.cell(record, PropertyId(2)).unwrap(),
+            CellValue::Items(vec!["12".into()]),
+            "the cell itself is the id"
+        );
+
+        // The attachment row goes and the bytes with it (ADR-0030's delete):
+        // no foreign key reaches inside `db_value_items`, so the id stays and
+        // paints itself — visible, rather than silently blank.
+        repo.apply(&[Change::AttachmentDeleted {
+            id: AttachmentId(12),
+        }])
+        .unwrap();
+        assert_eq!(painted(), "12");
+        assert_eq!(raw_count(&repo, "attachments"), 0);
+    }
+
+    /// ADR-0061's rule that makes renaming an option cheap: a value stores an
+    /// option's **id**, so an edit of the option list touches no cell. The
+    /// list-writing change arm arrives with the option editor (D3/D4); the
+    /// *rule* is what this pins, with the document edited where it lives.
+    #[test]
+    fn an_option_rename_is_one_document_edit_that_touches_no_value() {
+        let repo = store();
+        let select = with_config(2, PropertyKind::Select, OPTIONS, 1);
+        let columns = vec![select.clone()];
+        let db = seed(&repo, &columns);
+        let record = write_rows(&repo, &[vec![(2, CellValue::Text("7".into()))]])[0];
+        let req = RowRequest::new(db.id, PropertyId(1), &columns);
+        let painted = || {
+            repo.window_rows(&req, RowWindow { start: 0, end: 1 }).unwrap()[0].cells[0].clone()
+        };
+        assert_eq!(painted(), "Done");
+
+        let mut options = select.options();
+        assert!(options.rename(OptionId(7), "Finished"));
+        let renamed = options.to_config();
+        {
+            let conn = repo.database().conn();
+            conn.execute(
+                "UPDATE db_properties SET config = ?1 WHERE id = 2",
+                rusqlite::params![renamed],
+            )
+            .unwrap();
+        }
+        let catalog = repo.load_databases().unwrap();
+        let column_now = catalog
+            .properties_of(DatabaseId(1))
+            .find(|p| p.id == PropertyId(2))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            column_now.options().get(OptionId(7)).unwrap().name,
+            "Finished"
+        );
+        let req = RowRequest::new(db.id, PropertyId(1), std::slice::from_ref(&column_now));
+        let rows = repo
+            .window_rows(&req, RowWindow { start: 0, end: 1 })
+            .unwrap();
+        assert_eq!(rows[0].cells[0], "Finished", "the new name paints");
+        assert_eq!(
+            repo.cell(record, PropertyId(2)).unwrap(),
+            CellValue::Text("7".into()),
+            "and the value is byte for byte what it was"
+        );
+        // An id the list does not have paints itself; so does a column whose
+        // document does not parse at all.
+        let mut without = column_now.clone();
+        without.config = r#"{"options":[{"id":2,"name":"Doing"}]}"#.into();
+        let req = RowRequest::new(db.id, PropertyId(1), std::slice::from_ref(&without));
+        assert_eq!(
+            repo.window_rows(&req, RowWindow { start: 0, end: 1 }).unwrap()[0].cells[0],
+            "7"
+        );
+        without.config = "not json".into();
+        let req = RowRequest::new(db.id, PropertyId(1), std::slice::from_ref(&without));
+        assert_eq!(
+            repo.window_rows(&req, RowWindow { start: 0, end: 1 }).unwrap()[0].cells[0],
+            "7"
+        );
+    }
+
+    /// SPEC §三十九's `person` 降级 (ADR-0071): a name in a text cell, and a
+    /// member list that is the values themselves — no table, no accounts, no
+    /// ids to reconcile. Written the way a build that knows `person` would have
+    /// left the file, because **this** build folds the kind to text at load
+    /// (ADR-0061) and so cannot create one.
+    #[test]
+    fn a_person_column_is_a_name_and_the_member_list_is_derived_from_the_values() {
+        let repo = store();
+        // `seed` writes the title column itself, so the person column is the
+        // only extra one.
+        seed(&repo, &[]);
+        {
+            let conn = repo.database().conn();
+            conn.execute(
+                "INSERT INTO db_properties (id, db, name, kind, config, ord)
+                 VALUES (2, 1, 'Owner', 'person', '', 4352)",
+                [],
+            )
+            .unwrap();
+        }
+        write_rows(
+            &repo,
+            &[
+                vec![(2, CellValue::Text("Ada".into()))],
+                vec![(2, CellValue::Text("Bob".into()))],
+                vec![(2, CellValue::Text("Ada".into()))],
+                vec![],
+            ],
+        );
+
+        // The kind folds at load — this build has no account model and no
+        // person-specific behaviour to hang on a variant — and the cell is a
+        // plain string.
+        let catalog = repo.load_databases().unwrap();
+        let owner = catalog
+            .properties_of(DatabaseId(1))
+            .find(|p| p.id == PropertyId(2))
+            .unwrap();
+        assert_eq!(owner.kind, PropertyKind::Text);
+        assert_eq!(
+            repo.cell(RecordId(1_000), PropertyId(2)).unwrap(),
+            CellValue::Text("Ada".into())
+        );
+
+        // The list a picker offers is the distinct names in the file, in a
+        // stable order, with no second copy anywhere to go stale.
+        assert_eq!(
+            repo.workspace_people().unwrap(),
+            vec!["Ada".to_string(), "Bob".to_string()]
+        );
+        // And no member table exists: the names *are* the list.
+        {
+            let conn = repo.database().conn();
+            let tables: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                tables.iter().all(|t| !t.contains("person") && !t.contains("member")),
+                "{tables:?}"
+            );
+        }
+        // Renaming a person is editing a string — nothing else to reconcile,
+        // which is the whole argument for the degradation.
+        repo.apply(&[Change::CellSet {
+            record: RecordId(1_000),
+            property: PropertyId(2),
+            value: CellValue::Text("Ada Lovelace".into()),
+        }])
+        .unwrap();
+        assert_eq!(
+            repo.workspace_people().unwrap(),
+            vec!["Ada".to_string(), "Ada Lovelace".to_string(), "Bob".to_string()],
+            "a new name is a new row in the list, not a rename of a member \
+             (and \"Ada\" sorts before \"Ada Lovelace\", being its prefix)"
+        );
+    }
+
+    /// The bulk path (`replace_all`: a checkpoint, a repair, a LAN pull) deletes
+    /// the document and puts it back, and it cascades through `db_records.page`.
+    /// A record that survives it keeps the birthday it had — the moment the
+    /// file was rewritten is not when the row was made (ADR-0066's rule, applied
+    /// to ADR-0068's columns).
+    #[test]
+    fn a_bulk_replace_keeps_the_birthday_of_a_record_it_keeps() {
+        let repo = store();
+        seed(&repo, &[property(2, PropertyKind::Number, 1)]);
+        let record = write_rows(&repo, &[vec![(2, CellValue::Number(1.0))]])[0];
+        {
+            let conn = repo.database().conn();
+            conn.execute(
+                "UPDATE db_records SET created = '2020-01-01T00:00', edited = '2020-01-01T00:00'",
+                [],
+            )
+            .unwrap();
+        }
+        // Every borrow of the connection is scoped: the repository's mutex is
+        // not reentrant, so a guard held across a `repo.*` call would deadlock
+        // this test rather than fail it.
+        let snapshot = {
+            let conn = repo.database().conn();
+            snapshot_tables(&conn).unwrap()
+        };
+        // What `replace_all` does to the layer: `DELETE FROM pages` cascades
+        // through `db_records.page`, and here the tables are emptied outright.
+        {
+            let conn = repo.database().conn();
+            conn.execute("DELETE FROM db_records", []).unwrap();
+        }
+        assert!(repo.record_timestamps(record).unwrap().is_none());
+
+        {
+            let conn = repo.database().conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            restore_tables(&tx, &snapshot, &BTreeSet::new()).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let stamps = repo.record_timestamps(record).unwrap().unwrap();
+        assert_eq!(stamps.created, "2020-01-01T00:00");
+        assert_eq!(stamps.edited, "2020-01-01T00:00");
+        assert_eq!(
+            repo.cell(record, PropertyId(2)).unwrap(),
+            CellValue::Number(1.0),
+            "and the cells came back with it"
+        );
+    }
 }
 
 // ─── the measurement ────────────────────────────────────────────────────────
@@ -1964,11 +3324,7 @@ mod probe {
         let insert_ms = started.elapsed().as_secs_f64() * 1e3;
         let after = counters::process_bytes();
 
-        let req = RowRequest {
-            db: db.id,
-            title: title.id,
-            columns: &columns,
-        };
+        let req = RowRequest::new(db.id, title.id, &columns);
         let total = repo.record_count(db.id).unwrap();
         assert_eq!(total, ROWS, "every row the insert wrote is in the count");
         let geometry = ViewGeometry::new(32.0, 720.0);
@@ -2183,6 +3539,270 @@ mod probe {
             keyset_us,
             all.len(),
             all_bytes as f64 / window_bytes.max(1) as f64,
+        );
+    }
+
+    /// D2's number: what a **sorted** window costs on the SQL side, against the
+    /// arm §三十九 forbids a view from taking — every row, sorted in Rust.
+    ///
+    /// The same 10 000 rows as D1's probe, with one number column whose values
+    /// are scattered (`(i * 7919) mod 10007` is a permutation over pairs), so
+    /// neither the insertion order nor the value order is the answer. Both
+    /// orders are checked against each other before anything is timed: a fast
+    /// wrong order would be worse than a slow right one.
+    #[test]
+    #[ignore = "prints a measurement; run with --release --lib -- --ignored --nocapture"]
+    fn a_sorted_window_costs_its_window_and_sorting_in_memory_costs_the_table() {
+        let dir = crate::testing::ScratchDir::new("db-sorted-window");
+        let path = dir.join("quire.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+
+        let db = Database::new(DatabaseId(1), "Tasks");
+        let title = db.title_property(PropertyId(1));
+        let number = property(2, PropertyKind::Number, 1);
+        let date = property(3, PropertyKind::Date, 2);
+        let columns = vec![number.clone(), date.clone()];
+        let mut schema = vec![
+            Change::DatabaseCreated(db.clone()),
+            Change::PropertyAdded(title.clone()),
+            Change::ViewAdded(db.first_view(ViewId(1))),
+        ];
+        schema.extend(columns.iter().cloned().map(Change::PropertyAdded));
+        repo.apply(&schema).unwrap();
+
+        let started = Instant::now();
+        for batch in 0..(ROWS / BATCH) {
+            let mut changes = Vec::with_capacity(BATCH * 3);
+            for i in 0..BATCH {
+                let index = batch * BATCH + i;
+                let record = RecordId(index as u64 + 1);
+                changes.push(Change::RecordCreated(Record::bare(
+                    record,
+                    db.id,
+                    OrderKey(((index as u64) + 1) << 32),
+                )));
+                changes.push(Change::CellSet {
+                    record,
+                    property: PropertyId(2),
+                    value: CellValue::Number(((index * 7919) % 10_007) as f64),
+                });
+                changes.push(Change::CellSet {
+                    record,
+                    property: PropertyId(3),
+                    value: CellValue::Text(format!(
+                        "2026-{:02}-{:02}T{:02}:{:02}",
+                        1 + (index / 28) % 12,
+                        1 + index % 28,
+                        index % 24,
+                        index % 60
+                    )),
+                });
+            }
+            repo.apply(&changes).unwrap();
+        }
+        let insert_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(repo.record_count(db.id).unwrap(), ROWS);
+
+        let sort = SortSpec::of(&number, false).unwrap();
+        let sorted = RowRequest {
+            db: db.id,
+            title: title.id,
+            columns: &columns,
+            sort: Some(sort),
+        };
+        let plain = RowRequest {
+            sort: None,
+            ..sorted
+        };
+        let geometry = ViewGeometry::new(32.0, 720.0);
+        let top = crate::core::database::window(ROWS, geometry, 0.0);
+        let bottom = crate::core::database::window(
+            ROWS,
+            geometry,
+            crate::core::database::max_scroll_y(ROWS, geometry),
+        );
+
+        // Warm the page cache and the statement machinery.
+        assert_eq!(repo.window_rows(&sorted, RowWindow { start: 0, end: 1 }).unwrap().len(), 1);
+
+        let timed = |what: &str| {
+            let started = Instant::now();
+            let rows = match what {
+                "sorted" => repo.window_rows(&sorted, top),
+                "sorted-bottom" => repo.window_rows(&sorted, bottom),
+                "sorted-all" => repo.window_rows(&sorted, RowWindow { start: 0, end: ROWS }),
+                _ => repo.window_rows(&plain, bottom),
+            }
+            .unwrap();
+            (started.elapsed().as_secs_f64() * 1e6, rows)
+        };
+
+        // The SQL side, four readings: the window a view actually asks for at
+        // the top and at the bottom, the same sort without a window (what the
+        // order itself costs), and D1's unsorted bottom window for a
+        // same-session comparison — the sort's price is the difference.
+        let (top_us, top_rows) = timed("sorted");
+        let (bottom_us, bottom_rows) = timed("sorted-bottom");
+        let (all_sorted_us, all_sorted) = timed("sorted-all");
+        let (bottom_plain_us, _) = timed("plain-bottom");
+        assert_eq!(top_rows.len(), top.len());
+        assert_eq!(bottom_rows.len(), bottom.len());
+        assert_eq!(all_sorted.len(), ROWS);
+
+        // The control arm: every row, then a numeric sort in Rust — which is
+        // what "filter and sort in the UI" would mean, and what §三十九's red
+        // line is about.
+        let _ = repo.unwindowed_rows(&plain).unwrap();
+        let started = Instant::now();
+        let (all_rows, all_bytes) = measure(|| repo.unwindowed_rows(&plain).unwrap());
+        let all_rows_ms = started.elapsed().as_secs_f64() * 1e3;
+        let started = Instant::now();
+        let mut values: Vec<f64> = all_rows
+            .iter()
+            .map(|row| row.cells[0].parse::<f64>().unwrap_or(f64::NAN))
+            .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let rust_sort_us = started.elapsed().as_secs_f64() * 1e6;
+        let (window_rows, window_bytes) = measure(|| repo.window_rows(&sorted, top).unwrap());
+        assert_eq!(window_rows.len(), top.len());
+
+        // Both arms agree on the first window, so the fast one is not fast
+        // because it is wrong.
+        let sql_first: Vec<f64> = top_rows
+            .iter()
+            .map(|row| row.cells[0].parse::<f64>().unwrap_or(f64::NAN))
+            .collect();
+        assert_eq!(sql_first, values[..top.len()].to_vec());
+
+        // And the date column, ordered the way the stored shape promises.
+        let by_date = RowRequest {
+            db: db.id,
+            title: title.id,
+            columns: &columns,
+            sort: Some(SortSpec::of(&date, true).unwrap()),
+        };
+        let started = Instant::now();
+        let date_rows = repo.window_rows(&by_date, top).unwrap();
+        let date_top_us = started.elapsed().as_secs_f64() * 1e6;
+        let date_first: Vec<String> = date_rows.iter().map(|r| r.cells[1].clone()).collect();
+        assert!(date_first.windows(2).all(|w| w[0] >= w[1]), "descending: {date_first:?}");
+
+        // What one cell write costs *now* that ADR-0068 moves `edited` with it:
+        // 300 single-cell transactions, so D6's "cost of editing one cell" has
+        // its first reading and the bump's price is inside it.
+        let started = Instant::now();
+        for i in 0..300u64 {
+            repo.apply(&[Change::CellSet {
+                record: RecordId(i % 100 + 1),
+                property: PropertyId(2),
+                value: CellValue::Number(i as f64),
+            }])
+            .unwrap();
+        }
+        let cell_write_us = started.elapsed().as_secs_f64() * 1e6 / 300.0;
+
+        // The same writes with the commit taken out of them: one transaction
+        // around all 10 000, so the per-statement cost (the `db_values` upsert
+        // *and* ADR-0068's `edited` bump) is separable from what one transaction
+        // costs on this machine. The difference between the two readings is the
+        // fsync; the statement pair is what D6's one-cell number is about.
+        let started = Instant::now();
+        {
+            let conn = repo.database().conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..ROWS as u64 {
+                set_cell(
+                    &tx,
+                    RecordId(i % 1_000 + 1),
+                    PropertyId(2),
+                    &CellValue::Number(i as f64),
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let batched_cell_us = started.elapsed().as_secs_f64() * 1e6 / ROWS as f64;
+
+        // The evidence: the statement, its binds, and the plan SQLite chose.
+        let (query, binds, plan) = {
+            let conn = repo.database().conn();
+            let query = row_query(&sorted, Some(top));
+            let binds = row_binds(&sorted, Some(top));
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map(params_from_iter(binds.iter().copied()), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            (query, binds, plan)
+        };
+
+        let rows_mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let control_ms = all_rows_ms + rust_sort_us / 1000.0;
+        println!("database sort probe: {ROWS} records, one number column and one date column");
+        println!(
+            "  insert: {ROWS} records + {} cells in {BATCH}-change batches: {insert_ms:.1} ms",
+            ROWS * 3
+        );
+        println!(
+            "  sql, number ascending: top window {} rows in {top_us:.1} us (LIMIT {} OFFSET {})",
+            top_rows.len(),
+            top.len(),
+            top.start
+        );
+        println!(
+            "  sql, number ascending: bottom window {} rows in {bottom_us:.1} us                          (LIMIT {} OFFSET {})",
+            bottom_rows.len(),
+            bottom.len(),
+            bottom.start
+        );
+        println!(
+            "  sql, the same sort with no window: all {ROWS} rows in {:.1} ms — the order              itself, without the slice",
+            all_sorted_us / 1000.0
+        );
+        println!(
+            "  sql, the same bottom window with no sort: {bottom_plain_us:.1} us                           (so the sort adds {:.1} ms to a scroll)",
+            (bottom_us - bottom_plain_us) / 1000.0
+        );
+        println!(
+            "  sql, date descending: top window in {date_top_us:.1} us"
+        );
+        println!(
+            "  control (fetch everything, sort in Rust): {:.1} ms all rows + {:.3} ms sort              = {control_ms:.1} ms, {all_bytes} B ({:.2} MB) held",
+            all_rows_ms,
+            rust_sort_us / 1000.0,
+            rows_mb(all_bytes)
+        );
+        println!(
+            "  the window against the control: {:.0}x in time, {:.0}x in bytes",
+            control_ms * 1000.0 / top_us.max(1.0),
+            all_bytes as f64 / window_bytes.max(1) as f64
+        );
+        println!("  one cell write: {cell_write_us:.1} us with its own transaction, {batched_cell_us:.1} us batched");
+        println!("  query: {query}");
+        println!("  binds (?1 = title, then the columns, the database, the window): {binds:?}");
+        println!("  plan:");
+        for line in &plan {
+            println!("    {line}");
+        }
+        println!(
+            "{{\"label\":\"track3-d2-sort\",\"date\":\"2026-09-22\",\
+             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"records\":{ROWS},\"insert_ms\":{insert_ms:.1},\"sorted_top_rows\":{},\
+             \"sorted_top_us\":{top_us:.1},\"sorted_bottom_rows\":{},\"sorted_bottom_us\":{bottom_us:.1},\
+             \"sorted_all_rows\":{},\"sorted_all_ms\":{:.1},\"unsorted_bottom_us\":{bottom_plain_us:.1},\
+             \"date_top_us\":{date_top_us:.1},\"control_all_rows\":{},\"control_all_ms\":{all_rows_ms:.1},\
+             \"control_sort_us\":{rust_sort_us:.1},\"control_total_ms\":{control_ms:.1},\
+             \"heap_all_rows_bytes\":{all_bytes},\"heap_window_bytes\":{window_bytes},\
+             \"cell_write_us\":{cell_write_us:.1},\"batched_cell_us\":{batched_cell_us:.1}}}",
+            top_rows.len(),
+            bottom_rows.len(),
+            all_sorted.len(),
+            all_sorted_us / 1000.0,
+            all_rows.len(),
         );
     }
 }

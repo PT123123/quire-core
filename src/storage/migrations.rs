@@ -6,8 +6,12 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::core::StorageError;
 
-/// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 15;
+/// The schema version this build of Quire expects. Step 17 is Track 3's (the
+/// record timestamps, ADR-0068); step 16 is Track 2's, so this branch's chain
+/// reaches 17 without a 16 of its own — `ensure_current` applies every step
+/// above the file's version in array order, so a gap closes when the other
+/// branch lands and a fresh file still ends at 17.
+pub const CURRENT_VERSION: i32 = 17;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -307,7 +311,30 @@ CREATE TABLE IF NOT EXISTS db_views (
 CREATE INDEX IF NOT EXISTS idx_db_views_db ON db_views(db);
 "#,
     backfill: None,
-
+}, Migration {
+    version: 17,
+    label: "database record timestamps",
+    // ADR-0068: `created time` and `last edited time` are §三十九's two derived
+    // kinds, and they are derived from **these two columns and nothing else**.
+    // Writing them into `db_values` would be the double write ADR-0039 forbids
+    // — an instant kept in the same table as the cells whose changing it is
+    // supposed to notice — so the record's own row carries them and the
+    // projection reads them from there (a cell of either kind is never stored,
+    // and a write aimed at one is refused by name).
+    //
+    // The shape is ADR-0062's stored date: `YYYY-MM-DDTHH:MM`, local wall time,
+    // fixed width, `''` meaning "not known" (which is every row a v16 file
+    // already had — an upgrade invents no birthdays). Text rather than a Unix
+    // integer on purpose: both date-shaped kinds then sort by one rule, because
+    // fixed-width bytes are chronological bytes, and neither the reader nor the
+    // writer needs a calendar in Rust — SQLite's `strftime` is the clock
+    // (`storage::database_store`).
+    //
+    // A step of its own rather than a line added to v14: migrations are the one
+    // thing in this project that cannot be undone, and a v14 file in the wild
+    // (or in a backup) must keep meaning what it meant.
+    sql: "",
+    backfill: Some(add_record_timestamp_columns),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -337,6 +364,37 @@ fn add_page_icon_column(conn: &mut Connection) -> Result<(), StorageError> {
         conn,
         &[("icon", "ALTER TABLE pages ADD COLUMN icon TEXT NOT NULL DEFAULT ''")],
     )
+}
+
+/// Migration 17 body: the two record timestamps, each added only when it is
+/// missing (ADR-0068). Same shape as the color and attachment pairs above: a
+/// half-applied upgrade converges instead of erroring on a duplicate name, and
+/// a file the columns were added to by hand still opens.
+fn add_record_timestamp_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    const COLUMNS: [(&str, &str); 2] = [
+        (
+            "created",
+            "ALTER TABLE db_records ADD COLUMN created TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "edited",
+            "ALTER TABLE db_records ADD COLUMN edited TEXT NOT NULL DEFAULT ''",
+        ),
+    ];
+    for (name, ddl) in COLUMNS {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('db_records') WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if present == 0 {
+            conn.execute(ddl, [])
+                .map_err(|e| StorageError::Sql(format!("add db_records.{name}: {e}")))?;
+        }
+    }
+    Ok(())
 }
 
 /// Migration 10 body: the two page-appearance columns.

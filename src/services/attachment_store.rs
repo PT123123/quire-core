@@ -159,6 +159,32 @@ impl AttachmentStore {
         self.dir.join(&att.file)
     }
 
+    /// Delete an attachment's own files: the stored bytes and the downscaled
+    /// copy when there is one. Called only after the row is gone, so a failure
+    /// cannot leave a live reference pointing at nothing.
+    ///
+    /// Returns the files that were still there and refused to go — a locked or
+    /// read-only one — because an orphan with no row behind it is invisible to
+    /// every later sweep, and "one file could not be deleted" is worth saying
+    /// instead of reporting a clean removal (SPEC §三十七, ADR-0037). A file
+    /// that is already absent is not a failure: the half-orphan (bytes deleted
+    /// by hand, row still in the database) is the case this has to handle.
+    pub fn remove(&self, att: &Attachment) -> Vec<String> {
+        let mut stuck = Vec::new();
+        for name in [&att.file, &att.thumb] {
+            if name.is_empty() {
+                continue;
+            }
+            let path = self.dir.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => stuck.push(name.clone()),
+            }
+        }
+        stuck
+    }
+
     /// Store an arbitrary file (SPEC §三十七 批次 A's `file` kind). Nothing is
     /// decoded and nothing is held in memory: the bytes are streamed straight
     /// into the attachments folder, because a 2 GB attachment must not cost

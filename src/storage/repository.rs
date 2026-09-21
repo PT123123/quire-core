@@ -350,7 +350,9 @@ impl Repository for SqliteRepository {
         // `attachments` survives on purpose. The files are on disk and this
         // path cannot know which of them the incoming state still references;
         // dropping the rows would turn a live picture into a missing file.
-        // The cost is orphans, which no user action can see (SPEC §三十七).
+        // The orphans that leaves are what the settings-disk reclaim counts and
+        // deletes once a session has loaded the new state and can see the
+        // references (SPEC §三十七, ADR-0037).
         // A→B→A parent references satisfy FK rules but would spin the
         // sidebar tree forever, so the bulk path validates acyclicity.
         detect_cycle(
@@ -764,6 +766,14 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 ],
             )
             .map_err(sql)?;
+            Ok(())
+        }
+        Change::AttachmentDeleted { id } => {
+            // No `require_hit` here: the reclaim works from the in-memory book,
+            // and a row that is already gone (never flushed, or removed by an
+            // earlier sweep) is the outcome it wanted.
+            tx.execute("DELETE FROM attachments WHERE id = ?1", params![id.as_u64() as i64])
+                .map_err(sql)?;
             Ok(())
         }
         Change::BlockDeleted { id } => {

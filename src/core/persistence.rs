@@ -63,6 +63,11 @@ pub enum Change {
     /// this is recorded, so undo removes the *reference* only and never the
     /// file: an orphaned picture is recoverable, a deleted one is not.
     AttachmentAdded(Attachment),
+    /// Drop one attachment row for good (SPEC §三十七, ADR-0037). This is the
+    /// one change the *reclaim* emits and no command plan does: undo must never
+    /// reach it, or a Ctrl+Z would restore a reference to bytes that are gone.
+    /// Deleting an absent row is a no-op, like `MetaDelete`.
+    AttachmentDeleted { id: AttachmentId },
     /// Storage deletes the block and (recursively) its children; undo
     /// replays the captured subtree as `BlockInserted`s.
     BlockDeleted { id: BlockId },
@@ -75,6 +80,22 @@ pub enum Change {
     /// Storage removes the settings row — the real replacement for
     /// settings_store's empty-value tombstone (M8_FEEDBACK #1).
     SettingDelete { key: String },
+}
+
+/// Every attachment id a change list points at, read off the arm that carries
+/// it. Two callers need the same answer and must not disagree (§三十七,
+/// ADR-0037): the undo stack, whose outstanding entries can put a reference
+/// back into the document, and the reclaim, which may only delete what neither
+/// the document nor that stack still names. `BlockDeleted` is deliberately not
+/// one of them — the delete is what *drops* a reference, and its undo carries
+/// the `BlockInserted` that holds the id.
+pub fn attachment_ids_in(changes: &[Change]) -> impl Iterator<Item = AttachmentId> + '_ {
+    changes.iter().filter_map(|change| match change {
+        Change::BlockInserted(block) => block.attachment,
+        Change::BlockAttachmentSet { attachment, .. } => *attachment,
+        Change::AttachmentAdded(attachment) => Some(attachment.id),
+        _ => None,
+    })
 }
 
 /// Errors surfaced by a `Repository` implementation.

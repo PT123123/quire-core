@@ -694,6 +694,46 @@ fn attachments_round_trip_and_a_dangling_reference_still_loads() {
     assert_eq!(state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().img_percent, 100);
 }
 
+/// The reclaim's write arm: one row goes, the block that used to point at it
+/// stays (SPEC §三十七, ADR-0037). Deleting an id that is not there is a no-op,
+/// so a sweep is replayable.
+#[test]
+fn an_attachment_row_can_be_deleted_and_repeatedly() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    repo.apply(&[
+        Change::PageCreated(page(1, "One", None, 1 << 32)),
+        Change::AttachmentAdded(Attachment {
+            id: AttachmentId(4),
+            name: "gone.png".into(),
+            file: "4.png".into(),
+            thumb: String::new(),
+            mime: "image/png".into(),
+            bytes: 10,
+            width: 4,
+            height: 4,
+        }),
+        Change::BlockInserted(Block {
+            kind: BlockKind::Image,
+            attachment: Some(AttachmentId(4)),
+            ..block(10, 1, None, 100, "gone.png")
+        }),
+    ])
+    .unwrap();
+    assert_eq!(repo.load_attachments().unwrap().len(), 1);
+
+    repo.apply(&[Change::AttachmentDeleted { id: AttachmentId(4) }]).unwrap();
+    assert!(repo.load_attachments().unwrap().is_empty(), "the row is gone");
+    let state = repo.load().unwrap();
+    assert_eq!(
+        state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap().attachment,
+        Some(AttachmentId(4)),
+        "and nothing cascaded: the dangling reference is the load path's problem, not this one"
+    );
+
+    repo.apply(&[Change::AttachmentDeleted { id: AttachmentId(4) }]).unwrap();
+    repo.apply(&[Change::AttachmentDeleted { id: AttachmentId(99) }]).unwrap();
+}
+
 /// `blocks.attachment` deliberately carries no foreign key: a picture whose
 /// file row is gone must render as a missing image, not fail the library.
 #[test]
@@ -722,8 +762,9 @@ fn a_picture_whose_attachment_row_vanished_still_loads() {
         ])
         .unwrap();
     }
-    // the row disappears behind Quire's back — no Change deletes it, because
-    // undo must never throw bytes away
+    // the row disappears behind Quire's back — no command plan emits
+    // `AttachmentDeleted`, because undo must never throw bytes away; only the
+    // settings-disk reclaim does, and only for a row nothing points at
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(conn.execute("DELETE FROM attachments", []).unwrap(), 1);

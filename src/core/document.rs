@@ -72,6 +72,14 @@ impl Document {
         self.pages.get(&page).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Every block of every page, in no particular order. A page's blocks are
+    /// all in memory from load time, so this is the whole library (SPEC §三十七,
+    /// ADR-0037): what a reference scan must see, including the pages nobody has
+    /// opened this session.
+    pub fn all_blocks(&self) -> impl Iterator<Item = &Block> {
+        self.pages.values().flat_map(Vec::as_slice)
+    }
+
     pub fn block(&self, id: BlockId) -> Option<&Block> {
         self.pages.values().flat_map(Vec::as_slice).find(|b| b.id == id)
     }

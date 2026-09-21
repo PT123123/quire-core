@@ -1438,3 +1438,702 @@ fn block_colors_and_page_moves_round_trip() {
     assert_eq!(moved.color, quire::core::ColorKind::Red);
     assert!(state.blocks.iter().all(|b| b.id != BlockId(10) || b.page == PageId(2)));
 }
+
+// ─── SPEC §三十九 Database (Track 3, D1) ─────────────────────────────────────
+//
+// Four migration steps (v12–v15), the reopen that has to come back field for
+// field, and ADR-0063's record/page lifecycle. The module is nested so the
+// helpers above stay where they are; everything here is ordinary public API —
+// no test reaches inside the store.
+
+mod database_layer {
+    use super::*;
+    use quire::core::database::{
+        CellValue, Database, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId,
+        RowRequest, RowWindow, View, ViewId, ViewLayout,
+    };
+
+    /// A page fixture: the module-level `page` above takes the tree position
+    /// too, and every page these tests make is a top-level one whose only
+    /// interesting field is its title — which is exactly what ADR-0063 says a
+    /// record's title reads when the record owns the page.
+    fn page(id: u64, title: &str) -> Page {
+        super::page(id, title, None, 1 << 32)
+    }
+
+    /// A column of database 1, in the shape the store takes.
+    pub(crate) fn column(id: u64, name: &str, kind: PropertyKind, ordinal: u64) -> Property {
+        Property {
+            id: PropertyId(id),
+            db: DatabaseId(1),
+            name: name.into(),
+            kind,
+            config: String::new(),
+            ord: OrderKey(OrderKey::FIRST.0 + ordinal * 0x100),
+        }
+    }
+
+    /// Open a scratch database, migrate it to the current version, then roll the
+    /// *version number and schema* back to `version` — the only honest way to
+    /// stand in front of one step: a real older file, not a stub.
+    ///
+    /// Only the tables the steps *after* `version` add are dropped, leaf-first
+    /// (`db_value_items` references `db_records` and `db_properties`), so a v13
+    /// fixture really does hold `databases` and `db_properties` and nothing
+    /// later.
+    pub(crate) fn migrated(name: &str) -> (ScratchDir, std::path::PathBuf) {
+        let dir = ScratchDir::new(name);
+        let path = dir.join("quire.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    /// Drop what the steps after `version` add and put the version number back,
+    /// leaving a real older file behind. `pub(crate)` — and this module reached
+    /// as `crate::database_layer` — because a later step's migration test is
+    /// exactly this shape: a real older file, a version number, and the rows it
+    /// already had.
+    pub(crate) fn roll_back(path: &Path, version: i32) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let added_later: &[&str] = match version {
+            11 => &[
+                "db_views",
+                "db_value_items",
+                "db_values",
+                "db_records",
+                "db_properties",
+                "databases",
+            ],
+            12 => &[
+                "db_views",
+                "db_value_items",
+                "db_values",
+                "db_records",
+                "db_properties",
+            ],
+            13 => &["db_views", "db_value_items", "db_values", "db_records"],
+            14 => &["db_views"],
+            // Step 15 added `db_views`, step 16 added nothing but two indexes
+            // — so a v15 fixture keeps every table and drops only the indexes
+            // below.
+            15 => &[],
+            other => panic!("no rollback fixture for v{other}"),
+        };
+        for table in added_later {
+            conn.execute(&format!("DROP TABLE IF EXISTS {table}"), [])
+                .unwrap();
+        }
+        // Step 16 is an index-only step, so standing in front of it means the
+        // indexes are gone, not the tables. (`DROP TABLE IF EXISTS <index>` is
+        // a silent no-op in SQLite, which is exactly the trap this spells out.)
+        if version < 16 {
+            for index in ["idx_marks_reference", "idx_blocks_page_ref"] {
+                conn.execute(&format!("DROP INDEX IF EXISTS {index}"), [])
+                    .unwrap();
+            }
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
+    /// `(id, name)` of every database row, read with plain SQL.
+    pub(crate) fn raw_databases(path: &Path) -> Vec<(i64, String)> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn.prepare("SELECT id, name FROM databases ORDER BY id").unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    /// How many rows one table holds, with plain SQL.
+    pub(crate) fn raw_rows(path: &Path, table: &str) -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn the_v12_step_adds_the_databases_table_to_a_v11_database() {
+        let (_dir, path) = migrated("d1-v12");
+        {
+            // what a v11 library holds: pages, blocks, and nothing about
+            // databases anywhere
+            let repo = SqliteRepository::open(&path).unwrap();
+            repo.apply(&[Change::PageCreated(page(1, "Written before the step"))])
+                .unwrap();
+        }
+        roll_back(&path, 11);
+
+        let repo = SqliteRepository::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+        // The point of the step: the table is there and it is empty.
+        assert_eq!(raw_rows(&path, "databases"), 0);
+        drop(conn);
+
+        // …and the library it upgraded is exactly what it was.
+        let state = repo.load().unwrap();
+        assert_eq!(state.pages.len(), 1);
+        assert_eq!(state.pages[0].title, "Written before the step");
+        let catalog = repo.load_databases().unwrap();
+        assert!(
+            catalog.databases.is_empty() && catalog.properties.is_empty() && catalog.views.is_empty(),
+            "a v11 library has no database, and that is a valid state"
+        );
+    }
+
+    #[test]
+    fn the_v13_step_adds_the_property_columns_to_a_v12_database() {
+        let (_dir, path) = migrated("d1-v13");
+        {
+            let repo = SqliteRepository::open(&path).unwrap();
+            repo.apply(&[Change::DatabaseCreated(Database::new(
+                DatabaseId(7),
+                "Written before the step",
+            ))])
+            .unwrap();
+        }
+        roll_back(&path, 12);
+
+        let repo = SqliteRepository::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+        drop(conn);
+
+        // The row that existed at v12 reads back unchanged — that is what the
+        // upgrade may not touch.
+        assert_eq!(
+            raw_databases(&path),
+            vec![(7, "Written before the step".to_string())]
+        );
+        // …and the new table takes rows that point at it, with the uniqueness
+        // ADR-0061 rests on doing its job.
+        let db = Database::new(DatabaseId(7), "Written before the step");
+        repo.apply(&[Change::PropertyAdded(db.title_property(PropertyId(1)))])
+            .unwrap();
+        let twice = repo.apply(&[Change::PropertyAdded(Property {
+            id: PropertyId(2),
+            ..db.title_property(PropertyId(2))
+        })]);
+        assert!(
+            matches!(twice, Err(StorageError::Sql(_))),
+            "two columns called Name was refused, got {twice:?}"
+        );
+        let catalog = repo.load_databases().unwrap();
+        assert_eq!(catalog.database(DatabaseId(7)).unwrap().name, "Written before the step");
+        assert_eq!(catalog.properties_of(DatabaseId(7)).count(), 1);
+        assert!(catalog.title_property(DatabaseId(7)).unwrap().kind.is_title());
+    }
+
+    #[test]
+    fn the_v14_step_adds_records_and_their_values_to_a_v13_database() {
+        let (_dir, path) = migrated("d1-v14");
+        {
+            let repo = SqliteRepository::open(&path).unwrap();
+            let db = Database::new(DatabaseId(7), "Written before the step");
+            repo.apply(&[
+                Change::DatabaseCreated(db.clone()),
+                Change::PropertyAdded(db.title_property(PropertyId(1))),
+            ])
+            .unwrap();
+        }
+        roll_back(&path, 13);
+
+        let repo = SqliteRepository::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+        drop(conn);
+
+        // The three tables the step added, empty…
+        for table in ["db_records", "db_values", "db_value_items"] {
+            assert_eq!(raw_rows(&path, table), 0, "{table} arrived empty");
+        }
+        // …and the database and its column from v13 read back unchanged.
+        let catalog = repo.load_databases().unwrap();
+        let property = catalog.title_property(DatabaseId(7)).unwrap();
+        assert_eq!(
+            (property.id, property.name.as_str(), property.ord),
+            (PropertyId(1), "Name", OrderKey::FIRST)
+        );
+        assert_eq!(repo.record_count(DatabaseId(7)).unwrap(), 0, "no rows at v13");
+
+        // The new tables take a row with its title, through the ordinary path.
+        let record = RecordId(1);
+        repo.apply(&[
+            Change::RecordCreated(Record::bare(
+                record,
+                DatabaseId(7),
+                OrderKey(OrderKey::FIRST.0 + 0x100),
+            )),
+            Change::CellSet {
+                record,
+                property: PropertyId(1),
+                value: CellValue::Text("written after the step".into()),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            repo.record_title(record).unwrap().as_deref(),
+            Some("written after the step")
+        );
+        assert_eq!(raw_rows(&path, "db_values"), 1);
+    }
+
+    #[test]
+    fn the_v15_step_adds_views_to_a_v14_database() {
+        let (_dir, path) = migrated("d1-v15");
+        {
+            let repo = SqliteRepository::open(&path).unwrap();
+            let db = Database::new(DatabaseId(7), "Written before the step");
+            repo.apply(&[
+                Change::DatabaseCreated(db.clone()),
+                Change::PropertyAdded(db.title_property(PropertyId(1))),
+                Change::RecordCreated(Record::bare(RecordId(1), db.id, OrderKey::FIRST)),
+                Change::CellSet {
+                    record: RecordId(1),
+                    property: PropertyId(1),
+                    value: CellValue::Text("kept across the step".into()),
+                },
+            ])
+            .unwrap();
+        }
+        roll_back(&path, 14);
+
+        let repo = SqliteRepository::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+        drop(conn);
+
+        assert_eq!(raw_rows(&path, "db_views"), 0, "the table arrived empty");
+        // Every row written before the step is exactly where it was.
+        assert_eq!(raw_rows(&path, "db_records"), 1);
+        assert_eq!(raw_rows(&path, "db_values"), 1);
+        assert_eq!(
+            repo.record_title(RecordId(1)).unwrap().as_deref(),
+            Some("kept across the step")
+        );
+        // A v14 database has no views, which is the state D3's switcher has to
+        // survive — and the new table takes one.
+        assert_eq!(repo.load_databases().unwrap().views.len(), 0);
+        let db = Database::new(DatabaseId(7), "Written before the step");
+        repo.apply(&[Change::ViewAdded(db.first_view(ViewId(1)))])
+            .unwrap();
+        let catalog = repo.load_databases().unwrap();
+        assert_eq!(catalog.views_of(DatabaseId(7)).count(), 1);
+        assert_eq!(catalog.views_of(DatabaseId(7)).next().unwrap().layout, ViewLayout::Table);
+    }
+
+    /// The one D1 owes by name: a database read back from disk, field for
+    /// field, after the file was closed and opened again.
+    #[test]
+    fn a_database_comes_back_field_for_field_after_a_reopen() {
+        let dir = ScratchDir::new("d1-reopen");
+        let path = dir.join("quire.db");
+        let (db, records) = {
+            let repo = SqliteRepository::open(&path).unwrap();
+            let db = Database::new(DatabaseId(1), "Tasks and chores");
+            let mut select = column(3, "Status", PropertyKind::Status, 2);
+            select.config = r#"{"options":[{"id":7,"name":"Done","color":"green"}]}"#.into();
+            repo.apply(&[
+                Change::DatabaseCreated(db.clone()),
+                Change::PropertyAdded(db.title_property(PropertyId(1))),
+                Change::PropertyAdded(column(2, "Estimate", PropertyKind::Number, 1)),
+                Change::PropertyAdded(select),
+                Change::PropertyAdded(column(4, "Tags", PropertyKind::MultiSelect, 3)),
+                Change::ViewAdded(db.first_view(ViewId(1))),
+                Change::ViewAdded(View {
+                    id: ViewId(2),
+                    db: db.id,
+                    name: "Board".into(),
+                    layout: ViewLayout::Board,
+                    definition: r#"{"v":1,"groups":[{"property":3}]}"#.into(),
+                    ord: OrderKey(OrderKey::FIRST.0 + 0x100),
+                }),
+                Change::PageCreated(page(50, "Face of a row")),
+            ])
+            .unwrap();
+
+            // Three rows: one bare, one that owns a page, one empty.
+            let records = [RecordId(1), RecordId(2), RecordId(3)];
+            repo.apply(&[
+                Change::RecordCreated(Record::bare(
+                    records[0],
+                    db.id,
+                    OrderKey(OrderKey::FIRST.0 + 0x100),
+                )),
+                Change::RecordCreated(Record::bare(
+                    records[1],
+                    db.id,
+                    OrderKey(OrderKey::FIRST.0 + 0x200),
+                )),
+                Change::RecordCreated(Record {
+                    id: records[2],
+                    db: db.id,
+                    page: Some(PageId(50)),
+                    ord: OrderKey(OrderKey::FIRST.0 + 0x300),
+                }),
+            ])
+            .unwrap();
+            repo.apply(&[
+                Change::CellSet {
+                    record: records[0],
+                    property: PropertyId(1),
+                    value: CellValue::Text("Bare row".into()),
+                },
+                Change::CellSet {
+                    record: records[0],
+                    property: PropertyId(2),
+                    value: CellValue::Number(2.5),
+                },
+                Change::CellSet {
+                    record: records[0],
+                    property: PropertyId(3),
+                    value: CellValue::Text("7".into()),
+                },
+                Change::CellSet {
+                    record: records[0],
+                    property: PropertyId(4),
+                    value: CellValue::Items(vec!["7".into(), "9".into()]),
+                },
+                Change::CellSet {
+                    record: records[1],
+                    property: PropertyId(1),
+                    value: CellValue::Text("Second row".into()),
+                },
+                Change::CellSet {
+                    record: records[1],
+                    property: PropertyId(2),
+                    value: CellValue::Number(-1.0),
+                },
+            ])
+            .unwrap();
+            (db, records)
+        };
+
+        // Close, open, read: the store is the only thing that remembers.
+        let reopened = SqliteRepository::open(&path).unwrap();
+        let catalog = reopened.load_databases().unwrap();
+        assert_eq!(catalog.databases, vec![db.clone()], "the entity came back");
+
+        let properties: Vec<_> = catalog.properties_of(db.id).cloned().collect();
+        assert_eq!(properties.len(), 4);
+        assert_eq!(
+            properties.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![PropertyId(1), PropertyId(2), PropertyId(3), PropertyId(4)],
+            "columns come back in ord order"
+        );
+        assert_eq!(properties[1].name, "Estimate");
+        assert_eq!(properties[1].kind, PropertyKind::Number);
+        assert_eq!(
+            properties[2].config,
+            r#"{"options":[{"id":7,"name":"Done","color":"green"}]}"#
+        );
+        assert_eq!(properties[3].kind, PropertyKind::MultiSelect);
+
+        let views: Vec<_> = catalog.views_of(db.id).cloned().collect();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].name, "Table");
+        assert_eq!(views[0].layout, ViewLayout::Table);
+        assert_eq!(views[0].definition, "");
+        assert_eq!(views[1].name, "Board");
+        assert_eq!(views[1].layout, ViewLayout::Board);
+        assert_eq!(views[1].definition, r#"{"v":1,"groups":[{"property":3}]}"#);
+
+        // The rows, with their order, their pages and their cells.
+        for (index, record) in records.iter().enumerate() {
+            let loaded = reopened.record(*record).unwrap().unwrap();
+            assert_eq!(loaded.db, db.id);
+            assert_eq!(loaded.ord, OrderKey(OrderKey::FIRST.0 + 0x100 * (index as u64 + 1)));
+            assert_eq!(
+                loaded.page,
+                if index == 2 { Some(PageId(50)) } else { None }
+            );
+        }
+        assert_eq!(
+            reopened.cell(records[0], PropertyId(2)).unwrap(),
+            CellValue::Number(2.5)
+        );
+        assert_eq!(
+            reopened.cell(records[0], PropertyId(4)).unwrap(),
+            CellValue::Items(vec!["7".into(), "9".into()])
+        );
+        assert_eq!(
+            reopened.cell(records[1], PropertyId(2)).unwrap(),
+            CellValue::Number(-1.0),
+            "a negative number is not a parsing accident"
+        );
+        assert_eq!(
+            reopened.cell(records[2], PropertyId(4)).unwrap(),
+            CellValue::Empty,
+            "a cell nobody wrote stays absent"
+        );
+        assert_eq!(reopened.record_title(records[0]).unwrap().as_deref(), Some("Bare row"));
+        assert_eq!(
+            reopened.record_title(records[2]).unwrap().as_deref(),
+            Some("Face of a row"),
+            "a page-backed row's title is the page's"
+        );
+
+        // And the window read works on the file that came back.
+        let columns: Vec<Property> = vec![
+            catalog.title_property(db.id).cloned().unwrap(),
+            properties[1].clone(),
+        ];
+        let req = RowRequest {
+            db: db.id,
+            title: PropertyId(1),
+            columns: &columns,
+        };
+        assert_eq!(reopened.record_count(db.id).unwrap(), 3);
+        let rows = reopened.window_rows(&req, RowWindow { start: 0, end: 3 }).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].title, "Bare row");
+        assert_eq!(rows[0].cells, vec!["Bare row".to_string(), "2.5".to_string()]);
+        assert_eq!(rows[2].title, "Face of a row");
+        assert_eq!(rows[2].cells, vec!["Face of a row".to_string(), "".to_string()]);
+    }
+
+    /// ADR-0063's two delete paths. They arrive from different places — the
+    /// view's row menu and the sidebar — and they have to end in the same
+    /// state: no row whose page is gone, and no page lost while its row lives.
+    #[test]
+    fn a_row_dies_with_the_page_it_owns_and_both_delete_paths_end_there() {
+        let dir = ScratchDir::new("d1-lifecycle");
+        let path = dir.join("quire.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+        let db = Database::new(DatabaseId(1), "Tasks");
+        let records = [RecordId(1), RecordId(2), RecordId(3)];
+        repo.apply(&[
+            Change::DatabaseCreated(db.clone()),
+            Change::PropertyAdded(db.title_property(PropertyId(1))),
+            Change::PropertyAdded(column(4, "Tags", PropertyKind::MultiSelect, 1)),
+            Change::ViewAdded(db.first_view(ViewId(1))),
+            Change::PageCreated(page(50, "Owes its row")),
+            Change::PageCreated(page(51, "Owes its row too")),
+        ])
+        .unwrap();
+        repo.apply(&[
+            Change::RecordCreated(Record::bare(records[0], db.id, OrderKey::FIRST)),
+            Change::RecordCreated(Record {
+                id: records[1],
+                db: db.id,
+                page: Some(PageId(50)),
+                ord: OrderKey(OrderKey::FIRST.0 + 0x100),
+            }),
+            Change::RecordCreated(Record {
+                id: records[2],
+                db: db.id,
+                page: Some(PageId(51)),
+                ord: OrderKey(OrderKey::FIRST.0 + 0x200),
+            }),
+            Change::CellSet {
+                record: records[0],
+                property: PropertyId(1),
+                value: CellValue::Text("Bare".into()),
+            },
+            Change::CellSet {
+                record: records[1],
+                property: PropertyId(4),
+                value: CellValue::Items(vec!["9".into()]),
+            },
+        ])
+        .unwrap();
+
+        // Path A — the row menu: the record and the page it owns, in one batch.
+        // One `apply` is one transaction, which is what makes this one undo
+        // step; the page is in the batch because the record owns it.
+        repo.apply(&[
+            Change::RecordDeleted { id: records[1] },
+            Change::PageDeleted { id: PageId(50) },
+        ])
+        .unwrap();
+
+        // Path B — the sidebar: the page alone. Nobody names the record, so the
+        // `ON DELETE CASCADE` is the backstop that keeps the invariant true.
+        repo.apply(&[Change::PageDeleted { id: PageId(51) }]).unwrap();
+
+        // Both paths end in the same state.
+        assert_eq!(repo.record(records[1]).unwrap(), None);
+        assert_eq!(repo.record(records[2]).unwrap(), None);
+        assert_eq!(repo.record_title(records[1]).unwrap(), None);
+        let state = repo.load().unwrap();
+        assert!(state.pages.is_empty(), "both pages are gone");
+        assert_eq!(repo.record_count(db.id).unwrap(), 1, "the bare row is not");
+        assert_eq!(repo.record(records[0]).unwrap().unwrap().page, None);
+        assert_eq!(
+            repo.record_title(records[0]).unwrap().as_deref(),
+            Some("Bare"),
+            "and it still has its title — deleting a row is not deleting a column"
+        );
+        // The invariant, stated as a read: no row points at a page that is not
+        // there. That is the property, not the mechanism.
+        let live: Vec<u64> = state.pages.iter().map(|p| p.id.as_u64()).collect();
+        let rows = repo
+            .window_rows(
+                &RowRequest {
+                    db: db.id,
+                    title: PropertyId(1),
+                    columns: &[],
+                },
+                RowWindow { start: 0, end: 31 },
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(live.is_empty() || rows.iter().all(|r| live.contains(&r.record)));
+
+        // Undo is the inverse batch: the same rows come back, including the
+        // page, because the delete captured them (ADR-0063).
+        repo.apply(&[
+            Change::PageCreated(page(50, "Owes its row")),
+            Change::RecordCreated(Record {
+                id: records[1],
+                db: db.id,
+                page: Some(PageId(50)),
+                ord: OrderKey(OrderKey::FIRST.0 + 0x100),
+            }),
+            Change::CellSet {
+                record: records[1],
+                property: PropertyId(4),
+                value: CellValue::Items(vec!["9".into()]),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            repo.record(records[1]).unwrap().unwrap().page,
+            Some(PageId(50))
+        );
+        assert_eq!(
+            repo.cell(records[1], PropertyId(4)).unwrap(),
+            CellValue::Items(vec!["9".into()])
+        );
+        assert_eq!(repo.record_count(db.id).unwrap(), 2);
+    }
+
+    /// The bulk path (checkpoint / repair) replaces the *document*, and the
+    /// database layer is not part of that state — but `DELETE FROM pages` still
+    /// cascades through `db_records.page`. ADR-0066: the layer survives, except
+    /// where it hangs off a page the incoming state dropped.
+    #[test]
+    fn the_bulk_path_keeps_the_database_layer_except_what_hangs_off_a_dropped_page() {
+        let dir = ScratchDir::new("d1-bulk");
+        let path = dir.join("quire.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+        let db = Database::new(DatabaseId(1), "Tasks");
+        let records = [RecordId(1), RecordId(2)];
+        repo.apply(&[
+            Change::DatabaseCreated(db.clone()),
+            Change::PropertyAdded(db.title_property(PropertyId(1))),
+            Change::PropertyAdded(column(2, "Notes", PropertyKind::Text, 1)),
+            Change::ViewAdded(db.first_view(ViewId(1))),
+            Change::PageCreated(page(50, "Kept by the state")),
+            Change::PageCreated(page(51, "Dropped by the state")),
+        ])
+        .unwrap();
+        repo.apply(&[
+            Change::RecordCreated(Record {
+                id: records[0],
+                db: db.id,
+                page: Some(PageId(50)),
+                ord: OrderKey::FIRST,
+            }),
+            Change::RecordCreated(Record {
+                id: records[1],
+                db: db.id,
+                page: Some(PageId(51)),
+                ord: OrderKey(OrderKey::FIRST.0 + 0x100),
+            }),
+            // Both rows are page-backed, so their *titles* are the pages'
+            // (ADR-0063); what the record itself carries is the other column.
+            Change::CellSet {
+                record: records[0],
+                property: PropertyId(2),
+                value: CellValue::Text("survives".into()),
+            },
+            Change::CellSet {
+                record: records[1],
+                property: PropertyId(2),
+                value: CellValue::Text("goes with its page".into()),
+            },
+        ])
+        .unwrap();
+
+        // The state that keeps page 50 and knows nothing about page 51.
+        let kept = PersistedState {
+            pages: vec![page(50, "Kept by the state")],
+            blocks: vec![],
+            meta: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        repo.replace_all(&kept).unwrap();
+
+        let catalog = repo.load_databases().unwrap();
+        assert_eq!(catalog.databases.len(), 1, "the entity survived the bulk path");
+        assert_eq!(catalog.properties.len(), 2, "and its columns did");
+        assert_eq!(catalog.views.len(), 1);
+        assert_eq!(repo.load().unwrap().pages.len(), 1);
+        assert_eq!(
+            repo.record(records[0]).unwrap().unwrap().page,
+            Some(PageId(50)),
+            "the row whose page the state kept is still the face of it"
+        );
+        assert_eq!(
+            repo.record_title(records[0]).unwrap().as_deref(),
+            Some("Kept by the state"),
+            "the page the state handed back is still the row's title"
+        );
+        assert_eq!(
+            repo.cell(records[0], PropertyId(2)).unwrap(),
+            CellValue::Text("survives".into())
+        );
+        assert_eq!(
+            repo.record(records[1]).unwrap(),
+            None,
+            "the row whose page the state dropped went with it"
+        );
+        assert_eq!(
+            repo.cell(records[1], PropertyId(2)).unwrap(),
+            CellValue::Empty,
+            "and its values went too, rather than hanging off nothing"
+        );
+        assert_eq!(repo.record_count(db.id).unwrap(), 1);
+
+        // A bulk path that hands back the same pages is a no-op for this layer.
+        let both = PersistedState {
+            pages: vec![page(50, "Kept by the state"), page(51, "Kept this time")],
+            blocks: vec![],
+            meta: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        repo.apply(&[Change::PageCreated(page(51, "Kept this time"))]).unwrap();
+        repo.replace_all(&both).unwrap();
+        assert_eq!(repo.record_count(db.id).unwrap(), 1);
+        assert_eq!(
+            repo.cell(records[0], PropertyId(2)).unwrap(),
+            CellValue::Text("survives".into())
+        );
+        assert_eq!(
+            repo.record_title(records[0]).unwrap().as_deref(),
+            Some("Kept by the state")
+        );
+    }
+}

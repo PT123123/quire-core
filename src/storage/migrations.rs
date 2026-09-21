@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 11;
+pub const CURRENT_VERSION: i32 = 15;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -198,6 +198,116 @@ CREATE TABLE IF NOT EXISTS attachments (
     // v10 library opens with every page exactly as it looked before.
     sql: "",
     backfill: Some(add_page_icon_column),
+}, Migration {
+    version: 12,
+    label: "databases",
+    // SPEC §三十九 (ADR-0060): the database entity itself. One row per
+    // database, reached from a page through a `Database` block's `db_ref` (a
+    // later step, with the block kind). Deliberately only this table: the
+    // schema, the rows and the views are three more semantic units below, and a
+    // migration is the one thing in this project that cannot be undone —
+    // one step per unit is what keeps a half-applied upgrade readable.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS databases (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT ''
+);
+"#,
+    backfill: None,
+}, Migration {
+    version: 13,
+    label: "database properties",
+    // ADR-0061: a database's columns are rows, because `UNIQUE (db, name)` is
+    // what makes renaming a column well defined — an invariant no JSON blob can
+    // enforce. Only a select's option list is JSON, and it lives in `config`.
+    // `ord` is an app invariant (like `block_children.ord`), not a constraint.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS db_properties (
+    id     INTEGER PRIMARY KEY,
+    db     INTEGER NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+    name   TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    config TEXT NOT NULL DEFAULT '',
+    ord    INTEGER NOT NULL,
+    UNIQUE (db, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_properties_db ON db_properties(db);
+"#,
+    backfill: None,
+}, Migration {
+    version: 14,
+    label: "database records and values",
+    // ADR-0063's records and ADR-0062's values, in one step because they are
+    // one unit of meaning: a value without its record is not a state any
+    // version of this app can produce, and `db_records.page`'s CASCADE is the
+    // backstop the record/page contract is written against. `UNIQUE (page)` is
+    // the ownership: a page is the face of at most one record, and two rows can
+    // never share one (SQLite allows many NULLs under it, which is load-bearing
+    // — a bare record is the default, ADR-0063).
+    //
+    // `db_values` is one row per (record, property) with one column per SQLite
+    // type a comparison needs: `text`, `num`, `flag`. A comparison has to
+    // happen in SQLite's own type system, or `ORDER BY` is lexicographic and
+    // `10` sorts before `9` (ADR-0062). `db_value_items` carries the list
+    // kinds — multi-select option ids and files attachment ids — so "has this
+    // option" is an index probe and not a JSON scan.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS db_records (
+    id   INTEGER PRIMARY KEY,
+    db   INTEGER NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+    page INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+    ord  INTEGER NOT NULL,
+    UNIQUE (page)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_records_db_ord ON db_records(db, ord);
+
+CREATE TABLE IF NOT EXISTS db_values (
+    record   INTEGER NOT NULL REFERENCES db_records(id) ON DELETE CASCADE,
+    property INTEGER NOT NULL REFERENCES db_properties(id) ON DELETE CASCADE,
+    text     TEXT NOT NULL DEFAULT '',
+    num      REAL,
+    flag     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (record, property)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_values_property ON db_values(property);
+
+CREATE TABLE IF NOT EXISTS db_value_items (
+    record   INTEGER NOT NULL REFERENCES db_records(id) ON DELETE CASCADE,
+    property INTEGER NOT NULL REFERENCES db_properties(id) ON DELETE CASCADE,
+    ord      INTEGER NOT NULL,
+    value    TEXT NOT NULL,
+    PRIMARY KEY (record, property, ord)
+);
+"#,
+    backfill: None,
+}, Migration {
+    version: 15,
+    label: "database views",
+    // ADR-0064: a view is a row whose name, layout and place in the switcher
+    // are columns, and whose rules (filter / sorts / groups / visible columns /
+    // widths) are one JSON document in `definition`. The split is ADR-0061's
+    // and ADR-0062's test read the other way round: SQL has to *list* views and
+    // their names, so those are columns; SQL never filters *on* the rules, so
+    // their shape is whatever the compiler reads best — and a filter is a tree
+    // whose depth nothing bounds.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS db_views (
+    id         INTEGER PRIMARY KEY,
+    db         INTEGER NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    layout     TEXT NOT NULL DEFAULT 'table',
+    definition TEXT NOT NULL DEFAULT '',
+    ord        INTEGER NOT NULL,
+    UNIQUE (db, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_views_db ON db_views(db);
+"#,
+    backfill: None,
+
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -404,7 +514,7 @@ pub fn ensure_current(conn: &mut Connection) -> Result<(), StorageError> {
 
 /// True when every table the current schema needs is present.
 pub fn check_schema(conn: &Connection) -> Result<(), StorageError> {
-    const TABLES: [&str; 9] = [
+    const TABLES: [&str; 15] = [
         "workspaces",
         "pages",
         "blocks",
@@ -414,6 +524,14 @@ pub fn check_schema(conn: &Connection) -> Result<(), StorageError> {
         "settings",
         "search_pages",
         "search_blocks",
+        // SPEC §三十九 (v12–v15). A file that reaches here without them is a
+        // file whose upgrade did not run, which is what this check is for.
+        "databases",
+        "db_properties",
+        "db_records",
+        "db_values",
+        "db_value_items",
+        "db_views",
     ];
     for table in TABLES {
         let found: Option<String> = conn

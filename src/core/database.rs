@@ -16,6 +16,14 @@
 // construction rather than by discipline. That is the same argument ADR-0028
 // makes for a folded subtree one level down, and the same one ADR-0031 makes
 // for a grid: the hidden thing has no representation at all.
+//
+// D1 adds the object model and the value shape below (`Database`, `Property`,
+// `Record`, `View`, `CellValue`) — data only, still no SQL: the storage layer
+// (`storage::database_store`) reads and writes it, and `RowRequest` is what it
+// needs to run a windowed read. ADR-0066/0067 are where D1's two new decisions
+// are written down.
+
+use super::types::{OrderKey, PageId};
 
 /// Extra rows kept realized above and below the visible band, so a scroll of
 /// one row does not immediately need a fetch. In rows and not in pixels,
@@ -201,6 +209,494 @@ impl RealizedRows {
     }
 }
 
+// ─── D1: the object model ───────────────────────────────────────────────────
+//
+// SPEC §三十九's four entities — the database, its properties, its records and
+// its views — plus the shape a cell's value has (ADR-0062). Data only, like
+// `core::types`: no SQL, no Slint, no clock, and no derived copy of anything
+// the store already knows (ADR-0039).
+
+/// A stable id, newtyped — SPEC §九's rule that an id is an id and never an
+/// index. The macro is a local copy of `core::types`'s `id_newtype!` rather
+/// than an export of it: that macro is private to its module, and this slice's
+/// standing instruction is to append to the shared files, not to reorganise
+/// them.
+macro_rules! db_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub u64);
+
+        impl $name {
+            pub fn as_u64(self) -> u64 {
+                self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), self.0)
+            }
+        }
+    };
+}
+
+db_id!(DatabaseId, "Stable identifier of a database entity (ADR-0060).");
+db_id!(
+    PropertyId,
+    "Stable identifier of a property — one column of one database (ADR-0061)."
+);
+db_id!(
+    RecordId,
+    "Stable identifier of a record — one row of one database (ADR-0063)."
+);
+db_id!(
+    ViewId,
+    "Stable identifier of a view definition on one database (ADR-0064)."
+);
+
+/// The name a new database's title column is born with. Notion's word, and the
+/// only string this build invents here: it is renameable like any other
+/// property (`Change::PropertyRenamed`), so nothing keys on it.
+pub const TITLE_PROPERTY_NAME: &str = "Name";
+
+/// One database entity (ADR-0060): what a `Database` block points at through
+/// `blocks.db_ref`, and the parent of the schema and of the rows. `name` is the
+/// database's own name — what a link to it says — and is deliberately not the
+/// title column's name (a row's title and the database's name are two things).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Database {
+    pub id: DatabaseId,
+    pub name: String,
+}
+
+impl Database {
+    pub fn new(id: DatabaseId, name: impl Into<String>) -> Self {
+        Database {
+            id,
+            name: name.into(),
+        }
+    }
+
+    /// The `title` column every database is born with, at `ord = 0` (ADR-0061).
+    /// A database with no title column cannot draw a row, so the two rows this
+    /// and [`Self::first_view`] build are what the insert path has to write
+    /// together with the `databases` row itself.
+    pub fn title_property(&self, id: PropertyId) -> Property {
+        Property {
+            id,
+            db: self.id,
+            name: TITLE_PROPERTY_NAME.into(),
+            kind: PropertyKind::Title,
+            config: String::new(),
+            ord: OrderKey::FIRST,
+        }
+    }
+
+    /// The first view every database is born with (ADR-0061): a table, whose
+    /// empty `definition` is "no rules" — the document that would hold filters
+    /// and sorts is ADR-0064's, and absent means show everything.
+    pub fn first_view(&self, id: ViewId) -> View {
+        View {
+            id,
+            db: self.id,
+            name: ViewLayout::Table.label().into(),
+            layout: ViewLayout::Table,
+            definition: String::new(),
+            ord: OrderKey::FIRST,
+        }
+    }
+}
+
+/// One column of one database (SPEC §三十九 "property：列，带类型"). Stored as a
+/// row rather than as JSON on the database, so that renaming a column is well
+/// defined under `UNIQUE (db, name)` (ADR-0061).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Property {
+    pub id: PropertyId,
+    pub db: DatabaseId,
+    pub name: String,
+    pub kind: PropertyKind,
+    /// The type's own settings, as one JSON document (ADR-0061) — exactly what
+    /// SQL never filters on: a select's option list (options carry their own
+    /// ids), a number's format, a rollup's target. D1 stores it verbatim and
+    /// never parses it: the option reader is D2's and the filter compiler that
+    /// has to *ignore* ids of deleted properties is D4's.
+    pub config: String,
+    /// Where the column sits in the view's column list. A dense key like
+    /// `pages.ord`, because `ord` being an app invariant is the price ADR-0061
+    /// accepted for the row table — and a key with gaps is what makes moving a
+    /// column between two others one `UPDATE`.
+    pub ord: OrderKey,
+}
+
+/// What a column is (SPEC §三十九's list, plus the computed kinds). Stored as a
+/// short stable string, like `blocks.kind` and `blocks.lang`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyKind {
+    Title,
+    Text,
+    Number,
+    Select,
+    MultiSelect,
+    Status,
+    Date,
+    Checkbox,
+    Url,
+    Email,
+    Phone,
+    Files,
+    CreatedTime,
+    LastEditedTime,
+    /// Computed, never stored (ADR-0062).
+    Formula,
+    /// Computed, never stored (ADR-0062).
+    Rollup,
+    /// Computed, never stored (ADR-0062) — and, per §三十九's 排期前提, a
+    /// pointer either at §四十's page mentions (Track 2) or at nothing.
+    Relation,
+}
+
+impl PropertyKind {
+    pub const ALL: [PropertyKind; 17] = [
+        PropertyKind::Title,
+        PropertyKind::Text,
+        PropertyKind::Number,
+        PropertyKind::Select,
+        PropertyKind::MultiSelect,
+        PropertyKind::Status,
+        PropertyKind::Date,
+        PropertyKind::Checkbox,
+        PropertyKind::Url,
+        PropertyKind::Email,
+        PropertyKind::Phone,
+        PropertyKind::Files,
+        PropertyKind::CreatedTime,
+        PropertyKind::LastEditedTime,
+        PropertyKind::Formula,
+        PropertyKind::Rollup,
+        PropertyKind::Relation,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PropertyKind::Title => "title",
+            PropertyKind::Text => "text",
+            PropertyKind::Number => "number",
+            PropertyKind::Select => "select",
+            PropertyKind::MultiSelect => "multi_select",
+            PropertyKind::Status => "status",
+            PropertyKind::Date => "date",
+            PropertyKind::Checkbox => "checkbox",
+            PropertyKind::Url => "url",
+            PropertyKind::Email => "email",
+            PropertyKind::Phone => "phone",
+            PropertyKind::Files => "files",
+            PropertyKind::CreatedTime => "created_time",
+            PropertyKind::LastEditedTime => "last_edited_time",
+            PropertyKind::Formula => "formula",
+            PropertyKind::Rollup => "rollup",
+            PropertyKind::Relation => "relation",
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<PropertyKind> {
+        PropertyKind::ALL.iter().copied().find(|k| k.as_str() == s)
+    }
+
+    /// What a stored string means in this build (ADR-0061's fold): a kind this
+    /// build does not know — one a future build wrote — loads as `text` and the
+    /// cell draws as text, rather than failing the whole library. `person` folds
+    /// here too, which is where SPEC's 降级 lands: with no account model behind
+    /// it, a person column is a text column (a local name list would be its own
+    /// table, picker and merge rules for zero extra data).
+    pub fn from_stored(s: &str) -> PropertyKind {
+        match s {
+            "person" => PropertyKind::Text,
+            other => PropertyKind::try_from_str(other).unwrap_or(PropertyKind::Text),
+        }
+    }
+
+    /// Whether this kind's value is a list, and therefore lives in
+    /// `db_value_items` (ADR-0062) instead of in the three typed columns.
+    pub fn is_list(self) -> bool {
+        matches!(self, PropertyKind::MultiSelect | PropertyKind::Files)
+    }
+
+    /// Whether this kind stores nothing at all and is computed for the window
+    /// at projection time — `formula` / `rollup` / `relation` (ADR-0062).
+    pub fn is_computed(self) -> bool {
+        matches!(
+            self,
+            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation
+        )
+    }
+
+    /// The one kind a database has exactly one of, at `ord = 0` (ADR-0061) —
+    /// and the column whose value is `pages.title` for a record that has a page
+    /// (ADR-0063).
+    pub fn is_title(self) -> bool {
+        self == PropertyKind::Title
+    }
+
+    /// The value the store can hold for a kind, given a cell to write. `None`
+    /// means the kind stores nothing and the write is dropped rather than
+    /// double-written (ADR-0039/ADR-0062). The title column is text: its
+    /// *storage* differs per record (page title or value row, ADR-0063) but
+    /// what a caller writes into it is a string either way.
+    pub fn value_kind(self) -> ValueKind {
+        match self {
+            PropertyKind::Number => ValueKind::Number,
+            PropertyKind::Checkbox => ValueKind::Flag,
+            PropertyKind::MultiSelect | PropertyKind::Files => ValueKind::Items,
+            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation => {
+                ValueKind::Computed
+            }
+            _ => ValueKind::Text,
+        }
+    }
+}
+
+/// Which of ADR-0062's storage shapes a kind's value takes: the `text` column,
+/// the `num` column, the `flag` column, the `db_value_items` table, or nothing
+/// at all because the column is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Text,
+    Number,
+    Flag,
+    Items,
+    Computed,
+}
+
+/// One row of one database (SPEC §三十九 "record：一行，可以同时是一个 page").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub id: RecordId,
+    pub db: DatabaseId,
+    /// The page this record is the face of (ADR-0063), or `None` for a bare
+    /// record — which is how every record is born: a page arrives when someone
+    /// opens the row. `UNIQUE (page)` makes the ownership mutual, so two
+    /// records can never share one.
+    pub page: Option<PageId>,
+    /// Row order in the database's own listing, before any view's sort. A dense
+    /// key rather than a rank, so inserting a row between two others is one
+    /// `UPDATE` and not a renumber of every row below it.
+    pub ord: OrderKey,
+}
+
+impl Record {
+    /// A bare record at `ord` — the shape the "new row" path writes, and the
+    /// only shape this build creates (ADR-0063's lazy page).
+    pub fn bare(id: RecordId, db: DatabaseId, ord: OrderKey) -> Self {
+        Record {
+            id,
+            db,
+            page: None,
+            ord,
+        }
+    }
+}
+
+/// SPEC §三十九's eight view layouts, in the order the app means to implement
+/// them (ADR-0060 made them one entity's layouts, not eight block kinds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ViewLayout {
+    Table,
+    Board,
+    List,
+    Calendar,
+    Gallery,
+    Timeline,
+    Form,
+    Chart,
+}
+
+impl ViewLayout {
+    pub const ALL: [ViewLayout; 8] = [
+        ViewLayout::Table,
+        ViewLayout::Board,
+        ViewLayout::List,
+        ViewLayout::Calendar,
+        ViewLayout::Gallery,
+        ViewLayout::Timeline,
+        ViewLayout::Form,
+        ViewLayout::Chart,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ViewLayout::Table => "table",
+            ViewLayout::Board => "board",
+            ViewLayout::List => "list",
+            ViewLayout::Calendar => "calendar",
+            ViewLayout::Gallery => "gallery",
+            ViewLayout::Timeline => "timeline",
+            ViewLayout::Form => "form",
+            ViewLayout::Chart => "chart",
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<ViewLayout> {
+        ViewLayout::ALL.iter().copied().find(|l| l.as_str() == s)
+    }
+
+    /// What the view switcher shows. `Form` keeps its one-word name; the layout
+    /// strings are the store's, these are the user's.
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewLayout::Table => "Table",
+            ViewLayout::Board => "Board",
+            ViewLayout::List => "List",
+            ViewLayout::Calendar => "Calendar",
+            ViewLayout::Gallery => "Gallery",
+            ViewLayout::Timeline => "Timeline",
+            ViewLayout::Form => "Form",
+            ViewLayout::Chart => "Chart",
+        }
+    }
+
+    /// What a stored string means in this build: an unknown layout is a table,
+    /// the same fold `Lang` gives an unknown fence — a view that cannot be
+    /// opened is worse than one that opens in the wrong shape.
+    pub fn from_stored(s: &str) -> ViewLayout {
+        ViewLayout::try_from_str(s).unwrap_or(ViewLayout::Table)
+    }
+}
+
+/// One view of one database (SPEC §三十九 "view：同一份数据的一个投影").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct View {
+    pub id: ViewId,
+    pub db: DatabaseId,
+    pub name: String,
+    pub layout: ViewLayout,
+    /// Filter + sorts + groups + visible columns + widths as one JSON document
+    /// (ADR-0064): `{"v":1,"filter":…,"sorts":[…],"groups":[…],"columns":[…],
+    /// "widths":{…}}`. Stored verbatim and never interpreted here; a document
+    /// that does not parse degrades to "no rules" in D4's compiler, so the view
+    /// opens showing everything rather than failing to open.
+    pub definition: String,
+    /// Where the view sits in the switcher. The order is the user's, so it is a
+    /// column and not the id's order.
+    pub ord: OrderKey,
+}
+
+/// One cell's value, in the shape ADR-0062 stores it: a row in `db_values`
+/// using whichever typed column the property's kind names, a row per item in
+/// `db_value_items` for the list kinds, or no row at all.
+#[derive(Debug, Clone)]
+pub enum CellValue {
+    /// The absence of the value: no `db_values` row and no items. ADR-0062's
+    /// one representation of "empty" — a number is never `0` for empty, and a
+    /// text cell the user deliberately blanked is `Text("")`, which is a row.
+    /// An empty [`CellValue::Items`] is normalised to this on the way in, so a
+    /// list cell with nothing in it is the same absence as every other.
+    Empty,
+    /// title / text / url / email / phone / select-option-id / status-option-id
+    /// / date-as-ISO-text: ADR-0062's `text` column.
+    Text(String),
+    /// number: the `num` column, which is why sorting by it is numeric in SQL.
+    Number(f64),
+    /// checkbox: the `flag` column.
+    Flag(bool),
+    /// multi-select option ids and files attachment ids, in display order: one
+    /// `db_value_items` row each, so "has this option" is an index probe.
+    Items(Vec<String>),
+}
+
+impl CellValue {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, CellValue::Empty)
+    }
+
+    /// The painted form of a cell. **D1's placeholder**, and the one place this
+    /// slice renders anything: the per-type rendering (a select shows its
+    /// option's *name*, a date its format, files their file names, a
+    /// multi-select its names joined) needs the property's `config`, which D2
+    /// reads. Until then a list cell shows the ids it stores.
+    pub fn display(&self) -> String {
+        match self {
+            CellValue::Empty => String::new(),
+            CellValue::Text(text) => text.clone(),
+            // Rust's `Display` for f64 gives "3" for 3.0 and "3.5" for 3.5, so
+            // a whole number does not paint a trailing `.0` (the user's number
+            // *format* is the property's `config`, D2's).
+            CellValue::Number(num) => format!("{num}"),
+            CellValue::Flag(true) => "Yes".into(),
+            CellValue::Flag(false) => "No".into(),
+            CellValue::Items(items) => items.join(", "),
+        }
+    }
+}
+
+/// Numbers compare by bit pattern, so a value can ride inside `Change` — which
+/// is `Eq` because `core::document::Entry` is, and `Entry` is what an undo step
+/// is. Under bit equality `Eq` is truthful (it is an equivalence relation):
+/// `NaN` equals itself and `0.0` differs from `-0.0`, which is the right answer
+/// for "is this the same stored value".
+impl PartialEq for CellValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CellValue::Empty, CellValue::Empty) => true,
+            (CellValue::Text(a), CellValue::Text(b)) => a == b,
+            (CellValue::Number(a), CellValue::Number(b)) => a.to_bits() == b.to_bits(),
+            (CellValue::Flag(a), CellValue::Flag(b)) => a == b,
+            (CellValue::Items(a), CellValue::Items(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CellValue {}
+
+/// Everything about the database layer that a startup load carries: the
+/// entities, their columns, their views. **Not their records and not their
+/// cells** — ADR-0067: a row exists only inside a window, so a database with
+/// 10 000 rows costs a schema and a `COUNT(*)` until someone scrolls, and the
+/// row objects that do appear are the ones the viewport asked for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DatabaseCatalog {
+    pub databases: Vec<Database>,
+    pub properties: Vec<Property>,
+    pub views: Vec<View>,
+}
+
+impl DatabaseCatalog {
+    pub fn database(&self, id: DatabaseId) -> Option<&Database> {
+        self.databases.iter().find(|d| d.id == id)
+    }
+
+    /// One database's columns, in the order the store returned them (`ord`).
+    pub fn properties_of(&self, db: DatabaseId) -> impl Iterator<Item = &Property> {
+        self.properties.iter().filter(move |p| p.db == db)
+    }
+
+    /// The database's one `title` column (ADR-0061). `None` means the invariant
+    /// was broken outside the app (SQL, or a hand-edited file) — a state the
+    /// read paths survive by drawing an empty title rather than by failing.
+    pub fn title_property(&self, db: DatabaseId) -> Option<&Property> {
+        self.properties_of(db).find(|p| p.kind.is_title())
+    }
+
+    /// One database's views, in switcher order.
+    pub fn views_of(&self, db: DatabaseId) -> impl Iterator<Item = &View> {
+        self.views.iter().filter(move |v| v.db == db)
+    }
+}
+
+/// What one window read needs to know: which database, which `title` column
+/// (the caller read it out of the catalog a moment ago, and ADR-0063's
+/// `COALESCE` cannot be written without it), and the columns the view shows, in
+/// the order the row's cells come back in. The title column may appear in
+/// `columns` or not — a row's title is [`RowView::title`] either way.
+#[derive(Debug, Clone, Copy)]
+pub struct RowRequest<'a> {
+    pub db: DatabaseId,
+    pub title: PropertyId,
+    pub columns: &'a [Property],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,13 +825,201 @@ mod tests {
             720 + DEFAULT_OVERSCAN
         );
     }
+
+    // ─── D1's model ────────────────────────────────────────────────────────
+
+    #[test]
+    fn property_kind_strings_round_trip_and_unknown_ones_fold_to_text() {
+        for kind in PropertyKind::ALL {
+            assert_eq!(PropertyKind::try_from_str(kind.as_str()), Some(kind));
+            assert_eq!(PropertyKind::from_stored(kind.as_str()), kind);
+        }
+        assert_eq!(PropertyKind::try_from_str("quantum"), None);
+        // ADR-0061's fold: a library written by a build that knows more than
+        // this one still opens, and the column draws as text.
+        assert_eq!(PropertyKind::from_stored("quantum"), PropertyKind::Text);
+        assert_eq!(PropertyKind::from_stored(""), PropertyKind::Text);
+        // SPEC's 降级 has one home, and it is this fold.
+        assert_eq!(PropertyKind::from_stored("person"), PropertyKind::Text);
+        assert!(PropertyKind::ALL.iter().all(|k| k.as_str() != "person"));
+    }
+
+    #[test]
+    fn each_kind_names_the_column_or_table_its_value_lives_in() {
+        assert_eq!(PropertyKind::Number.value_kind(), ValueKind::Number);
+        assert_eq!(PropertyKind::Checkbox.value_kind(), ValueKind::Flag);
+        for kind in [PropertyKind::MultiSelect, PropertyKind::Files] {
+            assert_eq!(kind.value_kind(), ValueKind::Items);
+            assert!(kind.is_list());
+        }
+        for kind in [
+            PropertyKind::Formula,
+            PropertyKind::Rollup,
+            PropertyKind::Relation,
+        ] {
+            assert_eq!(kind.value_kind(), ValueKind::Computed);
+            assert!(kind.is_computed());
+        }
+        // Everything else is a string in the `text` column — including the
+        // title, whose *storage* differs per record (ADR-0063) but whose value
+        // is a string either way.
+        for kind in [
+            PropertyKind::Title,
+            PropertyKind::Text,
+            PropertyKind::Select,
+            PropertyKind::Status,
+            PropertyKind::Date,
+            PropertyKind::Url,
+            PropertyKind::Email,
+            PropertyKind::Phone,
+            PropertyKind::CreatedTime,
+            PropertyKind::LastEditedTime,
+        ] {
+            assert_eq!(kind.value_kind(), ValueKind::Text);
+        }
+        assert!(PropertyKind::Title.is_title());
+        assert_eq!(
+            PropertyKind::ALL.iter().filter(|k| k.is_title()).count(),
+            1,
+            "the title kind exists once, and a database has one of it"
+        );
+        // A value lives in exactly one place: no kind is both a list and a
+        // computed column.
+        for kind in PropertyKind::ALL {
+            assert!(!(kind.is_list() && kind.is_computed()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_view_layout_round_trips_and_an_unknown_one_is_a_table() {
+        for layout in ViewLayout::ALL {
+            assert_eq!(ViewLayout::try_from_str(layout.as_str()), Some(layout));
+            assert_eq!(ViewLayout::from_stored(layout.as_str()), layout);
+            assert!(!layout.label().is_empty());
+        }
+        assert_eq!(ViewLayout::try_from_str("kanban"), None);
+        assert_eq!(ViewLayout::from_stored("kanban"), ViewLayout::Table);
+        // SPEC's order is the implementation order, and the store's strings
+        // are not the labels: they are stable spellings nothing may renumber.
+        assert_eq!(ViewLayout::ALL[0], ViewLayout::Table);
+        assert_eq!(ViewLayout::ALL[7], ViewLayout::Chart);
+    }
+
+    #[test]
+    fn a_new_database_is_born_with_a_title_column_and_a_table_view() {
+        let db = Database::new(DatabaseId(7), "Tasks");
+        assert_eq!(db.id, DatabaseId(7));
+        assert_eq!(db.name, "Tasks");
+
+        let title = db.title_property(PropertyId(1));
+        assert!(title.kind.is_title());
+        assert_eq!(title.ord, OrderKey::FIRST, "the title column is first");
+        assert_eq!(title.name, TITLE_PROPERTY_NAME);
+        assert_eq!(title.db, db.id);
+        assert_eq!(title.config, "", "a title column has no settings to keep");
+
+        let view = db.first_view(ViewId(1));
+        assert_eq!(view.layout, ViewLayout::Table);
+        assert_eq!(view.name, "Table");
+        assert_eq!(view.db, db.id);
+        // No rules is the empty document, which is also what "show everything"
+        // means to ADR-0064's reader.
+        assert_eq!(view.definition, "");
+    }
+
+    #[test]
+    fn a_cell_value_compares_by_bit_pattern_and_paints_itself() {
+        assert_eq!(CellValue::Empty, CellValue::Empty);
+        assert_ne!(CellValue::Empty, CellValue::Text(String::new()));
+        assert_eq!(CellValue::Text("a".into()), CellValue::Text("a".into()));
+        assert_ne!(CellValue::Text("a".into()), CellValue::Flag(true));
+        assert_eq!(CellValue::Number(1.5), CellValue::Number(1.5));
+        // Bits, not `PartialEq`'s float rules: `Entry` is `Eq`, so this has to
+        // be too, and NaN equals itself under "the same stored value".
+        assert_eq!(CellValue::Number(f64::NAN), CellValue::Number(f64::NAN));
+        assert_ne!(CellValue::Number(0.0), CellValue::Number(-0.0));
+        assert_eq!(
+            CellValue::Items(vec!["a".into(), "b".into()]),
+            CellValue::Items(vec!["a".into(), "b".into()])
+        );
+
+        assert_eq!(CellValue::Empty.display(), "");
+        assert_eq!(CellValue::Empty.is_empty(), true);
+        assert_eq!(CellValue::Text("hi".into()).display(), "hi");
+        // A whole number does not paint a trailing `.0`…
+        assert_eq!(CellValue::Number(3.0).display(), "3");
+        assert_eq!(CellValue::Number(3.5).display(), "3.5");
+        assert_eq!(CellValue::Number(-2.0).display(), "-2");
+        // …and the checkbox words are ADR-0065's, so the cell and the exported
+        // table say the same thing.
+        assert_eq!(CellValue::Flag(true).display(), "Yes");
+        assert_eq!(CellValue::Flag(false).display(), "No");
+        // D1's placeholder rendering: ids until D2 reads the property's config.
+        assert_eq!(
+            CellValue::Items(vec!["7".into(), "9".into()]).display(),
+            "7, 9"
+        );
+    }
+
+    #[test]
+    fn a_catalog_answers_for_one_database_at_a_time() {
+        let one = Database::new(DatabaseId(1), "One");
+        let two = Database::new(DatabaseId(2), "Two");
+        let mut catalog = DatabaseCatalog::default();
+        catalog.databases = vec![one.clone(), two.clone()];
+        catalog.properties = vec![
+            one.title_property(PropertyId(1)),
+            two.title_property(PropertyId(2)),
+            Property {
+                id: PropertyId(3),
+                db: two.id,
+                name: "Status".into(),
+                kind: PropertyKind::Status,
+                config: r#"{"options":[]}"#.into(),
+                ord: OrderKey(OrderKey::FIRST.0 + 2),
+            },
+        ];
+        catalog.views = vec![one.first_view(ViewId(1)), two.first_view(ViewId(2))];
+
+        assert_eq!(catalog.database(DatabaseId(2)).map(|d| d.name.as_str()), Some("Two"));
+        assert_eq!(catalog.database(DatabaseId(9)), None);
+        assert_eq!(
+            catalog.properties_of(DatabaseId(1)).map(|p| p.id).collect::<Vec<_>>(),
+            vec![PropertyId(1)]
+        );
+        assert_eq!(
+            catalog.properties_of(DatabaseId(2)).map(|p| p.id).collect::<Vec<_>>(),
+            vec![PropertyId(2), PropertyId(3)]
+        );
+        assert_eq!(
+            catalog.title_property(DatabaseId(2)).map(|p| p.id),
+            Some(PropertyId(2))
+        );
+        assert_eq!(
+            catalog.views_of(DatabaseId(1)).map(|v| v.layout).collect::<Vec<_>>(),
+            vec![ViewLayout::Table]
+        );
+        // The list-valued column keeps its config verbatim: D1 does not read
+        // inside it (D2 does), and it never rewrites what it stores.
+        assert_eq!(
+            catalog.properties_of(DatabaseId(2)).nth(1).map(|p| p.config.as_str()),
+            Some(r#"{"options":[]}"#)
+        );
+        // A database whose title column is missing is survivable at read time:
+        // the answer is `None`, and the caller draws an empty title.
+        assert_eq!(catalog.title_property(DatabaseId(9)), None);
+    }
 }
 
 /// D0's measurement. Two windows on the same table — one that holds every row
 /// and one that holds the window — and the bytes each costs, counted on the
 /// measuring thread by a transparent global allocator.
+///
+/// Reachable from D1's probe as well (`storage::database_store`), which weighs
+/// real SQL rows instead of built ones: there is exactly one global allocator
+/// per test binary, so the counter and the arming live here and are shared.
 #[cfg(test)]
-mod probe {
+pub(crate) mod probe {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
@@ -396,8 +1080,9 @@ mod probe {
         });
     }
 
-    /// Run `f` and report what its result holds on the heap, in bytes.
-    fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    /// Run `f` and report what its result holds on the heap, in bytes. Shared
+    /// with D1's storage probe; the counter is this thread's alone.
+    pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
         LIVE.with(|live| live.set(0));
         ARMED.with(|armed| armed.set(true));
         let out = f();
@@ -513,7 +1198,7 @@ mod probe {
     /// two declarations are hand-written for the reason ADR-0025 gives (one
     /// `extern` block instead of a crate), and they live here rather than in
     /// `platform` because only a headless test asks for this.
-    mod counters {
+    pub(crate) mod counters {
         #[repr(C)]
         #[derive(Default)]
         struct ProcessMemoryCounters {

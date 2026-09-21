@@ -2,7 +2,7 @@
 // (ADR-0012). One call, one transaction: `apply` and `replace_all` are
 // atomic — an intermediate state is never observable (SPEC §十八).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, Transaction};
@@ -16,6 +16,7 @@ use crate::core::types::{
 use super::backup::{self, OpenReport};
 use super::data_location;
 use super::database::{ord_from_db, ord_to_db, Database};
+use super::database_store;
 use super::search_index::{self, Match, SearchRequest};
 
 pub struct SqliteRepository {
@@ -366,6 +367,14 @@ impl Repository for SqliteRepository {
         // still rejects any dangling reference or cycle atomically.
         tx.pragma_update(None, "defer_foreign_keys", "ON")
             .map_err(sql)?;
+        // The database layer (SPEC §三十九) is not part of the state this call
+        // replaces, and `DELETE FROM pages` below cascades through
+        // `db_records.page` (ADR-0063). So it is read out first and written back
+        // after the new state is in — which is ADR-0066's rule: the layer
+        // survives the bulk path, except where it hangs off a page the incoming
+        // state dropped, and then the record goes with its page exactly as it
+        // does on the ordinary delete path.
+        let databases = database_store::snapshot_tables(&tx)?;
         tx.execute("DELETE FROM blocks", []).map_err(sql)?; // cascades block_children
         tx.execute("DELETE FROM pages", []).map_err(sql)?; // cascades child pages + blocks
         tx.execute("DELETE FROM metadata", []).map_err(sql)?;
@@ -404,6 +413,12 @@ impl Repository for SqliteRepository {
         for block in &state.blocks {
             insert_block(&tx, block)?;
         }
+        let kept_pages: BTreeSet<i64> = state
+            .pages
+            .iter()
+            .map(|p| p.id.as_u64() as i64)
+            .collect();
+        database_store::restore_tables(&tx, &databases, &kept_pages)?;
         write_map(&tx, "metadata", &state.meta)?;
         write_map(&tx, "settings", &state.settings)?;
         tx.commit().map_err(sql)?;
@@ -541,8 +556,9 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
 }
 
 /// Fail loudly when a mutation targets an id that is not there: silently
-/// dropping a change would desynchronize the in-memory truth.
-fn require_hit(affected: usize, what: &str, id: u64) -> Result<(), StorageError> {
+/// dropping a change would desynchronize the in-memory truth. `pub(crate)` so
+/// `database_store`'s arms report the same way as the ones here.
+pub(crate) fn require_hit(affected: usize, what: &str, id: u64) -> Result<(), StorageError> {
     if affected == 1 {
         Ok(())
     } else {
@@ -897,5 +913,35 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 .map_err(sql)?;
             Ok(())
         }
+
+        // ─── SPEC §三十九 Database (Track 3, D1) ────────────────────────────
+        // The SQL lives in `database_store`; the match stays here, exhaustive,
+        // so a new variant is a compile error and never a silently dropped
+        // write. Each arm is one statement (or one small batch for a cell).
+        Change::DatabaseCreated(db) => database_store::insert_database(tx, db),
+        Change::DatabaseRenamed { id, name } => database_store::rename_database(tx, *id, name),
+        Change::DatabaseDeleted { id } => database_store::delete_database(tx, *id),
+        Change::PropertyAdded(property) => database_store::insert_property(tx, property),
+        Change::PropertyRenamed { id, name } => database_store::rename_property(tx, *id, name),
+        Change::PropertyKindSet { id, kind } => database_store::set_property_kind(tx, *id, *kind),
+        Change::PropertyOrdSet { id, ord } => database_store::set_property_ord(tx, *id, *ord),
+        Change::PropertyDeleted { id } => database_store::delete_property(tx, *id),
+        Change::RecordCreated(record) => database_store::insert_record(tx, record),
+        Change::RecordOrdSet { id, ord } => database_store::set_record_ord(tx, *id, *ord),
+        Change::RecordPageSet { id, page } => database_store::set_record_page(tx, *id, *page),
+        Change::RecordDeleted { id } => database_store::delete_record(tx, *id),
+        Change::CellSet {
+            record,
+            property,
+            value,
+        } => database_store::set_cell(tx, *record, *property, value),
+        Change::ViewAdded(view) => database_store::insert_view(tx, view),
+        Change::ViewRenamed { id, name } => database_store::rename_view(tx, *id, name),
+        Change::ViewLayoutSet { id, layout } => database_store::set_view_layout(tx, *id, *layout),
+        Change::ViewDefinitionSet { id, definition } => {
+            database_store::set_view_definition(tx, *id, definition)
+        }
+        Change::ViewOrdSet { id, ord } => database_store::set_view_ord(tx, *id, *ord),
+        Change::ViewDeleted { id } => database_store::delete_view(tx, *id),
     }
 }

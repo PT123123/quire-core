@@ -9,6 +9,10 @@
 
 use std::fmt;
 
+use super::database::{
+    CellValue, Database, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId, View,
+    ViewId, ViewLayout,
+};
 use super::types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, OrderKey, Page,
     PageFont, PageId, PersistedState,
@@ -101,6 +105,74 @@ pub enum Change {
     /// Storage removes the settings row — the real replacement for
     /// settings_store's empty-value tombstone (M8_FEEDBACK #1).
     SettingDelete { key: String },
+
+    // ─── SPEC §三十九 Database (Track 3, D1) ─────────────────────────────────
+    //
+    // The database layer's write path, appended at the end of the enum like
+    // every variant before it: nothing here renumbers, and an id is an id.
+    // One `apply` is one transaction (SPEC §十八), which is what makes a record
+    // and its page one undo step: the command layer plans `apply` and `revert`
+    // as change lists (`core::document::Entry`), and storage never has to know
+    // which direction it is running in.
+    /// A new database entity (ADR-0060). ADR-0061 says a database that cannot
+    /// be drawn is one no path may create, so the caller writes this together
+    /// with its `title` property and its first view (`Database::title_property`
+    /// / `first_view`) in the same batch.
+    DatabaseCreated(Database),
+    DatabaseRenamed { id: DatabaseId, name: String },
+    /// Storage deletes the entity; its properties, views, records, values and
+    /// list items all cascade (ADR-0061/0062/0063/0064). The pages its records
+    /// own do **not**: a page is owned by a record, never by the database
+    /// (ADR-0063), so a page the user made survives the database that showed it.
+    DatabaseDeleted { id: DatabaseId },
+
+    PropertyAdded(Property),
+    PropertyRenamed { id: PropertyId, name: String },
+    /// The column's type. The values already stored are left exactly where they
+    /// are — a kind change is not a conversion, and casting a column's values
+    /// is D2's, with its own rules per type pair. Nothing double-writes.
+    PropertyKindSet { id: PropertyId, kind: PropertyKind },
+    PropertyOrdSet { id: PropertyId, ord: OrderKey },
+    /// Storage deletes the column and every value stored in it (`ON DELETE
+    /// CASCADE`, ADR-0062). View documents that name the id are JSON, which no
+    /// foreign key can reach: ADR-0064's compiler drops an unknown id instead.
+    PropertyDeleted { id: PropertyId },
+
+    /// A new row. `page` is `None` for a bare record — ADR-0063's lazy page:
+    /// creating a row creates no page, and a page arrives when someone opens
+    /// the row.
+    RecordCreated(Record),
+    RecordOrdSet { id: RecordId, ord: OrderKey },
+    /// Point the record at a page, or clear the pointer. Opening a record is
+    /// this plus the `PageCreated` and the title move in the same batch; its
+    /// inverse ("Turn into a plain record") moves the title back and leaves the
+    /// page in the tree — that operation is about the pointer (ADR-0063).
+    RecordPageSet { id: RecordId, page: Option<PageId> },
+    /// Storage deletes the row and its values. A page the record owned is *not*
+    /// deleted here: ADR-0063's delete plans `[DbValueDeleted…, RecordDeleted,
+    /// PageDeleted?]`, and keeping the two separate is what lets one `revert`
+    /// put back exactly what was there.
+    RecordDeleted { id: RecordId },
+    /// One cell, in ADR-0062's stored shape. `Empty` removes the row (and any
+    /// items) rather than writing a blank: absence is the one representation of
+    /// empty, so a number cell is never `0` and a text cell the user cleared is
+    /// `Text("")`, which is a row.
+    CellSet {
+        record: RecordId,
+        property: PropertyId,
+        value: CellValue,
+    },
+
+    ViewAdded(View),
+    ViewRenamed { id: ViewId, name: String },
+    ViewLayoutSet { id: ViewId, layout: ViewLayout },
+    /// The view's rules — filter, sorts, groups, visible columns, widths — as
+    /// one JSON document, replaced whole (ADR-0064). Replaced rather than
+    /// merged: the document is the view's own truth, and merging it in storage
+    /// would put the compiler's shape in two places.
+    ViewDefinitionSet { id: ViewId, definition: String },
+    ViewOrdSet { id: ViewId, ord: OrderKey },
+    ViewDeleted { id: ViewId },
 }
 
 /// Every attachment id a change list points at, read off the arm that carries

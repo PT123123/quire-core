@@ -86,6 +86,7 @@ fn page() -> Page {
         icon: String::new(),
         cover: None,
         locked: false,
+        template: false,
     }
 }
 
@@ -322,6 +323,38 @@ fn export_empty_page_is_an_empty_file() {
     assert_eq!(export_page(&[]), "");
 }
 
+/// A block with nothing written on it is still a block. The case that found
+/// this is a template's empty bullet — "leave a row open for somebody to fill
+/// in" is the whole point of a preset (SPEC §三十八) — and a bare marker is
+/// what the importer reads back as the same empty block, which is the same
+/// choice an empty heading already made. Writing nothing instead deleted a row
+/// from the page, breaking §二十六's own promise that re-importing yields the
+/// same block list.
+#[test]
+fn an_empty_block_exports_its_bare_marker_and_comes_back_as_itself() {
+    for kind in [
+        BlockKind::Bullet,
+        BlockKind::Numbered,
+        BlockKind::Todo,
+        BlockKind::Quote,
+        BlockKind::Heading2,
+    ] {
+        let md = export_page(&[block(1, kind, "")]);
+        assert!(
+            !md.ends_with(" \n"),
+            "{kind:?} left a trailing space after its marker: {md:?}"
+        );
+        let back = parse_markdown(&md);
+        assert_eq!(back.len(), 1, "{kind:?} vanished from its own export: {md:?}");
+        assert_eq!(
+            back[0].kind, kind,
+            "{md:?} was written for {kind:?} and read back as {:?}",
+            back[0].kind
+        );
+        assert!(back[0].text.is_empty(), "{md:?} invented text");
+    }
+}
+
 #[test]
 fn export_always_ends_with_exactly_one_newline() {
     let cases: Vec<Vec<Block>> = vec![
@@ -492,7 +525,8 @@ fn a_fence_info_string_is_the_language_it_comes_back_with() {
     assert_eq!(parse_markdown(&again), parsed, "and reads back the same");
 }
 
-#[test]fn import_chinese_survives_unchanged() {
+#[test]
+fn import_chinese_survives_unchanged() {
     let src =
         "## 写作与中文测试\n\n中文段落用于验证字体回退与行高。\n- 检查行高\n- [x] 完成引号方向\n";
     let parsed = parse_markdown(src);
@@ -531,6 +565,7 @@ fn import_emits_page_created_then_one_block_per_line_with_injected_ids() {
             icon: String::new(),
             cover: None,
             locked: false,
+            template: false,
         })
     );
 

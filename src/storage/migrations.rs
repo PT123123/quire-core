@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 13;
+pub const CURRENT_VERSION: i32 = 14;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -219,6 +219,20 @@ CREATE TABLE IF NOT EXISTS attachments (
     // editor has no way to show that honestly.
     sql: "",
     backfill: Some(add_page_locked_column),
+}, Migration {
+    version: 14,
+    label: "page template",
+    // SPEC §三十八 "模板": §三十八 refuses a second content format for a
+    // template, so a template is stored as a page whose block sequence is a body
+    // to copy from, and this column is the only thing that says so. `0` for
+    // every existing row is the whole migration — a v13 library opens with no
+    // templates, and the built-in ones arrive on the next start (see
+    // `core::template` and the seeding guard in `app::state`), *not* here: a
+    // migration that wrote block rows itself would have to keep the order keys,
+    // the `block_children` rows and both FTS indexes in step by hand, when the
+    // app already has one pipeline that does all three.
+    sql: "",
+    backfill: Some(add_page_template_column),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -263,6 +277,19 @@ fn add_page_locked_column(conn: &mut Connection) -> Result<(), StorageError> {
     add_page_columns(
         conn,
         &[("locked", "ALTER TABLE pages ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")],
+    )
+}
+
+/// Migration 14 body. Shaped exactly like migration 13's for the same reason:
+/// "not a template" is a value, so the `ADD COLUMN` needs no backfill statement
+/// and the step stays a no-op for every page already in the library.
+fn add_page_template_column(conn: &mut Connection) -> Result<(), StorageError> {
+    add_page_columns(
+        conn,
+        &[(
+            "template",
+            "ALTER TABLE pages ADD COLUMN template INTEGER NOT NULL DEFAULT 0",
+        )],
     )
 }
 

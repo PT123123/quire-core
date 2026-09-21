@@ -28,6 +28,7 @@ fn page(id: u64, title: &str) -> Page {
         icon: String::new(),
         cover: None,
         locked: false,
+        template: false,
     }
 }
 
@@ -357,7 +358,80 @@ fn an_aborted_batch_leaves_the_index_untouched() {
     assert_eq!(hits(&repo, "quick"), ["Getting Started 起步"]);
 }
 
+// ── templates (SPEC §三十八) ────────────────────────────────────────
+
+/// A template's rows are indexed exactly like a page's — §三十八 forbids a
+/// second content format, and `upsert_block` has no idea what kind of page a
+/// block belongs to — so the exclusion lives on the read side, as one term on
+/// the join back to `pages`. This test pins both halves of that claim: the rows
+/// really are in the index (a raw count, which no join can hide), and the same
+/// words on an ordinary page are what answers. Then the file is rolled back to
+/// before the index existed and rebuilt from the rows, which is the second door
+/// the read has to keep closed.
+#[test]
+fn a_template_is_indexed_and_never_found() {
+    let dir = ScratchDir::new("search-template");
+    let path = dir.join("lib.db");
+    {
+        let repo = Arc::new(SqliteRepository::open(&path).unwrap());
+        seed(&repo);
+        let mut body = page(3, "Meeting notes");
+        body.template = true;
+        repo.apply(&[
+            Change::PageCreated(body),
+            // the same sentence block 20 carries, on a page nobody can open
+            Change::BlockInserted(block(30, 3, "the renderer planning for this quarter")),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            hits(&repo, "renderer"),
+            ["Design notes"],
+            "a body with identical words answered"
+        );
+        assert!(hits(&repo, "Meeting").is_empty(), "so did its own title");
+        drop(repo);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let filed = |conn: &rusqlite::Connection| {
+            conn.query_row(
+                "SELECT count(*) FROM search_blocks WHERE text LIKE '%planning%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            filed(&conn),
+            2,
+            "control: both rows are in the index, so the answers above are the join's doing"
+        );
+        // Pretend the file predates the index, the way migration v2 finds it,
+        // and let the reopen backfill every row from `pages` and `blocks`.
+        conn.execute_batch(
+            "DROP TABLE search_pages;
+             DROP TABLE search_blocks;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let repo = Arc::new(SqliteRepository::open(&path).unwrap());
+        assert_eq!(hits(&repo, "renderer"), ["Design notes"], "after a rebuild the body is still unfindable");
+        assert!(hits(&repo, "Meeting").is_empty());
+        drop(repo);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            filed(&conn),
+            2,
+            "and the rebuild filed both rows again — the read, not the write, is the door"
+        );
+    }
+}
+
 // ── migration ───────────────────────────────────────────────────────
+
 
 #[test]
 fn a_v1_database_is_backfilled_on_upgrade() {

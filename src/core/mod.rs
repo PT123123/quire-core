@@ -9,6 +9,7 @@ pub mod history;
 pub mod icon;
 pub mod math;
 pub mod persistence;
+pub mod template;
 pub mod types;
 
 pub use command::{exec, plan, redo, undo, Command};

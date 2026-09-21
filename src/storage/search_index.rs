@@ -245,8 +245,24 @@ pub struct Match {
     pub score: f64,
 }
 
-/// Ranked raw matches, best first. Titles and blocks come from their own
-/// FTS table, joined back to `pages`/`blocks` for the unsegmented text.
+/// Ranked raw matches, best first.
+///
+/// The `p.template = 0` term in the join is the whole search side of the
+/// template feature (SPEC §三十八 "模板"), and it is on the read path rather
+/// than the write path on purpose. A template's rows stay *indexed*: excluding
+/// them at insert time would mean `insert_block` has to ask whether the page it
+/// is filing a block under is a template, which is a second source of truth
+/// about a fact one join already has -- and `rebuild` would have to disagree
+/// with `insert` about which rows belong in the index, or a template would start
+/// appearing in search after a rebuild. One term on the join keeps a template
+/// unfindable from both doors.
+///
+/// Titles and blocks come from their own FTS table, joined back to
+/// `pages`/`blocks` for the unsegmented text.
+///
+/// # Errors
+/// Returns [`StorageError`] when the query cannot be prepared or a row cannot be
+/// read.
 pub fn matches(conn: &Connection, req: &SearchRequest) -> Result<Vec<Match>, StorageError> {
     let Some(expr) = build_match(&req.query) else {
         return Ok(Vec::new());
@@ -270,7 +286,7 @@ pub fn matches(conn: &Connection, req: &SearchRequest) -> Result<Vec<Match>, Sto
                 ORDER BY score
                 LIMIT ?2
              ) AS h
-             JOIN pages AS p ON p.id = h.page_id
+             JOIN pages AS p ON p.id = h.page_id AND p.template = 0
              LEFT JOIN blocks AS b ON b.id = h.block
              ORDER BY h.score
              LIMIT ?2",

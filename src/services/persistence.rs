@@ -393,6 +393,7 @@ mod tests {
             icon: String::new(),
             cover: None,
             locked: false,
+            template: false,
         })
     }
 

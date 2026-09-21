@@ -32,6 +32,7 @@ fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
         icon: String::new(),
         cover: None,
         locked: false,
+        template: false,
     }
 }
 
@@ -1027,6 +1028,7 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         icon: "\u{1f6f0}".into(),
         cover: Some(AttachmentId(42)),
         locked: false,
+        template: false,
     })])
     .unwrap();
     let page = repo.load().unwrap().pages.remove(0);
@@ -1141,6 +1143,112 @@ fn the_v13_step_adds_the_page_lock_to_a_v12_database() {
         page.title, "Renamed",
         "the lock is one column of the page, not a shadow over the rest of it"
     );
+}
+
+/// Schema v14 (SPEC §三十八 "模板"): the template flag is one column on the
+/// page row, because a template *is* a page whose block sequence is a body to
+/// copy from — §三十八 forbids a second content format, so there is no template
+/// table to create and nothing to backfill. `DEFAULT 0` is what makes the step
+/// safe: an old library's every page reads as "a page" the moment it loads, and
+/// a half-migrated file (column read as NULL by a hand-edited row) still answers
+/// false rather than hiding a page nobody marked as a body.
+#[test]
+fn the_v14_step_adds_the_template_flag_to_a_v13_database() {
+    let dir = tempfile();
+    let path = dir.join("template.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pages DROP COLUMN template;
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon,
+                                cover, locked)
+             VALUES (1, 'Old', NULL, 1, 0, 0, '', 0, '', NULL, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 13);
+        // control: the column really is gone, or the step never ran and the 0
+        // below is just what a missing read happens to return
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'template'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no template column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        let template: i64 = conn
+            .query_row("SELECT template FROM pages WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(template, 0, "a page from before the flag is a page");
+        // The lock the previous step wrote survives this one, and so does the
+        // rest: one column is added, none are rewritten.
+        let (locked, cover): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT locked, cover FROM pages WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((locked, cover), (1, None), "a locked page stays locked");
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let loaded = |id: u64| {
+        repo.load()
+            .unwrap()
+            .pages
+            .into_iter()
+            .find(|p| p.id == PageId(id))
+    };
+    assert_eq!(loaded(1).map(|p| p.template), Some(false));
+
+    // The flag reaches the database through the page's own insert, which is the
+    // only way it is ever set: `create_template` writes the row and never
+    // attaches it, and there is deliberately no "make this page a template now"
+    // change, because a page you can open is not a body to copy from.
+    let mut body = page(2, "Meeting notes", None, 2 << 32);
+    body.template = true;
+    repo.apply(&[
+        Change::PageCreated(body),
+        Change::BlockInserted(block(20, 2, None, 1, "Agenda")),
+        Change::BlockInserted(block(21, 2, None, 2, "")),
+    ])
+    .unwrap();
+    assert_eq!(
+        loaded(2).map(|p| p.template),
+        Some(true),
+        "the template flag survives a reopen"
+    );
+    assert_eq!(loaded(1).map(|p| p.template), Some(false));
+    let state = repo.load().unwrap();
+    assert_eq!(
+        state
+            .blocks
+            .iter()
+            .filter(|b| b.page == PageId(2))
+            .count(),
+        2,
+        "and its body is stored as ordinary rows"
+    );
+    // A template has no parent and lands in no one's children list; the load
+    // path must not invent a slot for it, or the tree walk shows the body.
+    assert_eq!(state.pages.iter().find(|p| p.id == PageId(2)).unwrap().parent, None);
 }
 
 #[test]

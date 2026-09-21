@@ -79,9 +79,17 @@ fn handle_connection(stream: TcpStream, repo: &Arc<SqliteRepository>) -> std::io
             let Ok(state) = repo.load() else {
                 return respond(&stream, 500, "workspace load failed");
             };
-            let ids: Vec<i64> = state.pages.iter().map(|p| p.id.0 as i64).collect();
+            // Templates are excluded from every page listing, and this is one
+            // of them (SPEC §三十八): the LAN share is somebody else reading
+            // over the wall, and a template is a body to copy from, not a page.
+            let ids: Vec<i64> = state
+                .pages
+                .iter()
+                .filter(|p| !p.template)
+                .map(|p| p.id.0 as i64)
+                .collect();
             let mut out = String::new();
-            for p in &state.pages {
+            for p in state.pages.iter().filter(|p| !p.template) {
                 let parent_note = match p.parent {
                     Some(pid) if ids.contains(&(pid.0 as i64)) => {
                         format!("\tunder #{}", pid.0)
@@ -112,6 +120,13 @@ fn handle_connection(stream: TcpStream, repo: &Arc<SqliteRepository>) -> std::io
             let Some(page) = state.pages.iter().find(|p| p.id == pid) else {
                 return respond(&stream, 404, "no such page");
             };
+            // A template answers 404 rather than its own Markdown: on the other
+            // side of the wall there is no page with that id, because the
+            // enumeration above never listed it. Answering `200` here would let
+            // `/api/pages` and `/api/page/` disagree about what exists.
+            if page.template {
+                return respond(&stream, 404, "no such page");
+            }
             let blocks: Vec<crate::core::Block> = state
                 .blocks
                 .iter()
@@ -145,7 +160,13 @@ pub fn frame_workspace(state: &crate::core::PersistedState) -> String {
         let mut kids: Vec<&crate::core::Page> = state
             .pages
             .iter()
-            .filter(|p| p.parent == parent)
+            // The third of the three LAN doors, and the one that would have
+            // leaked: a template has no parent, so it walks in as a root here
+            // unless the filter says otherwise. `/api/export` is a whole-workspace
+            // read, so a template would land on the other machine as an ordinary
+            // page -- and `unframe_workspace` has no way to say "template", which
+            // is exactly the second content format §三十八 forbids.
+            .filter(|p| p.parent == parent && !p.template)
             .collect();
         kids.sort_by_key(|p| p.order);
         for p in kids {
@@ -244,8 +265,17 @@ mod tests {
             icon: String::new(),
             cover: None,
             locked: false,
+            template: false,
         };
-        state.pages.push(page);
+        state.pages.push(page.clone());
+        // A template is the same kind of row in the same two tables with one
+        // column flipped (SPEC §三十八 "模板的表示必须是「块序列的副本」"), so each
+        // of the three reads below has to name it back out of the answer.
+        let mut body = page;
+        body.id = PageId(8);
+        body.title = "Meeting notes".into();
+        body.template = true;
+        state.pages.push(body);
         state.blocks.push(Block {
             id: BlockId(1),
             page: PageId(7),
@@ -263,6 +293,14 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
+        });
+        let shared_row = state.blocks[0].clone();
+        state.blocks.push(Block {
+            id: BlockId(2),
+            page: PageId(8),
+            text: "a body to copy from".into(),
+            marks: Vec::new(),
+            ..shared_row
         });
         state.settings.insert("theme".into(), "dark".into());
         repo.replace_all(&state).unwrap();
@@ -313,6 +351,57 @@ mod tests {
 
         let (status, _) = get(port, "/api/page/999.md");
         assert_eq!(status, 404);
+    }
+
+    /// The three doors a share opens (SPEC §三十八 excludes a template from
+    /// every page listing, and the LAN share is a page listing): the id list,
+    /// one page's Markdown, and the whole-workspace export a client pulls. The
+    /// third is the one that would have leaked silently, because a template has
+    /// no parent and so walks in as a root of the framing tree.
+    ///
+    /// The control is the ordinary page: it sits in the same two tables, so a
+    /// read that names it and not the body is the filter working rather than the
+    /// data being missing.
+    #[test]
+    fn a_template_is_out_of_every_lan_read() {
+        let (port, repo) = spawn_server();
+        let state = repo.load().unwrap();
+        assert!(
+            state.pages.iter().any(|p| p.id == PageId(8) && p.template),
+            "control: the body is a page row in the database the server reads"
+        );
+        assert!(
+            state.blocks.iter().any(|b| b.page == PageId(8)),
+            "and it has rows that could be leaked"
+        );
+        drop(state);
+
+        let (status, body) = get(port, "/api/pages");
+        assert_eq!(status, 200);
+        assert!(body.contains("7\tShared page"), "the page is listed: {body}");
+        assert!(
+            !body.contains("8\tMeeting notes"),
+            "the body is not: {body}"
+        );
+
+        let (status, body) = get(port, "/api/page/8.md");
+        assert_eq!(
+            status,
+            404,
+            "a template has no page over the wall, so it cannot be fetched by id: {body}"
+        );
+
+        let (status, body) = get(port, "/api/export");
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("Shared page"),
+            "control: the export framed the page that is in the tree"
+        );
+        assert!(
+            !body.contains("Meeting notes") && !body.contains("a body to copy from"),
+            "and never mentions the one that is not: {body}"
+        );
+        assert_eq!(unframe_workspace(&body).len(), 1, "one page crossed the wall");
     }
 
     #[test]

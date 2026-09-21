@@ -380,6 +380,7 @@ mod tests {
             icon: String::new(),
             cover: None,
             locked: false,
+            template: false,
         });
         state.settings.insert("theme".into(), "dark".into());
         state.meta.insert("last.page".into(), "1".into());

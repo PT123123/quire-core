@@ -553,6 +553,17 @@ pub struct Page {
     /// gate that honours it is the one funnel every block command passes.
     /// `false` is the whole migration: a v12 library opens with nothing locked.
     pub locked: bool,
+    /// This page is a **template** (SPEC §三十八 "模板"): its block sequence is a
+    /// body to copy *from*, not a page anybody reads. §三十八 forbids a second
+    /// content format for a template, so the body is stored the way every other
+    /// page's body is stored — ordinary rows in `blocks` — and what makes it a
+    /// template is this one column: a template page is never attached to the
+    /// tree, so it appears nowhere a page is listed (sidebar, search, palette,
+    /// the Move-to walks, the LAN export), while `repo.load()` still brings its
+    /// blocks in and copying them needs no new code path at all.
+    /// `false` is the whole migration again: a v13 library opens with no
+    /// templates, and the built-in ones land on the next start.
+    pub template: bool,
 }
 
 /// Full state as loaded from (or checkpointed to) storage. Vecs are in no
@@ -641,7 +652,8 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_distinct_types() {        // compile-time intent: PageId and BlockId never mix accidentally
+    fn ids_are_distinct_types() {
+        // compile-time intent: PageId and BlockId never mix accidentally
         let p = PageId(7);
         let b = BlockId(7);
         assert_eq!(p.as_u64(), b.as_u64());

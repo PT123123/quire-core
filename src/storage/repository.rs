@@ -169,7 +169,7 @@ impl Repository for SqliteRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, title, parent, ord, favorite, expanded, font, layout, icon,
-                            cover, locked FROM pages",
+                            cover, locked, template FROM pages",
                 )
                 .map_err(sql)?;
             let rows = stmt
@@ -186,12 +186,24 @@ impl Repository for SqliteRepository {
                         r.get::<_, String>(8)?,
                         r.get::<_, Option<i64>>(9)?,
                         r.get::<_, Option<i64>>(10)?,
+                        r.get::<_, Option<i64>>(11)?,
                     ))
                 })
                 .map_err(sql)?;
             for row in rows {
                 let (
-                    id, title, parent, ord, favorite, expanded, font, layout, icon, cover, locked,
+                    id,
+                    title,
+                    parent,
+                    ord,
+                    favorite,
+                    expanded,
+                    font,
+                    layout,
+                    icon,
+                    cover,
+                    locked,
+                    template,
                 ) = row.map_err(sql)?;
                 pages.push(Page {
                     id: PageId(id as u64),
@@ -214,6 +226,11 @@ impl Repository for SqliteRepository {
                     // business, and failing to load the library over a NULL
                     // would be the worse of the two mistakes
                     locked: db_to_bool(locked.unwrap_or(0)),
+                    // read like `locked`: absent or NULL means an ordinary page,
+                    // so a half-migrated library loses a template rather than
+                    // refusing to load (and a template that reads as a page is
+                    // visible, which is loud, not silent)
+                    template: db_to_bool(template.unwrap_or(0)),
                 });
             }
         }
@@ -488,8 +505,8 @@ fn write_map(
 fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon, cover,
-                            locked)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            locked, template)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             page.id.as_u64() as i64,
             page.title,
@@ -502,6 +519,7 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
             page.icon,
             page.cover.map(|a| a.as_u64() as i64),
             bool_to_db(page.locked),
+            bool_to_db(page.template),
         ],
     )
     .map_err(sql)?;

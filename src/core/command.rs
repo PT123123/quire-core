@@ -30,6 +30,25 @@ pub enum Command {
     AppendBlock { kind: BlockKind, text: String },
     /// Deep copy of one block (flat model: no subtree) right after it.
     DuplicateBlock { id: BlockId },
+    /// Land a **forest** of blocks read from somewhere else — a template's
+    /// block sequence (SPEC §三十八) — directly after `anchor`, keeping the
+    /// subtree each root owns. `blocks` is the source's own display order; its
+    /// ids, `page` and order keys are dropped here, because the copy is a new
+    /// set of rows in a new page. This is what makes "insert template" the same
+    /// operation as "copy a block sequence" rather than a second content format:
+    /// the input is ordinary `Block`s, so every field a block can carry (marks,
+    /// colors, todo state, code language, attachment, a table's grid, a
+    /// columns' layout) rides over without this command knowing about it.
+    /// One undo step. Parent links that point inside the copy are remapped to
+    /// the fresh ids; links that point outside it become top level, which is
+    /// what a truncated copy should mean. Folds are cleared, because a fold is
+    /// view state: a template left folded would insert content and hide it.
+    /// `anchor: None` is the same front door `AppendBlock` has: a page with no
+    /// row to point at, which is what a brand-new page from a template is.
+    InsertForest {
+        anchor: Option<BlockId>,
+        blocks: Vec<Block>,
+    },
     SetBlockType { id: BlockId, kind: BlockKind },
     ToggleTodoChecked { id: BlockId },
     /// Move one slot up (-1) / down (+1) among the page's blocks.
@@ -987,6 +1006,65 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 // one delete is enough: storage cascades to the copy's cells
                 apply,
                 revert: vec![Change::BlockDeleted { id: new_id }],
+            })
+        }
+
+        Command::InsertForest { anchor, blocks } => {
+            if blocks.is_empty() {
+                return None;
+            }
+            let ids: HashSet<BlockId> = blocks.iter().map(|b| b.id).collect();
+            if ids.len() != blocks.len() {
+                // two source blocks with one id would remap onto themselves
+                return None;
+            }
+            // Where the run lands, and who owns its top level. The rules are
+            // `InsertBlockAfter`'s, and for the same reasons: a container's row
+            // *is* its subtree, so a copy lands after the whole of it rather
+            // than between it and its own cells; and a copy is a page-level
+            // body, so it does not go inside a table cell or a column box --
+            // `SetBlockType` already refuses to build a second container where
+            // one is drawn, and a grid inside a delegate row would be the same
+            // broken shape arriving by a different door.
+            let (slot, parent) = match anchor {
+                Some(a) => {
+                    if inside_container(doc, a) {
+                        return None;
+                    }
+                    let end = doc.index_of(page, subtree(doc, page, a).last()?.id)?;
+                    (Some(end), doc.block(a)?.parent)
+                }
+                None => (doc.page_blocks(page).len().checked_sub(1), None),
+            };
+            let hi = slot.map(|s| s + 1);
+            let fresh: Vec<BlockId> = blocks.iter().map(|_| doc.alloc_block_id()).collect();
+            let remap: HashMap<BlockId, BlockId> =
+                blocks.iter().zip(&fresh).map(|(b, n)| (b.id, *n)).collect();
+            let keys = keys_in_gaps(doc, page, &[(slot, hi, blocks.len())])?;
+            let mut apply = Vec::with_capacity(blocks.len());
+            let mut roots: Vec<BlockId> = Vec::new();
+            for (src, (new_id, order)) in blocks.iter().zip(fresh.iter().zip(&keys[0])) {
+                let owned = src.parent.and_then(|p| remap.get(&p).copied());
+                let parent = owned.or(parent);
+                let mut copy = src.clone();
+                copy.id = *new_id;
+                copy.page = page;
+                copy.order = *order;
+                copy.parent = parent;
+                copy.folded = false;
+                if owned.is_none() {
+                    roots.push(*new_id);
+                }
+                apply.push(Change::BlockInserted(copy));
+            }
+            Some(Entry {
+                apply,
+                // one delete per root is enough: deleting a container cascades
+                // to its subtree, which is where the cells and columns go
+                revert: roots
+                    .into_iter()
+                    .map(|id| Change::BlockDeleted { id })
+                    .collect(),
             })
         }
 
@@ -3049,5 +3127,180 @@ mod tests {
         // the whole layout is above it, the next paragraph below
         assert_eq!(blocks[slot - 1].parent, Some(boxes(&doc, page, ids[0])[1].id));
         assert_eq!(blocks[slot + 1].id, ids[1]);
+    }
+
+    /// The command behind "insert a template" (SPEC §三十八 "模板的表示必须是「块
+    /// 序列的副本」"). The fixture is a *second page* holding a heading, a bullet
+    /// under it, and a paragraph after it — which is the shape a saved template
+    /// really has, read straight off its own row set — because the only thing
+    /// worth proving about a copy is that the shape survives being copied: fresh
+    /// ids, the child still pointing at *its* new parent rather than at the
+    /// original's, and one Ctrl+Z taking all three rows back together.
+    #[test]
+    fn a_forest_copy_keeps_its_shape_and_undoes_as_one_step() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let make = |doc: &mut Document,
+                    page: PageId,
+                    parent: Option<BlockId>,
+                    order: OrderKey,
+                    kind: BlockKind,
+                    text: &str,
+                    folded: bool| Block {
+            id: doc.alloc_block_id(),
+            page,
+            parent,
+            order,
+            kind,
+            text: text.into(),
+            checked: false,
+            marks: Vec::new(),
+            color: ColorKind::Default,
+            background: ColorKind::Default,
+            page_ref: None,
+            folded,
+            attachment: None,
+            img_percent: 100,
+            columns: 0,
+            lang: Lang::Plain,
+        };
+        // the template's body, on its own page, in display order. The keys
+        // ascend because that is what a page's rows really look like: a parent
+        // and its child sharing a key would sort either way, and the fixture
+        // would be proving a coin flip.
+        let tpl = PageId(7);
+        let o1 = OrderKey::between(None, None).unwrap();
+        let o2 = OrderKey::between(Some(o1), None).unwrap();
+        let o3 = OrderKey::between(Some(o2), None).unwrap();
+        let head = make(&mut doc, tpl, None, o1, BlockKind::Toggle, "Agenda", true);
+        let kid = make(&mut doc, tpl, Some(head.id), o2, BlockKind::Bullet, "- owner — item", false);
+        let tail = make(&mut doc, tpl, None, o3, BlockKind::Paragraph, "Notes", false);
+        let source = vec![head.id, kid.id, tail.id];
+        doc.set_page_blocks(tpl, vec![head, kid, tail]);
+        let src = doc.page_blocks(tpl).to_vec();
+        assert_eq!(src.len(), 3, "the template page reads as three rows");
+
+        let changes = exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertForest { anchor: Some(ids[0]), blocks: src },
+        )
+        .expect("a copy lands on a page with rows to land among");
+        let copies: Vec<BlockId> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::BlockInserted(b) => Some(b.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies.len(), 3, "one change per row, and nothing else");
+        assert!(
+            copies.iter().all(|id| !source.contains(id)),
+            "a copy that shared an id with its source would be the same row twice"
+        );
+
+        let blocks = doc.page_blocks(page);
+        assert_eq!(blocks.len(), 6);
+        // it arrived where the anchor asked: after that row's whole subtree,
+        // before the next top-level one
+        assert_eq!(blocks[0].id, ids[0]);
+        assert_eq!(blocks[1].id, copies[0]);
+        assert_eq!(blocks[3].id, copies[2]);
+        assert_eq!(blocks[4].id, ids[1]);
+
+        let copied_head = doc.block(copies[0]).unwrap();
+        let copied_kid = doc.block(copies[1]).unwrap();
+        assert_eq!(copied_head.parent, None, "the forest's first root stays a root");
+        assert_eq!(
+            copied_kid.parent,
+            Some(copied_head.id),
+            "the bullet follows *its* heading, not the one it was copied from"
+        );
+        assert!(
+            blocks[1..4].iter().all(|b| b.page == page),
+            "a row that says it lives on another page would be filed out of the document"
+        );
+        assert!(!copied_head.folded, "a folded toggle would arrive hiding its own children");
+
+        // the template is not consumed by being used
+        assert_eq!(doc.page_blocks(tpl).len(), 3);
+
+        // one step back takes the whole copy with it — not eleven of twelve rows
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(
+            doc.page_blocks(page).iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[1], ids[2]],
+            "one undo step, which is the whole reason this is one command"
+        );
+        assert_eq!(doc.page_blocks(tpl).len(), 3, "undo is not allowed to eat the library");
+        redo(&mut doc, &mut hist, page);
+        assert_eq!(doc.page_blocks(page).len(), 6, "and the step can be taken again");
+    }
+
+    /// The three shapes `InsertForest` answers `None` to. Each is a case where
+    /// applying the command would leave the document in a state the projection
+    /// cannot draw, so the refusal has to be at the plan, before any id is
+    /// minted. The control at the end is the load-bearing part: the same forest
+    /// with a legal anchor does land, so a `None` above means the anchor or the
+    /// list, not a broken fixture.
+    #[test]
+    fn a_forest_copy_refuses_what_it_cannot_land() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let src = {
+            let mut v = doc.page_blocks(page).to_vec();
+            v[0].text = "copied".into();
+            v
+        };
+
+        assert!(
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::InsertForest { anchor: Some(ids[0]), blocks: Vec::new() }
+            )
+            .is_none(),
+            "an empty sequence has nothing to insert"
+        );
+
+        let mut dupe = src.clone();
+        let id = dupe[1].id;
+        dupe[2].id = id;
+        assert!(
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::InsertForest { anchor: Some(ids[0]), blocks: dupe }
+            )
+            .is_none(),
+            "two source rows sharing an id would both remap onto one copy"
+        );
+
+        // a cell's row is drawn inside its grid, and a second container in a
+        // delegate row is the shape `SetBlockType` already refuses to build
+        labeled_table(&mut doc, &mut hist, page, ids[0]);
+        let cell = cells(&doc, page, ids[0])[0].id;
+        assert!(
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::InsertForest { anchor: Some(cell), blocks: src.clone() }
+            )
+            .is_none(),
+            "a page-level body does not go inside a cell"
+        );
+
+        assert!(
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::InsertForest { anchor: Some(ids[1]), blocks: src }
+            )
+            .is_some(),
+            "control: the same forest lands on a top-level anchor"
+        );
     }
 }

@@ -18,6 +18,8 @@
 //   switching kind starts a new list and gets a blank line
 // - child blocks are indented two spaces per depth (the importer accepts and
 //   flattens that indentation)
+// - a block with no text writes its marker bare (`-`, `1.`, `>`, `#`) rather
+//   than vanishing, so it comes back as the same empty block
 // - the file ends with exactly one '\n'; an empty page exports to ""
 //
 // Inline markers in text get escaped; block markers at the start of a line do
@@ -233,7 +235,13 @@ fn render(block: &Block, number: &mut usize) -> String {
         }
         BlockKind::Numbered => {
             *number += 1;
-            format!("{}. {text}", *number)
+            // the empty item writes its number and no trailing space, like a
+            // bare heading writes its `#`
+            if text.is_empty() {
+                format!("{}.", *number)
+            } else {
+                format!("{}. {text}", *number)
+            }
         }
         // Markdown has no page-embed shape; an in-app link keeps the target
         // openable after re-import (the app resolves quire://page links).
@@ -292,7 +300,17 @@ fn heading(level: usize, text: &str) -> String {
 
 /// A multi-line block keeps its marker on every line so the whole group is
 /// recognized as one block on re-import.
+///
+/// An empty block still writes its marker (`-` alone, `>` alone), which is the
+/// same deal [`heading`] makes for an empty heading: a bare marker is the one
+/// spelling the importer reads back as the same block with no text. Dropping
+/// the line instead would delete a block the page has, and for a template an
+/// empty bullet *is* the content -- the row left open for somebody to fill in
+/// (SPEC §三十八).
 fn prefix_lines(marker: &str, text: &str) -> String {
+    if text.is_empty() {
+        return marker.trim_end().to_string();
+    }
     text.lines()
         .map(|l| format!("{marker}{l}"))
         .collect::<Vec<_>>()

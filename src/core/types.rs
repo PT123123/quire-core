@@ -543,6 +543,11 @@ pub struct Page {
     /// list changes. Empty means unset, and the sidebar then shows
     /// [`icon::initial`] of the title instead.
     pub icon: String,
+    /// The page's cover (SPEC §三十八 "图标与封面") — an attachment id, never a
+    /// path: the bytes are the attachment store's, and §三十七's reclaim has to
+    /// be able to ask who points at a file. `None` draws no band at all, so a
+    /// v11 library opens exactly as it looked before.
+    pub cover: Option<AttachmentId>,
 }
 
 /// Full state as loaded from (or checkpointed to) storage. Vecs are in no

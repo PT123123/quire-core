@@ -30,6 +30,7 @@ fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
         full_width: false,
         small_text: false,
         icon: String::new(),
+        cover: None,
     }
 }
 
@@ -918,6 +919,98 @@ fn the_v11_step_adds_the_page_icon_to_a_v10_database() {
 }
 
 #[test]
+fn the_v12_step_adds_the_page_cover_to_a_v11_database() {
+    let dir = tempfile();
+    let path = dir.join("cover.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pages DROP COLUMN cover;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon)
+             VALUES (1, 'Old', NULL, 1, 0, 0, '', 0, '')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 11);
+        // control: the column really is gone, or the step never ran and the
+        // NULL below proves nothing
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'cover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no cover column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        let cover: Option<i64> = conn
+            .query_row("SELECT cover FROM pages WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cover, None, "a page from before covers has none");
+        // the emoji the v11 step stored is still there: a new column must not
+        // disturb the old ones
+        let icon: String = conn
+            .query_row("SELECT icon FROM pages WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(icon, "");
+        migrations::ensure_current(&mut conn).unwrap();
+        migrations::check_schema(&conn).unwrap();
+    }
+    let repo = SqliteRepository::open(&path).unwrap();
+    let loaded = || {
+        repo.load()
+            .unwrap()
+            .pages
+            .into_iter()
+            .find(|p| p.id == PageId(1))
+            .unwrap()
+    };
+    assert_eq!(loaded().cover, None);
+
+    // An id, not a path: the band draws what the attachment table holds.
+    repo.apply(&[Change::PageCoverSet {
+        id: PageId(1),
+        cover: Some(AttachmentId(7)),
+    }])
+    .unwrap();
+    assert_eq!(loaded().cover, Some(AttachmentId(7)));
+    // Removing writes NULL back, so "no cover" is a stored fact and not a
+    // missing column — the reading the reclaim depends on.
+    repo.apply(&[Change::PageCoverSet {
+        id: PageId(1),
+        cover: None,
+    }])
+    .unwrap();
+    assert_eq!(loaded().cover, None);
+    repo.apply(&[Change::PageCoverSet {
+        id: PageId(1),
+        cover: Some(AttachmentId(9)),
+    }])
+    .unwrap();
+    repo.apply(&[Change::PageIconSet {
+        id: PageId(1),
+        icon: "\u{1f5bc}".into(),
+    }])
+    .unwrap();
+    let page = loaded();
+    assert_eq!(page.cover, Some(AttachmentId(9)));
+    assert_eq!(page.icon, "\u{1f5bc}", "cover and icon are separate facts");
+}
+
+#[test]
 fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
     let repo = SqliteRepository::in_memory().unwrap();
     repo.apply(&[Change::PageCreated(Page {
@@ -931,6 +1024,7 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         full_width: true,
         small_text: false,
         icon: "\u{1f6f0}".into(),
+        cover: Some(AttachmentId(42)),
     })])
     .unwrap();
     let page = repo.load().unwrap().pages.remove(0);
@@ -940,6 +1034,11 @@ fn a_page_created_with_a_look_keeps_it_through_the_insert_path() {
         "the look is written with the page, not only updated later"
     );
     assert_eq!("\u{1f6f0}", page.icon, "and so is the icon");
+    assert_eq!(
+        page.cover,
+        Some(AttachmentId(42)),
+        "and so is the cover: a page written with one must not open without it"
+    );
 }
 
 #[test]

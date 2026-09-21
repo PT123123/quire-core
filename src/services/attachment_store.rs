@@ -303,6 +303,25 @@ impl AttachmentStore {
             .ok()?;
         self.import_bytes(id, "sample-gradient", &png).ok()
     }
+
+    /// The same import, from a flat colour. The cover's contrast proof (SPEC
+    /// §二十一 over §三十八) needs the brightest picture a user can pick -- a
+    /// white one -- because that is the worst case a scrim has to carry, and a
+    /// diagonal gradient cannot stand in for it.
+    pub fn create_solid_fixture(
+        &self,
+        id: AttachmentId,
+        width: u32,
+        height: u32,
+        rgb: [u8; 3],
+    ) -> Option<Attachment> {
+        let buf = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
+        let mut png = Vec::new();
+        DynamicImage::ImageRgb8(buf)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .ok()?;
+        self.import_bytes(id, "solid-sample", &png).ok()
+    }
 }
 
 /// Name the format from the bytes themselves (the decoder figured this out

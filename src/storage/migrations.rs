@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::core::StorageError;
 
 /// The schema version this build of Quire expects.
-pub const CURRENT_VERSION: i32 = 11;
+pub const CURRENT_VERSION: i32 = 12;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -198,6 +198,16 @@ CREATE TABLE IF NOT EXISTS attachments (
     // v10 library opens with every page exactly as it looked before.
     sql: "",
     backfill: Some(add_page_icon_column),
+}, Migration {
+    version: 12,
+    label: "page cover",
+    // SPEC §三十八 "图标与封面": the picture half of a page's look, which
+    // ADR-0046 left for this column. `pages.cover` holds an attachment id — a
+    // row of §三十七's media table, not a path — because that is the only form
+    // the reclaim sweep can answer a reference to. NULL = no cover, so the
+    // default is the whole migration and a v11 library opens unchanged.
+    sql: "",
+    backfill: Some(add_page_cover_column),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -227,6 +237,12 @@ fn add_page_icon_column(conn: &mut Connection) -> Result<(), StorageError> {
         conn,
         &[("icon", "ALTER TABLE pages ADD COLUMN icon TEXT NOT NULL DEFAULT ''")],
     )
+}
+
+/// Migration 12 body. Nullable rather than `DEFAULT 0`, so "no cover" and
+/// "attachment id 0" cannot be confused the way `''` and a real emoji cannot.
+fn add_page_cover_column(conn: &mut Connection) -> Result<(), StorageError> {
+    add_page_columns(conn, &[("cover", "ALTER TABLE pages ADD COLUMN cover INTEGER")])
 }
 
 /// Migration 10 body: the two page-appearance columns.

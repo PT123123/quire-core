@@ -242,6 +242,7 @@ mod tests {
             full_width: false,
             small_text: false,
             icon: String::new(),
+            cover: None,
         };
         state.pages.push(page);
         state.blocks.push(Block {

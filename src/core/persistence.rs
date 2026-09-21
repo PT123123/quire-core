@@ -39,6 +39,14 @@ pub enum Change {
     /// touching anybody's page. Like the font above it, this is a page column
     /// and cannot be expressed against a block.
     PageIconSet { id: PageId, icon: String },
+    /// The page's cover (SPEC §三十八 "图标与封面"): an attachment id, or `None`
+    /// for no band. An id and not a path because a cover is one more thing that
+    /// points at a file, and §三十七's reclaim decides who lives by who is
+    /// pointed at.
+    PageCoverSet {
+        id: PageId,
+        cover: Option<AttachmentId>,
+    },
     /// Storage deletes the page and (recursively) its sub-pages.
     PageDeleted { id: PageId },
 
@@ -114,6 +122,10 @@ pub fn attachment_ids_in(changes: &[Change]) -> impl Iterator<Item = AttachmentI
     changes.iter().filter_map(|change| match change {
         Change::BlockInserted(block) => block.attachment,
         Change::BlockAttachmentSet { attachment, .. } => *attachment,
+        // A page points at a file too now (SPEC §三十八), and an outstanding
+        // undo step that puts a cover back is a reference: sweeping those bytes
+        // would hand the user a blank band where Ctrl+Z promised a picture.
+        Change::PageCoverSet { cover, .. } => *cover,
         Change::AttachmentAdded(attachment) => Some(attachment.id),
         _ => None,
     })

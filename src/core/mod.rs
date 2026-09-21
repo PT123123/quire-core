@@ -2,6 +2,7 @@
 // See docs/ARCHITECTURE.md; nothing here may know about Slint types.
 
 pub mod command;
+pub mod database;
 pub mod document;
 pub mod embed;
 pub mod highlight;

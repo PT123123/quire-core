@@ -6,12 +6,12 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::core::StorageError;
 
-/// The schema version this build of Quire expects. Step 17 is Track 3's (the
-/// record timestamps, ADR-0068); step 16 is Track 2's, so this branch's chain
-/// reaches 17 without a 16 of its own — `ensure_current` applies every step
-/// above the file's version in array order, so a gap closes when the other
-/// branch lands and a fresh file still ends at 17.
-pub const CURRENT_VERSION: i32 = 17;
+/// The schema version this build of Quire expects. Step 18 is Track 3's (the
+/// database block reference, ADR-0060); step 16 is Track 2's, so this branch's
+/// chain reaches 18 without a 16 of its own — `ensure_current` applies every
+/// step above the file's version in array order, so a gap closes when the
+/// other branch lands and a fresh file still ends at 18.
+pub const CURRENT_VERSION: i32 = 18;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -335,6 +335,29 @@ CREATE INDEX IF NOT EXISTS idx_db_views_db ON db_views(db);
     // (or in a backup) must keep meaning what it meant.
     sql: "",
     backfill: Some(add_record_timestamp_columns),
+}, Migration {
+    version: 18,
+    label: "database block reference",
+    // SPEC §三十九 / ADR-0060, the second half of the decision v12 opened: a
+    // `Database` block points at its entity through `blocks.db_ref`, the shape
+    // `blocks.page_ref` has had since migration 5 and for the same reason —
+    // the block *draws* the entity without *being* it, because a record may
+    // itself be a page and §三十九's "a record may be a page" has to keep a
+    // page's identity (`pages.id` is what §四十's mentions point at).
+    //
+    // Nullable and with no `DEFAULT`, like `page_ref`: `NULL` is "this block is
+    // not a database block", which is every row a v17 file already has. No
+    // foreign key either, and the same argument ADR-0026 made for `page_ref`:
+    // the entity is deleted by the change that drops the block (ADR-0060), and
+    // a block whose ref dangles is a *state* the renderer has a word for
+    // ("(deleted database)") — a constraint that refused the write would turn a
+    // recoverable picture into a failed transaction.
+    //
+    // No index: nothing asks "which blocks draw this database" yet. D7's linked
+    // database is the query that will want one, and adding an index for a
+    // question nobody asks is a B-tree every write pays for.
+    sql: "",
+    backfill: Some(add_db_ref_column),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -393,6 +416,25 @@ fn add_record_timestamp_columns(conn: &mut Connection) -> Result<(), StorageErro
             conn.execute(ddl, [])
                 .map_err(|e| StorageError::Sql(format!("add db_records.{name}: {e}")))?;
         }
+    }
+    Ok(())
+}
+
+/// Migration 18 body: add `blocks.db_ref` only when it is missing (ADR-0060).
+/// The same "缺哪列补哪列" shape as `page_ref`, `folded` and the two attachment
+/// columns: a half-applied upgrade — the column added by hand, a backup restored
+/// mid-step — converges instead of erroring on a duplicate name.
+fn add_db_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'db_ref'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute("ALTER TABLE blocks ADD COLUMN db_ref INTEGER", [])
+            .map_err(|e| StorageError::Sql(format!("add db_ref: {e}")))?;
     }
     Ok(())
 }

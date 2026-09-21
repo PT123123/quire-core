@@ -173,6 +173,18 @@ pub enum Change {
     ViewDefinitionSet { id: ViewId, definition: String },
     ViewOrdSet { id: ViewId, ord: OrderKey },
     ViewDeleted { id: ViewId },
+
+    /// Point a `Database` block at the entity it draws, or clear the pointer
+    /// (SPEC §三十九, ADR-0060). Appended after D1's block rather than beside
+    /// `BlockRefSet` because the enum is append-only: a variant's position is
+    /// nothing, and its spelling is everything.
+    ///
+    /// This is the write `Command::MakeDatabase` emits, and it is deliberately
+    /// the *only* one that touches the column: a `Database` block whose entity
+    /// is gone is a state the read paths survive (ADR-0060's "(deleted
+    /// database)"), while a block whose ref was silently repointed would be a
+    /// database someone else's rows vanished into.
+    BlockDbRefSet { id: BlockId, db: Option<DatabaseId> },
 }
 
 /// Every attachment id a change list points at, read off the arm that carries

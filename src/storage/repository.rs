@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, Transaction};
 
 use crate::core::persistence::{Change, Repository, StorageError};
+use crate::core::database::DatabaseId;
 use crate::core::types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey,
     Page, PageFont, PageId, PersistedState,
@@ -213,7 +214,7 @@ impl Repository for SqliteRepository {
                 .prepare(
                     "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
                             b.color, b.bg, b.page_ref, b.folded, b.attachment, b.img_percent,
-                            b.columns, b.lang
+                            b.columns, b.lang, b.db_ref
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -236,6 +237,7 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(12)?,
                         r.get::<_, i64>(13)?,
                         r.get::<_, String>(14)?,
+                        r.get::<_, Option<i64>>(15)?,
                     ))
                 })
                 .map_err(sql)?;
@@ -256,6 +258,7 @@ impl Repository for SqliteRepository {
                     img_percent,
                     columns,
                     lang,
+                    db_ref,
                 ) = row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
@@ -285,6 +288,12 @@ impl Repository for SqliteRepository {
                     // Like the colors: a string this build does not know is a
                     // plain block, not a failed load.
                     lang: Lang::try_from_str(&lang).unwrap_or(Lang::Plain),
+                    // The database entity a `Database` block draws (ADR-0060).
+                    // Not folded and not validated here: the *id* is the whole
+                    // reference, and whether the row exists is a question the
+                    // block's own render asks (a dangling ref draws
+                    // "(deleted database)"), exactly as `page_ref` does.
+                    db_ref: db_ref.map(|d| DatabaseId(d as u64)),
                 });
             }
         }
@@ -511,8 +520,8 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref, folded,
-                             attachment, img_percent, columns, lang)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                             attachment, img_percent, columns, lang, db_ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
@@ -527,6 +536,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
             block.img_percent as i64,
             block.columns as i64,
             block.lang.as_str(),
+            block.db_ref.map(|d| d.as_u64() as i64),
         ],
     )
     .map_err(sql)?;
@@ -698,6 +708,7 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 img_percent: 100,
                 columns: 0,
                 lang: Lang::Plain,
+                db_ref: None,
             };
             for m in &block.marks {
                 tx.execute(
@@ -805,6 +816,20 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockRefSet", id.as_u64())
+        }
+        // SPEC §三十九 / ADR-0060: the same statement `BlockRefSet` runs, one
+        // column over. A `Database` block's entity is a row of its own table,
+        // so "clear the pointer" is `NULL` here and the entity survives until
+        // something deletes it — which is why `Command::MakeDatabase`'s revert
+        // clears the ref *and* deletes the entity, as two changes in one batch.
+        Change::BlockDbRefSet { id, db } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET db_ref = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, db.map(|d| d.as_u64() as i64)],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockDbRefSet", id.as_u64())
         }
         Change::BlockAttachmentSet { id, attachment } => {
             let n = tx

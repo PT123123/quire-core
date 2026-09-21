@@ -108,6 +108,7 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
+            db_ref: None,
         })
     }
 

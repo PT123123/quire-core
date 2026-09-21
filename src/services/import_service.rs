@@ -81,6 +81,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
                     checked: false,
                     marks: Vec::new(),
                     lang: Lang::Plain,
+                    db_ref: None,
                 });
                 math = None;
             } else {
@@ -99,6 +100,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
                 checked: false,
                 marks: Vec::new(),
                 lang: Lang::Plain,
+                db_ref: None,
             });
             continue;
         }
@@ -118,6 +120,7 @@ pub fn parse_markdown(src: &str) -> Vec<ParsedBlock> {
             checked: false,
             marks: Vec::new(),
             lang: Lang::Plain,
+            db_ref: None,
         });
     }
     out
@@ -265,6 +268,7 @@ fn classify(line: &str) -> ParsedBlock {
                         checked: flag.eq_ignore_ascii_case("x"),
                         marks,
                         lang: Lang::Plain,
+                        db_ref: None,
                     };
                 }
             }
@@ -285,6 +289,7 @@ fn block(kind: BlockKind, text: &str) -> ParsedBlock {
         checked: false,
         marks,
         lang: Lang::Plain,
+        db_ref: None,
     }
 }
 

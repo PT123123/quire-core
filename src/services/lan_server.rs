@@ -261,6 +261,7 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
+            db_ref: None,
         });
         state.settings.insert("theme".into(), "dark".into());
         repo.replace_all(&state).unwrap();

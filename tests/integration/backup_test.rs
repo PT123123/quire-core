@@ -311,6 +311,7 @@ fn a_recovered_database_is_searchable_straight_away() {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
+        db_ref: None,
             }),
         ])
         .unwrap();
@@ -468,6 +469,7 @@ fn snapshot_cost() {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
+        db_ref: None,
         })
         .collect();
     {

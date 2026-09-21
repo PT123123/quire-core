@@ -132,10 +132,29 @@ pub enum BlockKind {
     /// runtime, so the card is the whole feature and its one action is "open
     /// this in the system browser".
     Embed,
+    Embed,
+    /// A database view (SPEC §三十九, ADR-0060). `db_ref` names the `databases`
+    /// row this block draws, exactly as a `Page` block names its child page;
+    /// the rows and the columns are the entity's, never the block's, because
+    /// §三十九's "a record may *be* a page" has to keep a page's identity.
+    ///
+    /// Like a `Table` or a `Columns` block it is a **leaf** that owns no child
+    /// blocks: its rows are records and its cells are values, so the projection
+    /// has nothing to hide and no row-index consumer has to translate. What it
+    /// owns is the entity — deleting the block deletes the `databases` row the
+    /// way deleting a `Page` block deletes its child page, and a dangling
+    /// `db_ref` (the entity gone, the block back through an undo) renders one
+    /// muted line, "(deleted database)", exactly as a dangling `page_ref` does.
+    ///
+    /// The eight view layouts are *not* eight kinds: `db_views.layout` (ADR-0060
+    /// / ADR-0064) is which view of this one entity is being drawn, and the six
+    /// `INSERT_ITEMS` placeholders in `state.rs` are the same kinds' entry
+    /// points, lit one phase at a time (D3 lights `Table view`).
+    Database,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 23] = [
+    pub const ALL: [BlockKind; 24] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -159,6 +178,7 @@ impl BlockKind {
         BlockKind::Math,
         BlockKind::Toc,
         BlockKind::Embed,
+        BlockKind::Database,
     ];
 
     /// Heading level 1..3 for a heading kind; `None` for anything else. A
@@ -197,6 +217,7 @@ impl BlockKind {
             BlockKind::Math => "math",
             BlockKind::Toc => "toc",
             BlockKind::Embed => "embed",
+            BlockKind::Database => "database",
         }
     }
 
@@ -449,6 +470,24 @@ pub struct Block {
     /// is only ever read as the key for its colour. Meaningless for other kinds,
     /// where it stays `Plain` — a colour on a paragraph is `color`/`background`.
     pub lang: Lang,
+    /// The database a `Database` block draws (SPEC §三十九, ADR-0060), the
+    /// shape `page_ref` gave a `Page` block and for the same reason: the entity
+    /// has to be reachable from the block without the block *being* it, because
+    /// a record may itself be a page and a page's data may never be derived.
+    /// Meaningless for every other kind, where it stays `None`.
+    ///
+    /// `None` on a `Database` block and a `Some` pointing at a deleted row are
+    /// two different things and only the second one has a word for it: `None`
+    /// is a block whose entity has not been written yet (the two are created in
+    /// one batch — `Command::MakeDatabase` — so it is a state only a torn file
+    /// or a hand-edit produces), while a dangling id is ADR-0060's
+    /// "(deleted database)": the entity is gone and the block is back.
+    ///
+    /// **Not a foreign key**, for the same reason `page_ref` is not: the entity
+    /// is deleted by the change that drops the block (ADR-0060), and a block
+    /// whose ref dangles is a *state* the renderer has a word for, not a
+    /// failure the load reports.
+    pub db_ref: Option<crate::core::database::DatabaseId>,
 }
 
 /// One file that lives next to the database (SPEC §三十七 批次 A, §十八's

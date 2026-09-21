@@ -28,6 +28,7 @@ fn block(id: u64, kind: BlockKind, text: &str) -> Block {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
+        db_ref: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn parsed(kind: BlockKind, text: &str) -> ParsedBlock {
         checked: false,
         marks: Vec::new(),
         lang: Lang::Plain,
+        db_ref: None,
     }
 }
 
@@ -1019,6 +1021,7 @@ fn a_layout_round_trips_as_its_lines_losing_only_the_shape() {
             checked: true,
             marks: Vec::new(),
             lang: Lang::Plain,
+            db_ref: None,
         },
         parsed(BlockKind::Paragraph, "after"),
     ];

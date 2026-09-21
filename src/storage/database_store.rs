@@ -50,6 +50,7 @@ use crate::core::database::{
     RealizedRows, Record, RecordId, RecordTimestamps, RowRequest, RowView, RowWindow, SortColumn,
     SortSpec, ValueKind, View, ViewGeometry, ViewId,
 };
+use crate::core::database_view::RecordPages;
 use crate::core::persistence::StorageError;
 use crate::core::types::{OrderKey, PageId};
 
@@ -395,7 +396,171 @@ impl SqliteRepository {
             None => Ok(realized),
         }
     }
+
+    /// The highest `ord` in one database, or `None` when it has no rows — what
+    /// the "new row" path asks for the key of the row it is about to append.
+    ///
+    /// `MAX` over the `(db, ord)` index the record table already carries, so it
+    /// is the index's rightmost leaf rather than a table scan — which is the
+    /// point: the app is not allowed to hold the rows to find the last one
+    /// (ADR-0067), so the last *key* is a question for the store.
+    pub fn last_record_ord(&self, db: DatabaseId) -> Result<Option<OrderKey>, StorageError> {
+        let conn = self.database().conn();
+        let max: Option<i64> = conn
+            .query_row(
+                "SELECT max(ord) FROM db_records WHERE db = ?1",
+                params![id(db.as_u64())],
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
+        Ok(max.map(|ord| OrderKey(ord_from_db(ord))))
+    }
+
+    /// The highest id in one of the six database tables, or 0 for an empty one —
+    /// what the app's per-session id watermark is seeded from (ADR-0072).
+    ///
+    /// One question, asked once per table at startup, and a `MAX` over an
+    /// integer primary key is the B-tree's own rightmost leaf: it reads no rows.
+    /// It is a **watermark and not an allocator** on purpose — the app takes the
+    /// value, keeps its own counter, and never asks again, so two creations in
+    /// one session cannot race for the same id even though the second one's row
+    /// is not in the file yet (the debounced write path is what makes that real:
+    /// changes reach SQLite on a timer, not on the keystroke).
+    pub fn max_id(&self, table: DbTable) -> Result<u64, StorageError> {
+        let conn = self.database().conn();
+        let max: Option<i64> = conn
+            .query_row(&format!("SELECT max(id) FROM {}", table.name()), [], |r| {
+                r.get(0)
+            })
+            .map_err(sql)?;
+        Ok(max.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Every value stored for one record, in the stored shape (ADR-0062): what
+    /// deleting a row has to capture so that its undo can put the cells back
+    /// (ADR-0063's plan).
+    ///
+    /// One query for the typed rows and one for the list items, rather than a
+    /// point read per column: the caller does not know which columns have a
+    /// value, and asking per column would be fourteen queries to answer "what is
+    /// in this row". The columns are read here as they are stored, and the
+    /// *kind* decides which of them is the value — the same rule
+    /// [`SqliteRepository::cell`] follows for one cell.
+    pub fn record_values(
+        &self,
+        record: RecordId,
+    ) -> Result<Vec<(PropertyId, CellValue)>, StorageError> {
+        let conn = self.database().conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT v.property, p.kind, v.text, v.num, v.flag
+                   FROM db_values v
+                   JOIN db_properties p ON p.id = v.property
+                  WHERE v.record = ?1
+                  ORDER BY v.property",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![id(record.as_u64())], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(sql)?;
+        let typed: Vec<(i64, String, String, Option<f64>, i64)> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        let mut out = Vec::with_capacity(typed.len());
+        for (property, kind, text, num, flag) in typed {
+            let property = PropertyId(property as u64);
+            let kind = PropertyKind::from_stored(&kind);
+            if kind.is_list() {
+                // A list cell is its items or nothing: `db_value_items` is the
+                // only place its value lives, and an empty list is `Empty` (the
+                // store normalises it on the way in, ADR-0062).
+                let items = read_cell_items(&conn, record, property)?;
+                if !items.is_empty() {
+                    out.push((property, CellValue::Items(items)));
+                }
+                continue;
+            }
+            if kind.is_computed() || kind.is_derived() {
+                // A computed cell stores nothing, and a derived one is the
+                // record's own column (ADR-0068, which is why a value row a
+                // rogue caller wrote there is not a value any read consults).
+                continue;
+            }
+            let value = match kind.value_kind() {
+                ValueKind::Number => num.map(CellValue::Number).unwrap_or(CellValue::Empty),
+                ValueKind::Flag => CellValue::Flag(flag != 0),
+                _ => CellValue::Text(text),
+            };
+            if !value.is_empty() {
+                out.push((property, value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Which records of one database own a page (ADR-0063), as a map — the one
+    /// thing a window read's `RowView` does not carry and the Markdown export
+    /// needs (ADR-0065 writes `[title](quire://page/<id>)` for a page-backed
+    /// row).
+    ///
+    /// One query for the whole database and not one per row: the export walks
+    /// every row it writes, and a point read per row would be a thousand queries
+    /// for a thousand-row file. The predicate is `page IS NOT NULL`, which is a
+    /// scan of the rows that *have* a page and not of the table — and with lazy
+    /// pages (ADR-0063) that is a small fraction of the rows.
+    pub fn record_pages(&self, db: DatabaseId) -> Result<RecordPages, StorageError> {
+        let conn = self.database().conn();
+        let mut stmt = conn
+            .prepare("SELECT id, page FROM db_records WHERE db = ?1 AND page IS NOT NULL")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![id(db.as_u64())], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(sql)?;
+        let mut pages = RecordPages::new();
+        for row in rows {
+            let (record, page) = row.map_err(sql)?;
+            pages.insert(record as u64, PageId(page as u64));
+        }
+        Ok(pages)
+    }
 }
+
+/// Which of the six tables an id is being asked about (ADR-0072's watermark).
+/// An enum and not a `&str`, because the name is formatted into a statement and
+/// the *only* strings that may reach it are the six spelled here — a caller
+/// cannot pass `db_records; DROP TABLE pages` if it cannot pass a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbTable {
+    Databases,
+    Properties,
+    Records,
+    Views,
+}
+
+impl DbTable {
+    /// The table's name. `const` so a caller can also print it in a message
+    /// without allocating.
+    pub const fn name(self) -> &'static str {
+        match self {
+            DbTable::Databases => "databases",
+            DbTable::Properties => "db_properties",
+            DbTable::Records => "db_records",
+            DbTable::Views => "db_views",
+        }
+    }
+}
+
+
 
 /// A record's two instants, or `None` when there is no such record. The free
 /// function takes the connection its caller already holds — the method on the

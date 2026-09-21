@@ -29,8 +29,53 @@ use std::collections::HashMap;
 
 use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind};
 
-/// Render a page's blocks as Markdown, in display order.
+/// Render a page's blocks as Markdown, in display order. A caller with no
+/// way to read a database (a test, the LAN page writer) gets the stored text,
+/// which is what this layer did before there was a choice — and a `Database`
+/// block writes nothing at all in that shape (ADR-0065 argues why there is no
+/// marker line for one).
 pub fn export_page(blocks: &[Block]) -> String {
+    export_page_with(blocks, &|_| None)
+}
+
+/// One database view already laid out as a table: the header row and the rows,
+/// each cell a display string. **Pre-rendered on purpose** (ADR-0065): a
+/// database's content is not its blocks — it is records and values in six
+/// tables — and `export_page` is handed blocks and nothing else, so the caller
+/// that can already read the database renders the rows and this layer only
+/// writes them out. It is the same division the attachment sizes and the math
+/// glyphs use: a renderer asks for a value and never fetches one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DatabaseTable {
+    /// The columns, title first — the view's own order (ADR-0065).
+    pub header: Vec<String>,
+    /// One entry per record, in the view's order and membership (filters and
+    /// sorts included, which is why the caller renders rather than this file).
+    pub rows: Vec<Vec<String>>,
+}
+
+impl DatabaseTable {
+    /// A table with nothing in it writes nothing: a database with no visible
+    /// columns has no representation as a grid, and a header-only table would
+    /// be a `| | |` line that means less than the blank it replaces.
+    pub fn is_empty(&self) -> bool {
+        self.header.is_empty()
+    }
+}
+
+/// The same page, with one more question the export layer cannot answer for
+/// itself (SPEC §三十九's Markdown answer): **what does this database block
+/// show as a table?** The rows are pre-rendered by the caller that can read
+/// records — the exporter never receives a repository (ADR-0044's boundary),
+/// so it is handed the header and the rows and only lays them out. `None`
+/// means two different things that write the same bytes: a caller with no
+/// database reader, and a `Database` block whose entity is gone. Both write
+/// nothing at all; what the screen says about it ("(deleted database)",
+/// ADR-0060) is screen furniture, not content.
+pub fn export_page_with(
+    blocks: &[Block],
+    database: &dyn Fn(BlockId) -> Option<DatabaseTable>,
+) -> String {
     let mut out = String::new();
     let mut number = 0;
     // A table's cells are children, so the grid has to be assembled before the
@@ -59,6 +104,14 @@ pub fn export_page(blocks: &[Block]) -> String {
                 number = 0;
                 render_table(block, grids.get(&block.id).map(Vec::as_slice).unwrap_or(&[]))
             }
+            // ADR-0065: the database's own table, rendered by the caller that
+            // can read records — this layer never opens one.
+            BlockKind::Database => {
+                number = 0;
+                database(block.id)
+                    .map(|table| render_database(&table))
+                    .unwrap_or_default()
+            }
             _ => render(block, &mut number),
         };
         for line in rendered.lines() {
@@ -72,6 +125,25 @@ pub fn export_page(blocks: &[Block]) -> String {
         }
     }
     out
+}
+
+fn render_database(table: &DatabaseTable) -> String {
+    if table.header.is_empty() {
+        return String::new();
+    }
+    let cols = table.header.len();
+    let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ").replace('\r', " ");
+    let head: Vec<String> = table.header.iter().map(|c| cell(c)).collect();
+    let mut out = format!("| {} |\n", head.join(" | "));
+    let dashes = (0..cols).map(|_| "---").collect::<Vec<_>>().join(" | ");
+    out.push_str(&format!("| {dashes} |\n"));
+    for row in &table.rows {
+        let line: Vec<String> = (0..cols)
+            .map(|at| row.get(at).map(|c| cell(c)).unwrap_or_default())
+            .collect();
+        out.push_str(&format!("| {} |\n", line.join(" | ")));
+    }
+    out.trim_end().to_string()
 }
 
 /// True when the block sits inside a columns layout, at any depth.

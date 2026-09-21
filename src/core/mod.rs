@@ -4,6 +4,9 @@
 pub mod command;
 pub mod database;
 pub mod database_property;
+// D3's drawing half of SPEC §三十九: the view's definition document, the
+// columns it shows, and the shape one window of rows takes on its way to Slint.
+pub mod database_view;
 pub mod document;
 pub mod embed;
 pub mod highlight;

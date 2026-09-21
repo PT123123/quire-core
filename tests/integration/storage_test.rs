@@ -51,6 +51,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
+        db_ref: None,
     }
 }
 
@@ -963,6 +964,7 @@ fn attachments_round_trip_and_a_dangling_reference_still_loads() {
             img_percent: 50,
             columns: 0,
             lang: Lang::Plain,
+            db_ref: None,
             ..block(10, 1, None, 100, "Sunset photo.png")
         }),
     ])

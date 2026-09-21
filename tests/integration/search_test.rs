@@ -47,6 +47,7 @@ fn block(id: u64, page_id: u64, text: &str) -> Block {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
+        db_ref: None,
     }
 }
 

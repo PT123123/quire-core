@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::database::{CellValue, DatabaseDraft, Property, PropertyId, Record, RecordId, ViewId};
+use super::database::{
+    CellValue, DatabaseDraft, Property, PropertyId, Record, RecordId, View, ViewId,
+};
 use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
@@ -202,6 +204,21 @@ pub enum Command {
         from: String,
         to: String,
     },
+    /// One new view of the database a block draws — D5's switcher `+`: a row
+    /// in `db_views` with its own layout, born with an empty rules document
+    /// (ADR-0060: a view is `db_views.layout`, not a block kind; ADR-0064: the
+    /// rules are the document, and a new view has none yet).
+    ///
+    /// The row travels whole — id, name, layout, ord — because the plan layer
+    /// can allocate none of them (`MakeDatabase`'s rule, applied to the one
+    /// table whose rows the app keeps out of memory). The id is the caller's
+    /// watermark (ADR-0072), the name defaults to the layout's label and is
+    /// renameable later, and the ord is past the last view so a new view lands
+    /// at the switcher's end.
+    ///
+    /// The inverse is the view alone: a view nobody has edited yet holds no
+    /// document and owns no rows, so `ViewDeleted` is the whole of the undo.
+    AddDatabaseView { block: BlockId, view: View },
 }
 
 /// The grid shape the "+", the slash menu and "Turn into" hand out. Three
@@ -1424,6 +1441,22 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                     id: view,
                     definition: from,
                 }],
+            })
+        }
+
+        Command::AddDatabaseView { block, view } => {
+            let b = doc.block(block)?;
+            let db = b.db_ref?;
+            // The view belongs to the entity this *block* draws — the same
+            // refusal `AddDatabaseProperty` makes, for the same reason: the two
+            // ids travel separately and could disagree, and the result would be
+            // a view no tab of this block can ever show.
+            if view.db != db {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::ViewAdded(view.clone())],
+                revert: vec![Change::ViewDeleted { id: view.id }],
             })
         }
 

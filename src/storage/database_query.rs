@@ -373,6 +373,38 @@ pub fn group_query(req: &RowRequest<'_>, spec: &GroupSpec) -> RowQuery {
     }
 }
 
+/// The span one column takes across the rows the filter admits:
+/// `min(expr), max(expr)` over the same `FROM`/`WHERE` the row read runs.
+///
+/// D5's timeline asks exactly one question about the whole (filtered) set —
+/// "how many days wide is it" — and the answer is two aggregates, not the rows:
+/// the *lanes* are windowed like any other layout's rows, but the axis under
+/// them must be the range of every row the view shows, or a bar would be drawn
+/// against an axis that did not include it. One scan produces both ends; no
+/// row is taken.
+///
+/// The expression is the column the kind compares in (ADR-0070's table, the
+/// same one the sort and the filter use), so a date range is byte order —
+/// which is time order for the stored fixed-width shape (ADR-0062).
+pub fn range_query(req: &RowRequest<'_>, property: PropertyId, kind: PropertyKind) -> RowQuery {
+    let mut sql = Sql::new("", " FROM db_records r LEFT JOIN pages p ON p.id = r.page");
+    let slots = build_from(&mut sql, req.title, &[]);
+    let column = match kind {
+        PropertyKind::Checkbox => SortColumn::Flag,
+        PropertyKind::Number => SortColumn::Number,
+        PropertyKind::CreatedTime => SortColumn::Created,
+        PropertyKind::LastEditedTime => SortColumn::Edited,
+        _ => SortColumn::Text,
+    };
+    let expr = column_expr(&mut sql, property, column, req.title, &slots);
+    let wh = where_clause(&mut sql, req, &slots);
+    sql.select = format!("SELECT min({expr}), max({expr})");
+    RowQuery {
+        sql: format!("{}{}{}", sql.select, sql.from, wh),
+        binds: sql.binds,
+    }
+}
+
 /// The `WHERE` clause: the database, then the filter tree in one parenthesized
 /// group. `AND` with the tree, never string-concatenated into it — a tree that
 /// compiles to `a OR b` must stay `(a OR b)` or the database predicate would

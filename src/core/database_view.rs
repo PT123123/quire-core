@@ -22,10 +22,10 @@
 // projection, and never per frame; the one config parse there is happens once
 // per *column*, so a hundred rows of a select column share one answer.
 //
-// D3 draws `table` and nothing else (SPEC's order is the implementation order),
-// so a view of another layout is *recognised* and refused by name rather than
-// drawn wrongly: `LayoutSupport::Missing` carries the label the block says out
-// loud, and D5 turns one arm of it into a real view per phase.
+// D3 drew `table`; D5 draws the six layouts after it (board, list, calendar,
+// gallery, timeline, form) and `chart` stays refused by name until D7 (SPEC's
+// order is the implementation order): `LayoutSupport::Missing` carries the
+// label the block says out loud.
 
 use super::database::{
     DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind, RowWindow, RowView, SortSpec,
@@ -59,30 +59,31 @@ pub const WIDTH_MIN: u16 = 60;
 /// confused.
 pub const WIDTH_AUTO: u16 = 0;
 
-/// Whether this build draws a layout, or only knows its name. SPEC §三十九's
-/// 「顺序即实现顺序」 means the other seven become drawable one phase at a time,
-/// and a view whose layout this build cannot draw still **opens**: it says
-/// which view it is instead of showing a table that is not what the user asked
-/// for.
+/// Which layouts this build draws. SPEC §三十九's 「顺序即实现顺序」:
+/// D3 delivered `table`, D5 delivers the next six (board / list / calendar
+/// / gallery / timeline / form), and `chart` stays [`LayoutSupport::Missing`]
+/// until D7 — a view whose layout this build cannot draw still **opens**:
+/// it says which view it is instead of showing a table that is not what the
+/// user asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutSupport {
-    /// D3 delivers this one: the table.
+    /// D3's table, and D5's six: drawn by the block's delegate.
     Drawn,
-    /// Recognised, named, not drawn yet (D5).
+    /// Recognised, named, not drawn yet (D7: chart).
     Missing,
 }
 
 impl LayoutSupport {
     pub fn of(layout: ViewLayout) -> LayoutSupport {
         match layout {
-            ViewLayout::Table => LayoutSupport::Drawn,
-            ViewLayout::Board
+            ViewLayout::Table
+            | ViewLayout::Board
             | ViewLayout::List
             | ViewLayout::Calendar
             | ViewLayout::Gallery
             | ViewLayout::Timeline
-            | ViewLayout::Form
-            | ViewLayout::Chart => LayoutSupport::Missing,
+            | ViewLayout::Form => LayoutSupport::Drawn,
+            ViewLayout::Chart => LayoutSupport::Missing,
         }
     }
 
@@ -1556,3 +1557,445 @@ pub fn is_stored_date(text: &str) -> bool {
         && bytes[13] == b':'
         && (11..16).all(|at| at == 13 || digits_at(at))
 }
+
+// ─── D5: the view family (board / list / calendar / gallery / timeline / form) ─
+//
+// D3 drew the table and D4 gave a view its rules; D5 adds the six SPEC layouts
+// that come after it (chart is D7's). ADR-0060 made all eight **one entity's
+// layouts** rather than eight block kinds, so every view below is a `layout`
+// string plus a projection — the block, the switcher, the window arithmetic and
+// the document are all the same objects the table already used. What differs per
+// layout is only:
+//
+//   1. **what the window is opened on.** SPEC's red line is
+//      「10 000 行不得全量 realize；视图先算可见窗口再取行」, and "先算窗口" is
+//      per-shape arithmetic:
+//        * table / list / timeline — a window of *rows* (D0's `window`),
+//        * board — a window of *card slots*: one slot is a horizontal band
+//          across every column, and each group fetches its own slice of that
+//          band (`board_window` below). The column *headers* are the group
+//          list from one `GROUP BY` over an option-bounded column — a handful
+//          of rows, never one header per card,
+//        * gallery — a window of card *rows* (`per_row` cards each), fetched as
+//          one slice of `per_row × rows` cards,
+//        * calendar — the month grid is fixed (6×7), so what is windowed is
+//          the records *inside* a day: one `GROUP BY` over the date column for
+//          the month's counts (≤ 31 rows) and at most [`CALENDAR_PEEK`]
+//          records per day, with the rest folded into a count,
+//        * form — nothing to window: it is the *field list*, bounded by the
+//          schema, and it creates rows rather than reading them.
+//   2. **how a row is painted.** The store paints every visible cell for all
+//      layouts (that is D2's pipeline, unchanged); a layout's delegate picks
+//      the ones it shows. A list row reads the first two cells as its preview,
+//      a card reads the first checkbox cell for its box, a timeline lane reads
+//      the two date columns' day numbers (computed here, in Rust, because a
+//      delegate may not parse a date — hard rule).
+//
+// Everything in this section is **pure**: no SQL, no Slint, no clock (the
+// module's D0 contract). Calendar arithmetic is written out here rather than
+// borrowed from `core::date` because that module is another track's, and a
+// dependency on an uncommitted file is exactly what D1's `E0583` taught the
+// track not to do. The algorithms are the standard civil-date ones and carry
+// their own comments.
+
+/// One layout's own geometry, in px — the one source the window arithmetic and
+/// the delegate both read. `header_height` is the same 64 px for every layout
+/// (the switcher line plus the toolbar line); `row_height` is the height of one
+/// *placement unit*: a table row, a list row, a timeline lane — and, for the
+/// layouts that place cards rather than rows, the card slot the window counts
+/// in ([`TableView::BOARD_CARD_HEIGHT`] / [`TableView::GALLERY_CARD_HEIGHT`]).
+///
+/// The reason this is a function and not eight constants read at eight call
+/// sites: `core::database::window` divides the scroll offset by the row height,
+/// so a delegate laid out at one height while the window arithmetic used
+/// another would fetch a window that does not cover the viewport — the defect
+/// D3's `db-row-height = 0` bug was, in another form.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutMetrics {
+    pub row_height: f32,
+    pub header_height: f32,
+}
+
+pub fn layout_metrics(layout: ViewLayout) -> LayoutMetrics {
+    let row_height = match layout {
+        ViewLayout::Table => TableView::ROW_HEIGHT,
+        ViewLayout::List => TableView::LIST_ROW_HEIGHT,
+        ViewLayout::Timeline => TableView::TIMELINE_ROW_HEIGHT,
+        ViewLayout::Board => TableView::BOARD_CARD_HEIGHT,
+        ViewLayout::Gallery => TableView::GALLERY_CARD_HEIGHT,
+        // The calendar's grid and the form's fields are not windows over a
+        // placement unit at all; the numbers are here so a caller that asks
+        // gets the board's own slot rather than a zero to divide by.
+        ViewLayout::Calendar | ViewLayout::Form | ViewLayout::Chart => {
+            TableView::ROW_HEIGHT
+        }
+    };
+    LayoutMetrics {
+        row_height,
+        header_height: TableView::HEADER_HEIGHT,
+    }
+}
+
+impl TableView {
+    /// A list row: the title on its own line and the first two columns as a
+    /// muted preview line under it. Taller than a table row because it *is*
+    /// two lines of text — and the number lives here, once, because the window
+    /// arithmetic divides by it.
+    pub const LIST_ROW_HEIGHT: f32 = 44.0;
+    /// A board card: the title plus one checkbox row. Fixed so a column of
+    /// cards is a grid rather than a scale.
+    pub const BOARD_CARD_HEIGHT: f32 = 76.0;
+    /// How tall a board column's header is (the option's name and its count) —
+    /// **not** part of the window: a header costs one small rectangle however
+    /// many cards its column holds ([`group_window`]'s contract, restated for
+    /// a horizontal layout).
+    pub const BOARD_HEADER_HEIGHT: f32 = 28.0;
+    /// A gallery card: an avatar band plus two lines. The cover *image* is a
+    /// files column's first attachment and is D8's (the attachment thumbnail
+    /// path); D5 draws the letter avatar, which the brief allows as the
+    /// fallback and which needs no decode per realized card.
+    pub const GALLERY_CARD_HEIGHT: f32 = 132.0;
+    /// The narrowest a gallery card may be before the layout drops a column
+    /// instead of squeezing it. The delegate's `per-row` formula and this
+    /// number have to agree or the reported shape would fight the drawing.
+    pub const GALLERY_CARD_MIN_WIDTH: f32 = 168.0;
+    /// One timeline lane: the bar's own band.
+    pub const TIMELINE_ROW_HEIGHT: f32 = 36.0;
+    /// The calendar's month strip (‹ September 2026 ›), the weekday initials
+    /// row, and one week. The grid is **fixed** — six weeks is what a month
+    /// can need — so the calendar's surface height is a constant and the
+    /// virtualization inside it is per-day (see [`CALENDAR_PEEK`]).
+    pub const CALENDAR_NAV_HEIGHT: f32 = 28.0;
+    pub const CALENDAR_WEEKDAY_HEIGHT: f32 = 20.0;
+    pub const CALENDAR_WEEK_HEIGHT: f32 = 96.0;
+    /// One form field (label + editor) and the form's action row.
+    pub const FORM_FIELD_HEIGHT: f32 = 40.0;
+    pub const FORM_ACTIONS_HEIGHT: f32 = 48.0;
+
+    /// The surface below the header for the layouts that place one unit per
+    /// counted item — a table row, a list row, a timeline lane, a board slot.
+    pub fn rows_surface_height(row_height: f32, total: usize) -> f32 {
+        row_height * total as f32
+    }
+
+    /// A gallery's surface: `ceil(total / per_row)` card rows. The rows are the
+    /// window's unit; the cards inside one row come back in a single slice.
+    pub fn gallery_surface_height(total: usize, per_row: usize) -> f32 {
+        Self::GALLERY_CARD_HEIGHT * Self::gallery_rows(total, per_row) as f32
+    }
+
+    /// How many card rows a gallery has, with `per_row >= 1` forced: the
+    /// formula the delegate's reported `per-row` is the input to, so the two
+    /// halves of "how tall is the grid" cannot disagree.
+    pub fn gallery_rows(total: usize, per_row: usize) -> usize {
+        let per_row = per_row.max(1);
+        (total + per_row - 1) / per_row
+    }
+
+    /// How many cards fit in one row at this grid width — the delegate's own
+    /// formula, restated here so a seed or a default computes the same number
+    /// the delegate would report. A grid narrower than one card still shows
+    /// one column (a card too narrow to read is still better than no card).
+    pub fn gallery_per_row(grid_width: f32) -> usize {
+        if grid_width <= 0.0 {
+            return 1;
+        }
+        ((grid_width / Self::GALLERY_CARD_MIN_WIDTH).floor() as usize).max(1)
+    }
+
+    /// The calendar's surface: the month strip, the weekday initials, and six
+    /// weeks — a constant, because the grid does not grow with the data. This
+    /// is the whole difference between the calendar and every other layout: the
+    /// red line is about **rows**, and a month has at most 42 cells.
+    pub fn calendar_surface_height() -> f32 {
+        Self::CALENDAR_NAV_HEIGHT
+            + Self::CALENDAR_WEEKDAY_HEIGHT
+            + CALENDAR_WEEKS as f32 * Self::CALENDAR_WEEK_HEIGHT
+    }
+
+    /// A form's surface: one field per visible column plus the action row. No
+    /// records are read to draw it, which is why a form is the one layout that
+    /// cannot be asked to realize a row it does not have.
+    pub fn form_surface_height(fields: usize) -> f32 {
+        fields as f32 * Self::FORM_FIELD_HEIGHT + Self::FORM_ACTIONS_HEIGHT
+    }
+}
+
+/// The calendar's fixed grid: six weeks of seven days, so a month that starts
+/// on a Sunday in a 31-day month still fits.
+pub const CALENDAR_WEEKS: usize = 6;
+pub const CALENDAR_COLUMNS: usize = 7;
+/// How many records a day cell draws before it folds the rest into a count.
+/// Three is what fits in one cell at [`TableView::CALENDAR_WEEK_HEIGHT`]; the
+/// count is not decoration but the *virtualization*: a day with 500 records
+/// realizes three, and the cell says "and 497 more".
+pub const CALENDAR_PEEK: usize = 3;
+
+/// The board's answer to "a group header must not become a row", in the
+/// horizontal direction.
+///
+/// A board's scroll surface is a stack of *card slots*: slot `s` is one
+/// horizontal band across every column, and the board is
+/// `max(column counts)` slots tall. The window is computed over those slots by
+/// D0's own `window` (the caller passes `max(counts)` as the total), and this
+/// function maps it onto the per-column queries that realize it: for each
+/// column, how many of its leading cards to skip and how many to take.
+///
+/// So the objects that exist are `Σ len` ≤ `columns × (visible slots +
+/// overscan)` — bounded by the *viewport and the group list*, not by the table.
+/// A column holding 10 000 cards realizes the same handful of cards the
+/// ungrouped table would; a board with three columns realizes three slices, and
+/// its column headers are the group list (a handful of rows from one
+/// `GROUP BY`), never one per card.
+///
+/// Cards are placed at `slot × card_height` inside their column, so every
+/// realized card's slot is `window.start + model_index` — one expression in the
+/// delegate, the same row→slot conversion §三十七 requires of a row-based
+/// block.
+pub fn board_window(counts: &[usize], window: RowWindow) -> Vec<(usize, usize, usize)> {
+    counts
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(group, count)| {
+            let skip = window.start.min(count);
+            let len = window.len().min(count.saturating_sub(skip));
+            if len == 0 {
+                None
+            } else {
+                Some((group, skip, len))
+            }
+        })
+        .collect()
+}
+
+/// How many card slots a board's surface has: the tallest column. Zero columns
+/// (a board with no grouping yet) is zero slots, which is what the empty state
+/// draws.
+pub fn board_slots(counts: &[usize]) -> usize {
+    counts.iter().copied().max().unwrap_or(0)
+}
+
+/// The days of a month, 1-based — the calendar's own arithmetic. Leap years
+/// follow the Gregorian rule (a year divisible by 4, except centuries not
+/// divisible by 400), which is what the stored `YYYY-MM-DD` values of a
+/// hand-edited file are read against.
+pub fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Days since 1970-01-01 for a civil date — Howard Hinnant's `days_from_civil`
+/// with the era arithmetic kept explicit. It is here rather than in a crate
+/// because the app has no date library and must not grow one for a bar's `x`
+/// (the same argument ADR-0022 made about Markdown), and it is a *day number*
+/// rather than a `Date`: the only questions asked of it are "which is earlier"
+/// and "how many days apart".
+///
+/// Out-of-range fields are not invalidated (a hand-edited `2026-13-99` maps to
+/// a day number none of its neighbours share) for the same reason
+/// [`is_stored_date`] checks the shape and not the calendar: a wrong bar is
+/// visible and harmless, a refused read is not.
+pub fn day_number(year: i32, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year } as i64;
+    let m = month as i64;
+    let d = day as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The day number of a **stored (or painted) date value**, or `None` when the
+/// text is not one of ADR-0062's shapes. A painted date cell is
+/// `DateFormat::Date`'s first ten characters or the full stored text, and both
+/// start `YYYY-MM-DD`, so the first ten characters are the day — which is the
+/// one place the timeline and the calendar read a date out of a cell, and the
+/// reason neither needs a second query per row.
+pub fn day_number_of(text: &str) -> Option<i64> {
+    if !is_stored_date(text) {
+        return None;
+    }
+    let year = text.get(..4)?.parse::<i32>().ok()?;
+    let month = text.get(5..7)?.parse::<u32>().ok()?;
+    let day = text.get(8..10)?.parse::<u32>().ok()?;
+    Some(day_number(year, month, day))
+}
+
+/// The Monday-based weekday of a month's first day, `0 = Monday … 6 = Sunday`.
+/// 1970-01-01 was a Thursday, which is day number 0, so the offset is three.
+/// A calendar week that starts on Monday is the Notion shape the brief asks
+/// for, and the expression is the whole of the choice.
+pub fn first_weekday_monday0(year: i32, month: u32) -> u32 {
+    let day = day_number(year, month, 1);
+    ((day + 3).rem_euclid(7)) as u32
+}
+
+/// `2004` → `"2004-09-22"`. The stored date shape, written where the calendar
+/// builds the range clauses of a month (ADR-0062: bytes are time order, which
+/// is what makes `>=`/`<` a date comparison in SQL).
+pub fn date_key(year: i32, month: u32, day: u32) -> String {
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// `"2004-09"` — the month's first day as a key, which is the lower bound of
+/// the month's range clause.
+pub fn month_key(year: i32, month: u32) -> String {
+    date_key(year, month, 1)
+}
+
+/// The month a stored date value falls in, or `None` when it is not a date.
+pub fn month_of(text: &str) -> Option<(i32, u32)> {
+    if !is_stored_date(text) {
+        return None;
+    }
+    let year = text.get(..4)?.parse::<i32>().ok()?;
+    let month = text.get(5..7)?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some((year, month))
+}
+
+/// The day of the month a stored date value names (`"2026-09-22T10:00"` → 22),
+/// or `None` when it is not a date — the key the calendar's per-day queries are
+/// built from.
+pub fn day_of(text: &str) -> Option<u32> {
+    month_of(text)?;
+    text.get(8..10)?.parse::<u32>().ok()
+}
+
+/// Step a month by `delta` (a day's worth of intuition: `-1` is the month
+/// before, `+1` the one after), with the year carried. Written out rather than
+/// with `%`/`/` on a signed month because a calendar jumps from January
+/// backwards to December and the sign has to come out right.
+pub fn shift_month(year: i32, month: u32, delta: i32) -> (i32, u32) {
+    let mut y = year as i64;
+    let mut m = month as i64 + delta as i64;
+    while m < 1 {
+        m += 12;
+        y -= 1;
+    }
+    while m > 12 {
+        m -= 12;
+        y += 1;
+    }
+    (y as i32, m as u32)
+}
+
+/// The English month names the calendar's strip draws. The app's UI language is
+/// English (every other label in this build is), and a name table is the whole
+/// of what an i18n layer would change here.
+pub const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// `(2026, 9)` → `"September 2026"` — the calendar's strip label.
+pub fn month_label(year: i32, month: u32) -> String {
+    let name = MONTH_NAMES
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("");
+    format!("{name} {year}")
+}
+
+/// One month's grid: `CALENDAR_WEEKS * CALENDAR_COLUMNS` cells, leading and
+/// trailing days zero. `0` is a blank cell (the delegate draws nothing there);
+/// `1..=31` is a day of `year`/`month`.
+///
+/// The grid is a *constant* size so that a month's shape does not depend on
+/// which month it is — the same reason the surface height is a constant. A
+/// hand-edited date outside the month's days (`2026-02-30`) composes a day
+/// cell that never matches a query, which is where the fold and the count keep
+/// it from lying about the grid.
+pub fn month_cells(year: i32, month: u32) -> Vec<i32> {
+    let lead = first_weekday_monday0(year, month) as usize;
+    let days = days_in_month(year, month) as i32;
+    let mut cells = vec![0i32; CALENDAR_WEEKS * CALENDAR_COLUMNS];
+    for day in 1..=days {
+        let at = lead + (day as usize - 1);
+        if at < cells.len() {
+            cells[at] = day;
+        }
+    }
+    cells
+}
+
+// ─── D5's document keys ──────────────────────────────────────────────────────
+//
+// ADR-0064's one JSON document per view keeps growing by keys, never by tables
+// (ADR-0064/0074), and D5 owns **one** of them: `date` (plus its optional
+// partner `end`), which names the column a calendar places records by and a
+// timeline draws bars from.
+//
+// Why one key serves two layouts: both ask the same question — "which column is
+// this view's time axis" — and a second key would let the two answers drift
+// while meaning the same thing. What differs is only the fallback: a calendar
+// with no key falls back to the first date-kind column, because a calendar with
+// no time axis is a grid of nothing. A `sorts`/`filter` key is *not* reused for
+// this: those change membership and order, and neither says "which day".
+
+impl ViewDefinition {
+    /// The column this view's time axis is, as stored (`None` when the view has
+    /// no opinion or the key is not an id). Whether the column still exists, and
+    /// which kind it is, is the caller's check — a document is read by the layer
+    /// that has the schema.
+    pub fn date_column(&self) -> Option<PropertyId> {
+        self.document.get("date").and_then(Json::as_u64).map(PropertyId)
+    }
+
+    /// Write the time axis (`None` stores JSON `null`, "known and empty" — the
+    /// same rule `set_filter` follows, so a later build can tell a view that
+    /// never had the key from one whose column was cleared).
+    pub fn set_date(&mut self, property: Option<PropertyId>) {
+        self.put(
+            "date",
+            match property {
+                Some(id) => Json::Number(id.as_u64() as f64),
+                None => Json::Null,
+            },
+        );
+    }
+
+    /// The optional **end** column: a timeline bar spans from `date` to `end`
+    /// when the record has both, and is a point when it does not (the brief's
+    /// 「起=止=同一天时画点」). Optional because most databases have one date.
+    pub fn end_column(&self) -> Option<PropertyId> {
+        self.document.get("end").and_then(Json::as_u64).map(PropertyId)
+    }
+
+    pub fn set_end(&mut self, property: Option<PropertyId>) {
+        self.put(
+            "end",
+            match property {
+                Some(id) => Json::Number(id.as_u64() as f64),
+                None => Json::Null,
+            },
+        );
+    }
+}
+

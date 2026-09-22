@@ -72,7 +72,7 @@ use crate::core::persistence::StorageError;
 use crate::core::types::{OrderKey, PageId};
 
 use super::database::{ord_from_db, ord_to_db};
-use super::database_query::{count_query, group_query, row_query_in_group, row_query_plan};
+use super::database_query::{count_query, group_query, range_query, row_query_in_group, row_query_plan};
 use super::repository::{require_hit, SqliteRepository};
 
 /// The one clock in the database layer (ADR-0068): SQLite's own, read as the
@@ -510,6 +510,39 @@ impl SqliteRepository {
         )
     }
 
+    /// The span one column takes across the rows the filter admits, as the
+    /// stored text at each end — D5's timeline asks this once per refresh
+    /// (`database_query::range_query`: two aggregates over the same `FROM`/
+    /// `WHERE` the row read runs) to size its axis, and no row is taken to
+    /// answer it. `None` when no admitted row holds a value at all: an empty
+    /// axis is a fact the view draws, not an error.
+    ///
+    /// The values come back as stored text, not parsed dates: the caller (which
+    /// knows the column's kind) decides what they mean, and the store stays the
+    /// one place that runs SQL and the only place that does not interpret it.
+    pub fn column_bounds(
+        &self,
+        req: &RowRequest<'_>,
+        property: PropertyId,
+        kind: PropertyKind,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        let conn = self.database().conn();
+        let plan = range_query(req, property, kind);
+        let row: (Option<String>, Option<String>) = conn
+            .query_row(
+                &plan.sql,
+                params_from_iter(plan.binds.iter().copied()),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(sql)?;
+        // An empty text is the pre-ADR-0068 stamp shape, not a bound; a min
+        // that comes back `''` means nothing real was stored.
+        match (row.0.filter(|t| !t.is_empty()), row.1.filter(|t| !t.is_empty())) {
+            (Some(low), Some(high)) => Ok(Some((low, high))),
+            _ => Ok(None),
+        }
+    }
+
     /// The highest `ord` in one database, or `None` when it has no rows — what
     /// the "new row" path asks for the key of the row it is about to append.
     ///
@@ -527,6 +560,28 @@ impl SqliteRepository {
             )
             .map_err(sql)?;
         Ok(max.map(|ord| OrderKey(ord_from_db(ord))))
+    }
+
+    /// The local month, by the same clock the record stamps use — `NOW`'s
+    /// `strftime('now','localtime')`, asked of SQLite itself so "this month"
+    /// (the calendar's default) means what a record's `created` stamp prints.
+    /// One question, asked once per calendar without a session choice.
+    /// `None` when the clock cannot be read, which the caller treats as "no
+    /// default" rather than inventing a month.
+    pub fn local_month(&self) -> Result<Option<(i32, u32)>, StorageError> {
+        let conn = self.database().conn();
+        let text: Option<String> = conn
+            .query_row("SELECT strftime('%Y-%m','now','localtime')", [], |r| r.get(0))
+            .map_err(sql)?;
+        let Some(text) = text else {
+            return Ok(None);
+        };
+        let year = text.get(..4).and_then(|s| s.parse::<i32>().ok());
+        let month = text.get(5..7).and_then(|s| s.parse::<u32>().ok());
+        Ok(match (year, month) {
+            (Some(year), Some(month)) if (1..=12).contains(&month) => Some((year, month)),
+            _ => None,
+        })
     }
 
     /// The highest id in one of the six database tables, or 0 for an empty one —

@@ -1,4 +1,4 @@
-// Named versions of one page (SPEC §三十八 "version history", ADR-0050).
+// Named versions of one page (SPEC §三十八 "version history", ADR-0091).
 //
 // SPEC §三十八 says version history reuses §二十五's snapshot mechanism and
 // must not invent a second store. Read literally, that is what this file is: a

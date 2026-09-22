@@ -109,7 +109,7 @@ impl SqliteRepository {
     /// [`Repository::load`] without the startup contract that comes with
     /// [`Self::open`]: no snapshot family is rotated, no corrupt-file walk runs,
     /// and nothing is written beside the file. That is how a version snapshot
-    /// is read back (SPEC §三十八, ADR-0050), and `path` stays `None` because a
+    /// is read back (SPEC §三十八, ADR-0091), and `path` stays `None` because a
     /// handle that reports no path cannot be pointed at by the writers.
     pub(crate) fn from_database(db: Database) -> Self {
         SqliteRepository { db, path: None }

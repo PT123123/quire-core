@@ -542,7 +542,7 @@ fn snapshot_cost() {
     drop(repo);
 }
 
-// Named versions of one page (SPEC §三十八, ADR-0050). These are the file-level
+// Named versions of one page (SPEC §三十八, ADR-0091). These are the file-level
 // promises: a version is §二十五's `VACUUM INTO` narrowed to one page, so the
 // tests below ask whether the narrowing really happened — in the rows, in the
 // search index, and in the bytes on disk — and whether the folder's own

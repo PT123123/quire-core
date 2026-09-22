@@ -219,6 +219,25 @@ pub enum Command {
     /// The inverse is the view alone: a view nobody has edited yet holds no
     /// document and owns no rows, so `ViewDeleted` is the whole of the undo.
     AddDatabaseView { block: BlockId, view: View },
+    /// Set (or clear) a `formula` column's expression — D6's formula editor.
+    /// The strings are the column's **whole `config` document** before and
+    /// after (ADR-0061's one document per column), read-edit-written by the
+    /// caller through `core::database_formula::config_set_formula`, so the keys
+    /// this command does not own pass through untouched (ADR-0074's discipline,
+    /// applied to a column) and one edit is one change and one Ctrl+Z.
+    ///
+    /// The plan is the same shape `SetDatabaseViewDefinition`'s is — replace
+    /// whole, revert to the whole previous text — because the *validation*
+    /// (that the expression parses, that its column names exist, that the
+    /// dependency graph stays acyclic, ADR-0082's save-time checks) happened in
+    /// the caller before this command was built: `core::command::plan` sees a
+    /// `Document` and no store, and a formula's schema is the store's answer.
+    SetDatabaseFormula {
+        block: BlockId,
+        property: PropertyId,
+        from: String,
+        to: String,
+    },
 }
 
 /// The grid shape the "+", the slash menu and "Turn into" hand out. Three
@@ -1457,6 +1476,28 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry {
                 apply: vec![Change::ViewAdded(view.clone())],
                 revert: vec![Change::ViewDeleted { id: view.id }],
+            })
+        }
+
+        Command::SetDatabaseFormula {
+            block,
+            property,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to {
+                // The same write twice is not an undo step (the rule
+                // `SetDatabaseCell` states); a config that did not change has
+                // nothing to undo.
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::PropertyConfigSet { id: property, config: to }],
+                revert: vec![Change::PropertyConfigSet {
+                    id: property,
+                    config: from,
+                }],
             })
         }
 

@@ -336,6 +336,82 @@ impl SqliteRepository {
         }
     }
 
+    /// One column's stored values for **every record of one database**, keyed
+    /// by record — the read D6's Markdown export preloads its formula
+    /// dependencies from. The window read has no need of it (a formula on 31
+    /// realized rows point-reads its dependencies through `cell`, ADR-0083);
+    /// the export renders the *whole* view, and one indexed sweep per
+    /// dependency column is the honest shape there — the same trade
+    /// `unwindowed_rows` makes, for the same reason.
+    ///
+    /// A `formula` / `rollup` / `relation` column answers an empty map (it
+    /// stores nothing, ADR-0062), and a missing value simply does not appear in
+    /// the map — absence is empty, as everywhere else in this layer.
+    pub fn column_values(
+        &self,
+        db: DatabaseId,
+        property: PropertyId,
+    ) -> Result<std::collections::HashMap<u64, CellValue>, StorageError> {
+        let conn = self.database().conn();
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT kind FROM db_properties WHERE id = ?1",
+                params![property.as_u64() as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some(kind) = kind else {
+            return Ok(std::collections::HashMap::new());
+        };
+        let kind = PropertyKind::from_stored(&kind);
+        if matches!(kind.value_kind(), ValueKind::Computed | ValueKind::Derived) {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut statement = conn
+            .prepare(
+                "SELECT v.record, v.text, v.num, v.flag FROM db_values v
+                 JOIN db_records r ON r.id = v.record
+                 WHERE r.db = ?1 AND v.property = ?2",
+            )
+            .map_err(sql)?;
+        let rows = statement
+            .query_map(
+                params![db.as_u64() as i64, property.as_u64() as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .map_err(sql)?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (record, text, num, flag) = row.map_err(sql)?;
+            let value = match kind.value_kind() {
+                ValueKind::Text => CellValue::Text(text.unwrap_or_default()),
+                ValueKind::Number => match num {
+                    Some(num) => CellValue::Number(num),
+                    // A `NULL` num is empty, never 0 — the same rule `cell`
+                    // states for one row (ADR-0062's single "no value").
+                    None => CellValue::Empty,
+                },
+                ValueKind::Flag => CellValue::Flag(flag.unwrap_or(0) != 0),
+                // The list kinds are not fetched by this sweep (their values
+                // live in `db_value_items`, one row per item): a formula that
+                // names one reads it as empty (`core::database_formula::val_of`),
+                // so a map that pretends otherwise would disagree with the
+                // window path.
+                _ => CellValue::Empty,
+            };
+            out.insert(record, value);
+        }
+        Ok(out)
+    }
+
     /// **The workspace's local member list** — SPEC §三十九's `person` 降级, and
     /// ADR-0071's shape for it: no accounts, no member table, no ids. A person
     /// is a name in a text cell, and the list a picker offers is the distinct
@@ -1121,6 +1197,25 @@ pub(crate) fn set_property_kind(
         )
         .map_err(sql)?;
     require_hit(n, "PropertyKindSet", property.as_u64())
+}
+
+/// Replace a column's `config` document whole — `Change::PropertyConfigSet`'s
+/// write (D6, ADR-0082). The caller read-edit-wrote the document
+/// (`core::database_formula::config_set_formula` for the formula key), so this
+/// is one `UPDATE` and no JSON happens here: storage stores what the caller
+/// decided, which is what keeps the document's shape defined in one place.
+pub(crate) fn set_property_config(
+    tx: &Transaction,
+    property: PropertyId,
+    config: &str,
+) -> Result<(), StorageError> {
+    let n = tx
+        .execute(
+            "UPDATE db_properties SET config = ?2 WHERE id = ?1",
+            params![id(property.as_u64()), config],
+        )
+        .map_err(sql)?;
+    require_hit(n, "PropertyConfigSet", property.as_u64())
 }
 
 pub(crate) fn set_property_ord(

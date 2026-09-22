@@ -975,5 +975,12 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
         }
         Change::ViewOrdSet { id, ord } => database_store::set_view_ord(tx, *id, *ord),
         Change::ViewDeleted { id } => database_store::delete_view(tx, *id),
+        // D6 (ADR-0082): a column's `config` document, replaced whole — the
+        // formula expression's write today, an option list's or a number
+        // format's later. The document was read-edit-written by the caller
+        // (ADR-0074's discipline); storage stores it and does no JSON.
+        Change::PropertyConfigSet { id, config } => {
+            database_store::set_property_config(tx, *id, config)
+        }
     }
 }

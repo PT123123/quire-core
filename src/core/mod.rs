@@ -3,6 +3,9 @@
 
 pub mod command;
 pub mod database;
+// D6's computing half of SPEC §三十九 「需计算」: the formula engine — a pure
+// lexer and hand-written interpreter, finite by constants (ADR-0082/0083).
+pub mod database_formula;
 pub mod database_property;
 // D3's drawing half of SPEC §三十九: the view's definition document, the
 // columns it shows, and the shape one window of rows takes on its way to Slint.

@@ -185,6 +185,21 @@ pub enum Change {
     /// database)"), while a block whose ref was silently repointed would be a
     /// database someone else's rows vanished into.
     BlockDbRefSet { id: BlockId, db: Option<DatabaseId> },
+
+    /// A column's `config` document, **replaced whole** (ADR-0061's one JSON
+    /// document per column; the read-edit-write discipline is ADR-0074's,
+    /// applied to a column instead of a view). D6's first writer is the formula
+    /// expression (ADR-0082: the config holds the *expression* — the value is
+    /// computed at projection time and is never stored, ADR-0062/0039), and a
+    /// later editor of an option list or a number format writes through the
+    /// same arm rather than through a variant of its own: the document is the
+    /// column's own truth, and merging it in storage would put the writer's
+    /// shape in two places.
+    ///
+    /// Like `ViewDefinitionSet`, there is no `from` here — the command layer
+    /// (`Command::SetDatabaseFormula`) captured the previous document and its
+    /// revert names it; a change names what happened, not which way it ran.
+    PropertyConfigSet { id: PropertyId, config: String },
 }
 
 /// Every attachment id a change list points at, read off the arm that carries

@@ -11,7 +11,7 @@ use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
 use super::types::{
-    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page, PageFont,
+    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page,
     PageId,
 };
 

@@ -4102,4 +4102,137 @@ mod probe {
             all_rows.len(),
         );
     }
+
+    /// SPEC §三十九's 「切换视图的耗时」, headless: what the store does when a
+    /// view opens or its layout changes — decode the definition document, ask
+    /// SQL for the count and the window, and for a grouped layout the group
+    /// tallies. None of these walk the table; the control at the end is the walk
+    /// they refuse, for scale.
+    #[test]
+    #[ignore = "prints a measurement; run with --release --lib -- --ignored --nocapture"]
+    fn a_view_switch_decodes_and_reads_a_window_not_the_table() {
+        use crate::core::database::max_scroll_y;
+        use crate::core::database_view::{GroupSpec, ViewDefinition};
+        use std::hint::black_box;
+
+        let dir = crate::testing::ScratchDir::new("db-switch");
+        let path = dir.join("quire.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+
+        let db = Database::new(DatabaseId(1), "Tasks");
+        let title = db.title_property(PropertyId(1));
+        let number = property(2, PropertyKind::Number, 1);
+        let done = property(3, PropertyKind::Checkbox, 2);
+        let columns = vec![number.clone(), done.clone()];
+        let mut schema = vec![
+            Change::DatabaseCreated(db.clone()),
+            Change::PropertyAdded(title.clone()),
+            Change::ViewAdded(db.first_view(ViewId(1))),
+        ];
+        schema.extend(columns.iter().cloned().map(Change::PropertyAdded));
+        repo.apply(&schema).unwrap();
+
+        for batch in 0..(ROWS / BATCH) {
+            let mut changes = Vec::with_capacity(BATCH * 3);
+            for i in 0..BATCH {
+                let index = batch * BATCH + i;
+                let record = RecordId(index as u64 + 1);
+                changes.push(Change::RecordCreated(Record::bare(
+                    record,
+                    db.id,
+                    OrderKey(((index as u64) + 1) << 32),
+                )));
+                changes.push(Change::CellSet {
+                    record,
+                    property: PropertyId(2),
+                    value: CellValue::Number(index as f64),
+                });
+                changes.push(Change::CellSet {
+                    record,
+                    property: PropertyId(3),
+                    value: CellValue::Flag(index % 2 == 0),
+                });
+            }
+            repo.apply(&changes).unwrap();
+        }
+        assert_eq!(repo.record_count(db.id).unwrap(), ROWS);
+
+        let geometry = ViewGeometry::new(32.0, 720.0);
+        let plain = RowRequest::new(db.id, title.id, &columns);
+        let group = GroupSpec {
+            property: PropertyId(3),
+            kind: PropertyKind::Checkbox,
+        };
+        // A rules-bearing definition, the kind a configured view stores.
+        let definition_text = r#"{"v":1,"filter":{"and":[{"property":2,"op":"gt","value":100}]},"sort":[{"property":2,"descending":true}],"group":[{"property":3}],"columns":[1,2,3],"chart":"bar"}"#;
+
+        // Warm the page cache and the statement machinery.
+        let _ = repo.realized_rows(&plain, geometry, 0.0).unwrap();
+
+        let decodes = 100_000;
+        let started = Instant::now();
+        for _ in 0..decodes {
+            black_box(ViewDefinition::parse(definition_text));
+        }
+        let decode_us = started.elapsed().as_secs_f64() * 1e6 / decodes as f64;
+
+        // A row-shaped switch (table / list / gallery): count + one window fetch.
+        let started = Instant::now();
+        let top = repo.realized_rows(&plain, geometry, 0.0).unwrap();
+        let top_us = started.elapsed().as_secs_f64() * 1e6;
+        let started = Instant::now();
+        let bottom = repo
+            .realized_rows(&plain, geometry, max_scroll_y(ROWS, geometry))
+            .unwrap();
+        let bottom_us = started.elapsed().as_secs_f64() * 1e6;
+
+        // A grouped switch (board / calendar) adds the group tallies.
+        let started = Instant::now();
+        let groups = repo.group_counts(&plain, &group).unwrap();
+        let groups_us = started.elapsed().as_secs_f64() * 1e6;
+
+        // A whole switch, end to end: the decode plus the count+window it drives.
+        let started = Instant::now();
+        black_box(ViewDefinition::parse(definition_text));
+        let _ = repo.realized_rows(&plain, geometry, 0.0).unwrap();
+        let switch_us = started.elapsed().as_secs_f64() * 1e6;
+
+        // The forbidden shape, for scale: a switch that fetched the table.
+        let _ = repo.unwindowed_rows(&plain).unwrap();
+        let started = Instant::now();
+        let all_rows = repo.unwindowed_rows(&plain).unwrap().len();
+        let all_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        assert_eq!(top.realized(), 31);
+        assert_eq!(bottom.realized(), 31);
+        assert_eq!(all_rows, ROWS);
+
+        println!(
+            "view switch probe: {ROWS} rows, geometry 32/720/8, {} groups",
+            groups.len()
+        );
+        println!("  definition decode: {decode_us:.3} µs");
+        println!(
+            "  row switch = count + window fetch: top {top_us:.1} µs, bottom {bottom_us:.1} µs \
+             (31 rows each)"
+        );
+        println!(
+            "  grouped switch adds the tallies: {groups_us:.1} µs for {} groups",
+            groups.len()
+        );
+        println!("  whole switch (decode + row read): {switch_us:.1} µs");
+        println!(
+            "  control — a switch that fetched the table: {all_ms:.1} ms for {all_rows} rows \
+             ({:.0}x the window read)",
+            all_ms * 1000.0 / switch_us
+        );
+        println!(
+            "{{\"label\":\"track3-d8-view-switch\",\"date\":\"2026-09-22\",\
+             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"records\":{ROWS},\"decode_us\":{decode_us:.3},\"row_switch_top_us\":{top_us:.1},\
+             \"row_switch_bottom_us\":{bottom_us:.1},\"group_tallies_us\":{groups_us:.1},\
+             \"groups\":{},\"whole_switch_us\":{switch_us:.1},\"unwindowed_ms\":{all_ms:.1}}}",
+            groups.len()
+        );
+    }
 }

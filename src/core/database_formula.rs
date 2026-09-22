@@ -1002,11 +1002,6 @@ impl Parser<'_> {
         token
     }
 
-    /// Where an error should point when nothing is left: the end of the input.
-    fn end_at(&self) -> usize {
-        self.tokens.last().map(|t| t.at).unwrap_or(0)
-    }
-
     fn expect(&mut self, want: &TokenKind, what: &str) -> Result<(), FormulaError> {
         match self.peek() {
             Some(token) if &token.kind == want => {
@@ -1381,3 +1376,92 @@ pub fn config_set_formula(config: &str, expression: &str) -> String {
 //    for an empty expression, and round-trips through `config_formula`.
 // 7. **`val_of`**'s two folds: a select cell and a list cell are `Empty`, a
 //    date cell is `Val::Date`, an empty cell is `Empty` whatever the kind.
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// A representative, non-trivial expression: two references, arithmetic, a
+    /// comparison folded through `if`, and a nested function — the shape a real
+    /// formula column takes, and the work `open the editor` and `recompute one
+    /// cell` do.
+    const SOURCE: &str = "if([Done], [Points] * 2, [Points] + length(\"pending\")) - 1";
+
+    fn resolve(name: &str) -> Option<PropertyId> {
+        match name {
+            "Done" => Some(PropertyId(1)),
+            "Points" => Some(PropertyId(2)),
+            _ => None,
+        }
+    }
+
+    fn cell(id: PropertyId, _depth: u32) -> Result<Val, FormulaError> {
+        Ok(match id {
+            PropertyId(1) => Val::Flag(true),
+            PropertyId(2) => Val::Num(42.0),
+            _ => Val::Empty,
+        })
+    }
+
+    /// SPEC §三十九's 「打开公式编辑器的耗时」 and ADR-0083's recompute unit, in
+    /// one pure-Rust number: opening the editor parses the stored expression
+    /// once; recomputing a cell evaluates the window's formula cells.
+    #[test]
+    #[ignore = "prints a measurement; run with --release --lib -- --ignored --nocapture"]
+    fn a_formula_parses_and_evaluates_in_nanoseconds() {
+        const PARSES: usize = 50_000;
+        const EVALS: usize = 500_000;
+
+        let started = Instant::now();
+        for _ in 0..PARSES {
+            let parsed = Program::parse(SOURCE, resolve).unwrap();
+            black_box(parsed.deps().len());
+        }
+        let parse_ns = started.elapsed().as_nanos() as f64 / PARSES as f64;
+
+        let program = Program::parse(SOURCE, resolve).unwrap();
+        assert_eq!(program.deps().len(), 2, "the two named columns");
+        let started = Instant::now();
+        for _ in 0..EVALS {
+            let mut give = cell;
+            let value = program.eval(&mut give).unwrap();
+            black_box(&value);
+        }
+        let eval_ns = started.elapsed().as_nanos() as f64 / EVALS as f64;
+
+        // ADR-0083's contract, stated as the arithmetic the projection runs:
+        // opening a 10 000-row database paints the *window* (D0's 31 rows), so
+        // one visible formula column costs `window × eval`, and a table ten
+        // thousand rows deep pays the *same* number. Three formula columns is
+        // the figure a busy view approaches.
+        let window = 31.0;
+        let one_column_us = window * eval_ns / 1_000.0;
+        let three_columns_us = 3.0 * one_column_us;
+        let full_table_us = 10_000.0 * eval_ns / 1_000.0;
+
+        println!(
+            "formula probe: expr = {SOURCE:?}\n  parse {parse_ns:.0} ns \
+             (open-the-editor work)   eval {eval_ns:.0} ns (one painted cell)"
+        );
+        println!(
+            "  recompute the window ({} rows × 1 formula column) = {one_column_us:.2} µs; \
+             3 columns = {three_columns_us:.2} µs",
+            window as usize
+        );
+        println!(
+            "  the forbidden shape (10 000 rows recomputed) = {full_table_us:.1} µs — \
+             {:.0}× the window, and what the projection never does",
+            full_table_us / three_columns_us
+        );
+        println!(
+            "{{\"label\":\"track3-d8-formula\",\"date\":\"2026-09-22\",\
+             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"parse_ns\":{parse_ns:.0},\"eval_ns\":{eval_ns:.0},\
+             \"window_rows\":{window:.0},\"window_one_column_us\":{one_column_us:.3},\
+             \"window_three_columns_us\":{three_columns_us:.3},\
+             \"full_table_10000_us\":{full_table_us:.1}}}"
+        );
+    }
+}

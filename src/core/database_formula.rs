@@ -367,7 +367,7 @@ impl Program {
         if let Some(token) = parser.peek() {
             return Err(FormulaError::Syntax(format!(
                 "unexpected {} at character {}",
-                token.describe(),
+                token.kind.describe(),
                 token.at
             )));
         }
@@ -746,10 +746,10 @@ enum TokenKind {
     Comma,
 }
 
-impl Token {
+impl TokenKind {
     /// How an error message names this token.
     fn describe(&self) -> String {
-        match &self.kind {
+        match self {
             TokenKind::Num(num) => format!("the number {num}"),
             TokenKind::Str(_) => "a text".into(),
             TokenKind::Word(word) => format!("\"{word}\""),
@@ -878,12 +878,21 @@ fn lex(source: &str) -> Result<Vec<Token>, FormulaError> {
                         // also what keeps a multi-byte character whole (a byte
                         // at a time would cut it in half).
                         Some(b'\\') => {
-                            text.push('\\');
-                            at += 2;
-                        }
-                        Some(_) => {
-                            text.push('\\');
-                            at += 1;
+                            match bytes.get(at + 1) {
+                                Some(byte @ (b'"' | b'\\')) => {
+                                    text.push(*byte as char);
+                                    at += 2;
+                                }
+                                Some(_) => {
+                                    text.push('\\');
+                                    at += 1;
+                                }
+                                None => {
+                                    return Err(FormulaError::Syntax(format!(
+                                        "this text is never closed (it opens at character {start})"
+                                    )))
+                                }
+                            }
                         }
                         Some(_) => {
                             // Step one *character*, not one byte: a multi-byte
@@ -1181,7 +1190,7 @@ impl Parser<'_> {
                     if arguments.len() < least || most.is_some_and(|most| arguments.len() > most) {
                         return Err(FormulaError::Syntax(format!(
                             "\"{name}\" takes {} argument(s), not {}",
-                            arity_words(*least, *most),
+                            arity_words(least, *most),
                             arguments.len()
                         )));
                     }

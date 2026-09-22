@@ -516,7 +516,7 @@ impl SqliteRepository {
         let n: i64 = conn
             .query_row(
                 &plan.sql,
-                params_from_iter(plan.binds.iter().copied()),
+                params_from_iter(plan.binds.iter().cloned()),
                 |r| r.get(0),
             )
             .map_err(sql)?;
@@ -544,8 +544,8 @@ impl SqliteRepository {
         let conn = self.database().conn();
         let plan = group_query(req, spec);
         let mut stmt = conn.prepare(&plan.sql).map_err(sql)?;
-        let rows = stmt
-            .query(params_from_iter(plan.binds.iter().copied()))
+        let mut rows = stmt
+            .query(params_from_iter(plan.binds.iter().cloned()))
             .map_err(sql)?;
         let mut out: Vec<(GroupKey, usize)> = Vec::new();
         while let Some(row) = rows.next().map_err(sql)? {
@@ -607,7 +607,7 @@ impl SqliteRepository {
         let row: (Option<String>, Option<String>) = conn
             .query_row(
                 &plan.sql,
-                params_from_iter(plan.binds.iter().copied()),
+                params_from_iter(plan.binds.iter().cloned()),
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(sql)?;
@@ -903,7 +903,7 @@ fn run_row_query(
     let mut raw: Vec<RawRow> = Vec::new();
     {
         let mut rows = stmt
-            .query(params_from_iter(binds.iter().copied()))
+            .query(params_from_iter(binds.iter().cloned()))
             .map_err(sql)?;
         while let Some(row) = rows.next().map_err(sql)? {
             let record = row.get::<_, i64>(0).map_err(sql)?;
@@ -3100,7 +3100,7 @@ mod tests {
         let mut stmt = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
             .unwrap();
-        stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |r| {
+        stmt.query_map(rusqlite::params_from_iter(binds.iter().cloned()), |r| {
             r.get::<_, String>(3)
         })
         .unwrap()
@@ -3704,7 +3704,7 @@ mod probe {
                 .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
                 .unwrap();
             let plan: Vec<String> = stmt
-                .query_map(params_from_iter(binds.iter().copied()), |r| {
+                .query_map(params_from_iter(binds.iter().cloned()), |r| {
                     r.get::<_, String>(3)
                 })
                 .unwrap()
@@ -3998,7 +3998,7 @@ mod probe {
             let plan: Vec<String> = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
                 .unwrap()
-                .query_map(params_from_iter(binds.iter().copied()), |r| {
+                .query_map(params_from_iter(binds.iter().cloned()), |r| {
                     r.get::<_, String>(3)
                 })
                 .unwrap()

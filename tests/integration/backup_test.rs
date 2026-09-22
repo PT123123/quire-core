@@ -539,3 +539,432 @@ fn snapshot_cost() {
     println!("repository open (rotate + snapshot): {opened:.3?}, {blocks} blocks loaded");
     drop(repo);
 }
+
+// Named versions of one page (SPEC §三十八, ADR-0050). These are the file-level
+// promises: a version is §二十五's `VACUUM INTO` narrowed to one page, so the
+// tests below ask whether the narrowing really happened — in the rows, in the
+// search index, and in the bytes on disk — and whether the folder's own
+// housekeeping can tell its files from somebody else's.
+mod version_files {
+    use super::{tempdir, SqliteRepository};
+    use quire::core::persistence::{Change, Repository, StorageError};
+    use quire::core::types::{
+        Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind,
+        OrderKey, Page, PageFont, PageId, PersistedState,
+    };
+    use quire::storage::versions as v;
+    use std::collections::BTreeSet;
+
+    fn page(id: u64, title: &str) -> Page {
+        Page {
+            id: PageId(id),
+            title: title.into(),
+            parent: None,
+            order: OrderKey(id * 10),
+            favorite: false,
+            expanded: true,
+            font: PageFont::default(),
+            full_width: false,
+            small_text: false,
+            icon: String::new(),
+            cover: None,
+            locked: false,
+            template: false,
+        }
+    }
+
+    fn para(id: u64, owner: u64, text: &str) -> Block {
+        Block {
+            id: BlockId(id),
+            page: PageId(owner),
+            parent: None,
+            order: OrderKey(id * 10),
+            kind: BlockKind::Paragraph,
+            text: text.into(),
+            checked: false,
+            marks: Vec::new(),
+            color: ColorKind::Default,
+            background: ColorKind::Default,
+            page_ref: None,
+            folded: false,
+            attachment: None,
+            img_percent: 100,
+            columns: 0,
+            lang: Lang::Plain,
+        }
+    }
+
+    /// A library with three pages and enough text on each that "one page, minus
+    /// the search index" is measurably smaller than "the library".
+    fn library(path: &std::path::Path) -> SqliteRepository {
+        let repo = SqliteRepository::open(path).unwrap();
+        let mut changes: Vec<Change> = Vec::new();
+        for p in 1..=3u64 {
+            changes.push(Change::PageCreated(page(p, &format!("Page {p}"))));
+            for i in 0..120u64 {
+                let id = p * 1000 + i;
+                changes.push(Change::BlockInserted(para(
+                    id,
+                    p,
+                    &format!("page {p} line {i} — enough words to be worth indexing here"),
+                )));
+            }
+        }
+        repo.apply(&changes).unwrap();
+        repo
+    }
+
+    fn count(path: &std::path::Path, sql: &str) -> i64 {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
+    }
+
+    fn ids(values: &[i64]) -> BTreeSet<i64> {
+        values.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_version_is_the_library_narrowed_to_one_page() {
+        let dir = tempdir();
+        let path = dir.join("workspace.db");
+        let repo = library(&path);
+        let created = 1_700_000_000;
+        assert_eq!(
+            v::save(&repo, 2, created),
+            Ok(Some(vec![])),
+            "no block of page 2 points at a file, so the pin list is empty"
+        );
+
+        let file = v::path_for(&path, 2, created);
+        assert!(file.exists(), "the version is a file beside the library");
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                !std::path::Path::new(&format!("{}{suffix}", file.display())).exists(),
+                "a version has to be one self-contained file, like a snapshot"
+            );
+        }
+
+        assert_eq!(
+            count(&file, "SELECT COUNT(*) FROM pages"),
+            1,
+            "every other page is gone, and the cascade took its blocks with it"
+        );
+        assert_eq!(count(&file, "SELECT COUNT(*) FROM blocks"), 120);
+        // The FTS tables are a copy of every page's text. Leaving them in would
+        // make "a snapshot of one page" quietly be "a copy of the library".
+        assert_eq!(count(&file, "SELECT COUNT(*) FROM search_pages"), 0);
+        assert_eq!(count(&file, "SELECT COUNT(*) FROM search_blocks"), 0);
+        // …and the row counts alone do not prove it. FTS5 keeps its terms in a
+        // `<table>_data` b-tree that a plain `DELETE` leaves standing: measured
+        // on a 201-page library, a version with 0 rows in `search_blocks` still
+        // held 368 rows / 1.4 MB of `search_blocks_data` — the words of every
+        // page it was not allowed to contain. An emptied index sits at two rows
+        // (its root and config cells), so a handful here is the real check.
+        for fts in ["search_pages", "search_blocks"] {
+            let terms = count(&file, &format!("SELECT COUNT(*) FROM {fts}_data"));
+            assert!(
+                terms <= 4,
+                "{fts}_data holds {terms} rows: the term index survived the narrowing"
+            );
+        }
+
+        // The library's own rows are still in its WAL at this moment — `VACUUM
+        // INTO` reads through the connection, which sees them, while the main
+        // file on disk has not taken them yet — so the comparison is with every
+        // byte the library occupies.
+        let mut main = 0u64;
+        for suffix in ["", "-wal", "-shm"] {
+            main += std::fs::metadata(format!("{}{suffix}", path.display()))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+        let version = std::fs::metadata(&file).unwrap().len();
+        assert!(
+            version * 2 < main,
+            "one page of three must be less than half the library it came from: {version} vs {main}"
+        );
+    }
+
+    #[test]
+    fn a_version_reads_back_through_the_loader_the_app_uses() {
+        // The reason no second reader exists: a version file *is* a Quire
+        // database, so everything a page can carry survives the round trip.
+        let dir = tempdir();
+        let path = dir.join("workspace.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+        let mut block = para(11, 1, "Ship it");
+        block.kind = BlockKind::Callout;
+        block.color = ColorKind::Blue;
+        block.background = ColorKind::Yellow;
+        block.lang = Lang::Rust;
+        block.checked = true;
+        block.folded = true;
+        block.attachment = Some(AttachmentId(4));
+        block.img_percent = 50;
+        block.marks = vec![Mark {
+            start: 0,
+            end: 4,
+            kind: MarkKind::Bold,
+            url: String::new(),
+        }];
+        repo.apply(&[
+            Change::PageCreated(Page {
+                title: "A page with a name".into(),
+                icon: "🚀".into(),
+                ..page(1, "unused")
+            }),
+            Change::AttachmentAdded(Attachment {
+                id: AttachmentId(4),
+                name: "Sunset photo.png".into(),
+                file: "4.png".into(),
+                thumb: String::new(),
+                mime: "image/png".into(),
+                bytes: 12345,
+                width: 1280,
+                height: 720,
+            }),
+            Change::BlockInserted(block.clone()),
+            Change::BlockInserted(para(12, 1, "second line")),
+        ])
+        .unwrap();
+
+        let pinned = v::save(&repo, 1, 1_700_000_001).unwrap().unwrap();
+        assert_eq!(pinned, vec![4], "the picture a version points at is recorded");
+
+        let (stored, blocks) = v::read(&path, 1, 1_700_000_001).unwrap();
+        assert_eq!(stored.title, "A page with a name");
+        assert_eq!(stored.icon, "🚀");
+        assert_eq!(blocks, vec![block, para(12, 1, "second line")]);
+    }
+
+    #[test]
+    fn a_second_version_taken_in_the_same_second_is_refused_not_overwritten() {
+        let dir = tempdir();
+        let path = dir.join("workspace.db");
+        let repo = library(&path);
+        assert!(v::save(&repo, 1, 1_700_000_002).unwrap().is_some());
+        let before = std::fs::metadata(v::path_for(&path, 1, 1_700_000_002))
+            .unwrap()
+            .len();
+        assert_eq!(
+            v::save(&repo, 1, 1_700_000_002),
+            Ok(None),
+            "`None` is the collision the caller retries a second later"
+        );
+        let after = std::fs::metadata(v::path_for(&path, 1, 1_700_000_002))
+            .unwrap()
+            .len();
+        assert_eq!(before, after, "and the first copy is untouched by the refusal");
+    }
+
+    #[test]
+    fn a_version_of_a_page_that_is_not_there_leaves_no_file() {
+        let dir = tempdir();
+        let path = dir.join("workspace.db");
+        let repo = library(&path);
+        let result = v::save(&repo, 99, 1_700_000_003);
+        assert!(
+            matches!(result, Err(StorageError::Sql(_))),
+            "a page nobody can name is an error, not an empty version: {result:?}"
+        );
+        assert!(!v::path_for(&path, 99, 1_700_000_003).exists());
+        // and a session with no database file says so at the door
+        let memory = SqliteRepository::in_memory().unwrap();
+        assert!(
+            v::save(&memory, 1, 1).is_err(),
+            "no file, so nowhere for a version to live"
+        );
+    }
+
+    #[test]
+    fn the_index_lists_one_pages_versions_newest_first() {
+        let persisted = PersistedState {
+            pages: Vec::new(),
+            blocks: Vec::new(),
+            meta: [
+                (v::label_key(1, 200), "Draft".to_string()),
+                (v::label_key(1, 300), "Shipped".to_string()),
+                (v::label_key(2, 400), "Other page".to_string()),
+                (v::files_key(1, 200), "7,12".to_string()),
+                // strangers: a half-written key, a key missing its number, and
+                // a row this feature never writes
+                ("version/x/1".to_string(), "junk".to_string()),
+                ("version/1".to_string(), "junk".to_string()),
+                ("something/else".to_string(), "junk".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            settings: Default::default(),
+        };
+        assert_eq!(
+            v::index_of(&persisted, 1),
+            vec![(300, "Shipped".to_string()), (200, "Draft".to_string())],
+            "newest first, and nothing that is not a label row"
+        );
+        assert_eq!(v::index_of(&persisted, 2).len(), 1);
+        assert_eq!(v::index_of(&persisted, 3), Vec::new());
+        // `-files` hangs off the same idea without being one of its prefixes
+        assert_eq!(v::parse_key(&v::files_key(1, 200)), None);
+        assert_eq!(v::parse_ids("7,12"), ids(&[7, 12]));
+        assert_eq!(
+            v::parse_ids("7, ,oops,12"),
+            ids(&[7, 12]),
+            "an unparseable id is skipped, which costs a picture the reclaim keeps"
+        );
+    }
+
+    #[test]
+    fn the_folder_sweep_takes_only_what_the_index_no_longer_names() {
+        let dir = tempdir();
+        let path = dir.join("workspace.db");
+        let repo = library(&path);
+        v::save(&repo, 1, 100).unwrap();
+        v::save(&repo, 1, 200).unwrap();
+        v::save(&repo, 2, 300).unwrap();
+        // a file a crashed save left behind: written, never listed
+        std::fs::copy(v::path_for(&path, 1, 100), v::path_for(&path, 1, 999)).unwrap();
+        // and something that is not this folder's business at all
+        let stranger = v::folder(&path).join("readme.txt");
+        std::fs::write(&stranger, b"not a version").unwrap();
+
+        let keep: BTreeSet<(i64, i64)> = [(1i64, 200i64), (2, 300)].into_iter().collect();
+        let gone = v::sweep_orphans(&path, &keep).unwrap();
+        assert_eq!(gone.len(), 2, "the pruned one and the orphan: {gone:?}");
+        assert!(!v::path_for(&path, 1, 100).exists());
+        assert!(!v::path_for(&path, 1, 999).exists());
+        assert!(v::path_for(&path, 1, 200).exists());
+        assert!(
+            v::path_for(&path, 2, 300).exists(),
+            "another page's version is kept"
+        );
+        assert!(
+            stranger.exists(),
+            "a file this folder did not name is nobody's to delete"
+        );
+
+        // no folder yet is not an error — a library that never versioned
+        let fresh = tempdir();
+        let empty = fresh.join("new.db");
+        let _repo = SqliteRepository::open(&empty).unwrap();
+        assert_eq!(v::sweep_orphans(&empty, &keep).unwrap(), Vec::<std::path::PathBuf>::new());
+    }
+
+    #[test]
+    fn removing_a_version_takes_its_sidecars_with_it() {
+        let dir = tempdir();
+        let path = dir.join("workspace.db");
+        let repo = library(&path);
+        v::save(&repo, 1, 12345).unwrap();
+        let file = v::path_for(&path, 1, 12345);
+        for suffix in ["-wal", "-shm"] {
+            std::fs::write(format!("{}{suffix}", file.display()), b"x").unwrap();
+        }
+        v::remove(&path, 1, 12345).unwrap();
+        assert!(!file.exists());
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                !std::path::Path::new(&format!("{}{suffix}", file.display())).exists(),
+                "a version is one file, and a half-deleted one is a leak"
+            );
+        }
+        // removing what is already gone is a no-op, like `MetaDelete`
+        v::remove(&path, 1, 12345).unwrap();
+    }
+
+    /// One-off cost probe for docs/PERFORMANCE.md, not an assertion: what one
+    /// page's version file costs against the library it came from, what the
+    /// twenty-per-page cap bounds that at, and how long the copy takes. Run with
+    /// `cargo test --test backup -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "one-off cost probe, not an assertion"]
+    fn version_cost() {
+        use std::time::Instant;
+
+        fn on_disk(path: &std::path::Path) -> u64 {
+            ["", "-wal", "-shm"]
+                .iter()
+                .map(|suffix| {
+                    std::fs::metadata(format!("{}{suffix}", path.display()))
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                })
+                .sum()
+        }
+
+        let dir = tempdir();
+        let path = dir.join("cost.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+        // A working library: 200 pages of 60 lines, plus one page the size of a
+        // long one (5 000 lines), which is the worst case the cap bounds.
+        let mut changes: Vec<Change> = Vec::new();
+        for p in 1..=200u64 {
+            changes.push(Change::PageCreated(page(p, &format!("Page {p}"))));
+            for i in 0..60u64 {
+                changes.push(Change::BlockInserted(para(
+                    p * 1000 + i,
+                    p,
+                    &format!("page {p} line {i} — enough words to be worth indexing here"),
+                )));
+            }
+        }
+        changes.push(Change::PageCreated(page(900, "The long one")));
+        for i in 0..5_000u64 {
+            changes.push(Change::BlockInserted(para(
+                900_000 + i,
+                900,
+                &format!("long page line {i} — enough words to be worth indexing here"),
+            )));
+        }
+        repo.apply(&changes).unwrap();
+        let main = on_disk(&path);
+        let rows = count(&path, "SELECT COUNT(*) FROM blocks");
+        println!("library: {main} bytes on disk, {rows} blocks in 201 pages");
+        // The RAM half of the question is bounded by two sizes, so print the one
+        // that is not a constant: a version's rows are `Block`s, and a diff holds
+        // a second copy of them.
+        println!(
+            "one Block in memory: {} bytes, so the 5 000-line page is {} bytes of rows while a version is open",
+            std::mem::size_of::<Block>(),
+            5_000 * std::mem::size_of::<Block>()
+        );
+
+        for (label, p) in [("an ordinary 60-line page", 7u64), ("a 5 000-line page", 900u64)] {
+            let started = Instant::now();
+            v::save(&repo, p as i64, 1_700_000_000).unwrap();
+            let took = started.elapsed();
+            let bytes = std::fs::metadata(v::path_for(&path, p as i64, 1_700_000_000))
+                .unwrap()
+                .len();
+            println!(
+                "{label}: version {bytes} bytes, {}% of the library",
+                bytes * 100 / main
+            );
+            println!("    copy + narrow + vacuum took {took:.3?}");
+            std::fs::remove_file(v::path_for(&path, p as i64, 1_700_000_000)).unwrap();
+        }
+
+        // The cap's worst case: twenty versions of the long page.
+        let started = Instant::now();
+        for i in 0..20i64 {
+            v::save(&repo, 900, 1_700_000_100 + i).unwrap();
+        }
+        let took = started.elapsed();
+        let folder = v::folder(&path);
+        let total: u64 = std::fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::metadata(e.path()).ok())
+            .map(|m| m.len())
+            .sum();
+        let files = std::fs::read_dir(&folder).unwrap().count();
+        println!(
+            "20 versions of the long page: {total} bytes in {files} files, {took:.3?} ({:.1?} each)",
+            took / 20
+        );
+        println!("    that is {}% of the library", total * 100 / main);
+    }
+}

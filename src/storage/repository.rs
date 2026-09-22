@@ -103,6 +103,16 @@ impl SqliteRepository {
         &self.db
     }
 
+    /// A handle over a database that is already open, for the reads that want
+    /// [`Repository::load`] without the startup contract that comes with
+    /// [`Self::open`]: no snapshot family is rotated, no corrupt-file walk runs,
+    /// and nothing is written beside the file. That is how a version snapshot
+    /// is read back (SPEC §三十八, ADR-0050), and `path` stays `None` because a
+    /// handle that reports no path cannot be pointed at by the writers.
+    pub(crate) fn from_database(db: Database) -> Self {
+        SqliteRepository { db, path: None }
+    }
+
     /// The file behind this repository, or `None` for an in-memory one.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()

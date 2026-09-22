@@ -8,6 +8,7 @@ pub mod database;
 pub mod migrations;
 pub mod repository;
 pub mod search_index;
+pub mod versions;
 
 pub use backup::OpenReport;
 pub use database::Database;

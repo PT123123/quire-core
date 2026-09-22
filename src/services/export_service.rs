@@ -29,10 +29,89 @@
 
 use std::collections::HashMap;
 
-use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind};
+use crate::core::types::{Block, BlockId, BlockKind, Mark, MarkKind, PageId};
 
-/// Render a page's blocks as Markdown, in display order.
+/// Render a page's blocks as Markdown, in display order, with no workspace to
+/// ask: every reference keeps the characters its own block stores, and a
+/// database block writes nothing (see [`export_page_with`]).
 pub fn export_page(blocks: &[Block]) -> String {
+    export_page_with(blocks, &|_| None, &|_| None)
+}
+
+/// One database view already laid out as a table: the header row and the rows,
+/// each cell a display string. **Pre-rendered on purpose** (ADR-0065): a
+/// database's content is not its blocks — it is records and values in six
+/// tables — and `export_page` is handed blocks and nothing else, so the caller
+/// that can already read the database renders the rows and this layer only
+/// writes them out. It is the same division the attachment sizes and the math
+/// glyphs use: a renderer asks for a value and never fetches one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DatabaseTable {
+    /// The columns, title first — the view's own order (ADR-0065).
+    pub header: Vec<String>,
+    /// One entry per record, in the view's order and membership (filters and
+    /// sorts included, which is why the caller renders rather than this file).
+    pub rows: Vec<Vec<String>>,
+}
+
+impl DatabaseTable {
+    /// A table with nothing in it writes nothing: a database with no visible
+    /// columns has no representation as a grid, and a header-only table would
+    /// be a `| | |` line that means less than the blank it replaces.
+    pub fn is_empty(&self) -> bool {
+        self.header.is_empty()
+    }
+}
+
+/// The same, plus the two things a block cannot answer for itself (SPEC §四十
+/// "页面别名" and §三十九's Markdown answer): what its referenced pages are
+/// called **now**, and what each database block shows as a table.
+///
+/// A reference stores an id, so after a rename the block's own characters are
+/// stale while everything on screen — the sidebar, the mention chip, the
+/// backlink list — already reads the new title. A named reference that stopped
+/// following its page would be exactly the defect that storing ids exists to
+/// avoid, so the caller that has a workspace hands one in. Callers that do not
+/// (a test, the LAN page writer) go through `export_page` above and get the
+/// stored text, which is what this layer did before there was a choice.
+///
+/// Block-level references (a `Page` or `Link to page` block) are untouched:
+/// that slice owns the *inline* channel, and changing a closed milestone's
+/// export shape is not a decision a slice may take quietly. ADR-0053 says so
+/// out loud.
+///
+/// `database` is ADR-0065's channel, and `None` means two different things that
+/// write the same bytes: a caller with no database reader (the clipboard, the
+/// LAN page writer), and a `Database` block whose entity is gone. Both write
+/// **nothing at all** — there is no marker line for a database (ADR-0065 argues
+/// that at length: the table *is* the representation, and a marker naming an id
+/// nothing can resolve on import is a dangling promise), and a deleted entity
+/// has no rows to write. What the screen says about it ("(deleted database)",
+/// ADR-0060) is screen furniture, not content.
+pub fn export_page_with(
+    blocks: &[Block],
+    title_of: &dyn Fn(PageId) -> Option<String>,
+    database: &dyn Fn(BlockId) -> Option<DatabaseTable>,
+) -> String {
+    export_page_full(blocks, title_of, database, &|_| None)
+}
+
+/// The same page again, with one more question the export layer cannot answer
+/// for itself (SPEC §四十, ADR-0052 §7): **what does a mirror's source say?**
+///
+/// A mirror owns no words — that is the whole design — so a caller without this
+/// channel exports it as a blank line, which loses the sentence rather than the
+/// relationship. What no caller gets back is the relationship itself: Markdown
+/// is §二十六's content channel and not a fidelity format, and a block id means
+/// nothing in another library, so a mirror flattens into the words it was a
+/// second view of. That is what ADR-0032 settled for columns, and inventing a
+/// marker would only produce something that cannot be resolved on the way in.
+pub fn export_page_full(
+    blocks: &[Block],
+    title_of: &dyn Fn(PageId) -> Option<String>,
+    database: &dyn Fn(BlockId) -> Option<DatabaseTable>,
+    sync_of: &dyn Fn(BlockId) -> Option<(String, Vec<Mark>)>,
+) -> String {
     let mut out = String::new();
     let mut number = 0;
     // A table's cells are children, so the grid has to be assembled before the
@@ -59,9 +138,21 @@ pub fn export_page(blocks: &[Block]) -> String {
         let rendered = match block.kind {
             BlockKind::Table => {
                 number = 0;
-                render_table(block, grids.get(&block.id).map(Vec::as_slice).unwrap_or(&[]))
+                render_table(
+                    block,
+                    grids.get(&block.id).map(Vec::as_slice).unwrap_or(&[]),
+                    title_of,
+                )
             }
-            _ => render(block, &mut number),
+            // ADR-0065: the database's own table, rendered by the caller that
+            // can read records — this layer never opens one.
+            BlockKind::Database => {
+                number = 0;
+                database(block.id)
+                    .map(|table| render_database(&table))
+                    .unwrap_or_default()
+            }
+            _ => render(block, &mut number, title_of, sync_of),
         };
         for line in rendered.lines() {
             if line.is_empty() {
@@ -74,6 +165,35 @@ pub fn export_page(blocks: &[Block]) -> String {
         }
     }
     out
+}
+
+/// One pre-rendered database table as a GitHub-flavored table: a header row, the
+/// `---` rule under it, then one line per record. The same shape `render_table`
+/// writes for the simple grid, because a reader must not have to tell the two
+/// apart in the file.
+///
+/// A cell's `|` and its newlines become text: neither is representable inside a
+/// table cell, and dropping them would lose characters while letting them
+/// through would end the column or the row. A ragged row (a caller handing back
+/// fewer cells than the header) is padded rather than written short — a short
+/// row in GFM silently shifts every following column.
+fn render_database(table: &DatabaseTable) -> String {
+    if table.header.is_empty() {
+        return String::new();
+    }
+    let cols = table.header.len();
+    let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ").replace('\r', " ");
+    let head: Vec<String> = table.header.iter().map(|c| cell(c)).collect();
+    let mut out = format!("| {} |\n", head.join(" | "));
+    let dashes = (0..cols).map(|_| "---").collect::<Vec<_>>().join(" | ");
+    out.push_str(&format!("| {dashes} |\n"));
+    for row in &table.rows {
+        let line: Vec<String> = (0..cols)
+            .map(|at| row.get(at).map(|c| cell(c)).unwrap_or_default())
+            .collect();
+        out.push_str(&format!("| {} |\n", line.join(" | ")));
+    }
+    out.trim_end().to_string()
 }
 
 /// True when the block sits inside a columns layout, at any depth.
@@ -111,14 +231,18 @@ fn table_grids(blocks: &[Block]) -> HashMap<BlockId, Vec<Block>> {
 /// A grid as a GitHub-flavored-Markdown table. The first row is the header
 /// row — the same convention the block itself starts with, and the only shape
 /// a Markdown table has. A table with no cells writes nothing.
-fn render_table(table: &Block, cells: &[Block]) -> String {
+fn render_table(
+    table: &Block,
+    cells: &[Block],
+    title_of: &dyn Fn(PageId) -> Option<String>,
+) -> String {
     let cols = table.columns as usize;
     if cols == 0 || cells.is_empty() {
         return String::new();
     }
     let cell = |b: Option<&Block>| {
         b.map(|c| {
-            let text = render_inline(&c.text, &c.marks);
+            let text = render_inline(&c.text, &c.marks, title_of);
             // a pipe would end the column, a newline the row: neither is
             // representable inside a cell, so both become text
             text.replace('|', "\\|").replace('\n', " ")
@@ -152,17 +276,41 @@ fn same_list_run(prev: BlockKind, next: BlockKind) -> bool {
 
 /// One block as Markdown source. `number` is the numbered-list run counter,
 /// reset whenever a non-numbered block appears.
-fn render(block: &Block, number: &mut usize) -> String {
+fn render(
+    block: &Block,
+    number: &mut usize,
+    title_of: &dyn Fn(PageId) -> Option<String>,
+    sync_of: &dyn Fn(BlockId) -> Option<(String, Vec<Mark>)>,
+) -> String {
     // a code block is source and a divider has no text: markers stay literal
     let text = match block.kind {
         BlockKind::Code | BlockKind::Divider | BlockKind::Math | BlockKind::Embed => {
             block.text.clone()
         }
-        _ => render_inline(&block.text, &block.marks),
+        // SPEC §四十 / ADR-0052 §7: a mirror's words are **its source's**, and
+        // its own `text` is empty by construction. Reading them here is what
+        // "flatten" means — the row leaves as the sentence it was showing, with
+        // the source's own marks riding along, because those characters are
+        // still a mention even when they are standing in another page.
+        //
+        // `None` is the source being gone, and it writes nothing: an empty line
+        // says more than inventing a marker that no importer can resolve.
+        BlockKind::Synced => match sync_of(block.id) {
+            Some((words, marks)) => render_inline(&words, &marks, title_of),
+            None => String::new(),
+        },
+        _ => render_inline(&block.text, &block.marks, title_of),
     };
     let text = text.as_str();
     match block.kind {
         BlockKind::Paragraph => {
+            *number = 0;
+            text.to_string()
+        }
+        // A mirror exports as a paragraph: the words were already
+        // resolved out of the source by the first match above, and a
+        // paragraph is the plainest shape a sentence takes (ADR-0052).
+        BlockKind::Synced => {
             *number = 0;
             text.to_string()
         }
@@ -286,6 +434,15 @@ fn render(block: &Block, number: &mut usize) -> String {
             *number = 0;
             String::new()
         }
+        // Unreachable from the page walk, which intercepts a `Database` block
+        // before it gets here (ADR-0065: its content is records, and this layer
+        // never opens a database). The arm exists so the match stays exhaustive
+        // without a wildcard that would swallow the *next* kind — a new block
+        // kind must fail to compile until someone decides what it exports.
+        BlockKind::Database => {
+            *number = 0;
+            String::new()
+        }
     }
 }
 
@@ -325,7 +482,7 @@ fn prefix_lines(marker: &str, text: &str) -> String {
 // importer reads back — `**a _b_ c**` in, bold-with-italic inside, identical
 // bytes out — without building a tree.
 
-fn render_inline(text: &str, marks: &[Mark]) -> String {
+fn render_inline(text: &str, marks: &[Mark], title_of: &dyn Fn(PageId) -> Option<String>) -> String {
     let spans = normalize(text, marks);
     let mut out = String::new();
     if spans.is_empty() {
@@ -354,6 +511,14 @@ fn render_inline(text: &str, marks: &[Mark]) -> String {
             open.push(&spans[next]);
             next += 1;
         }
+        // A mention writes its target's *current* title rather than the
+        // characters the block holds. The atom is one piece (never cut: it is
+        // an atom and `normalize` closes whole spans), so the piece whose
+        // bounds equal the mark's is the label.
+        if let Some(title) = live_mention_label(&open, a, b, title_of) {
+            out.push_str(&title);
+            continue;
+        }
         // inside a code span or a formula the text is verbatim: escaping there
         // would put the backslash in the document
         if open.iter().any(|m| m.kind == MarkKind::Code || m.kind == MarkKind::Math) {
@@ -366,6 +531,32 @@ fn render_inline(text: &str, marks: &[Mark]) -> String {
         closer_into(&mut out, m, text);
     }
     out
+}
+
+/// The current title of the mention that *is* this piece, or `None` when the
+/// piece is something else, the page is gone, or its title cannot be written
+/// between `@[` and `]` without being re-read as syntax.
+///
+/// That last case is a real one and not a theoretical one: the importer takes
+/// the label's bytes verbatim and honours `\]` only as an escape *while
+/// scanning*, so a title holding a bracket or a newline would come back with
+/// the wrong text. Those keep the span's own characters — the same characters
+/// the editor shows — which is the pre-existing behaviour rather than a new
+/// hole, and the reason is written into ADR-0053.
+fn live_mention_label(
+    open: &[&Mark],
+    a: usize,
+    b: usize,
+    title_of: &dyn Fn(PageId) -> Option<String>,
+) -> Option<String> {
+    let m = open
+        .iter()
+        .find(|m| m.kind == MarkKind::Mention && m.start == a && m.end == b)?;
+    let title = crate::core::page_of(&m.url).and_then(title_of)?;
+    if title.is_empty() || title.contains(['\\', '[', ']', '\n']) {
+        return None;
+    }
+    Some(title)
 }
 
 /// The spans as the writer needs them: on char boundaries, contiguous
@@ -385,8 +576,16 @@ fn normalize(text: &str, marks: &[Mark]) -> Vec<Mark> {
         match joined.last_mut() {
             // two runs of the same kind with nothing between them are written
             // as one: `**a****b**` leaves a four-marker run in the middle, and
-            // `` `a``b` `` reads back as a single span holding two backticks
-            Some(last) if last.kind == m.kind && last.url == m.url && last.end == m.start => {
+            // `` `a``b` `` reads back as a single span holding two backticks.
+            // The payload has to match too, and it is compared through
+            // `stored_payload` rather than `url` — a date's ISO string lives in
+            // `date`, so two adjacent dates with different values would
+            // otherwise be joined into one span holding both.
+            Some(last)
+                if last.kind == m.kind
+                    && last.stored_payload() == m.stored_payload()
+                    && last.end == m.start =>
+            {
                 last.end = m.end;
             }
             _ => joined.push(m),
@@ -444,6 +643,20 @@ fn normalize(text: &str, marks: &[Mark]) -> Vec<Mark> {
     joined.retain(|m| {
         m.kind == MarkKind::Math || !math.iter().any(|&(s, e)| s <= m.start && m.end <= e)
     });
+    // a mention and a date are atoms for the same reason a formula is: their
+    // spelling is `@[label](target)` / `@[iso]`, one token with no room for a
+    // nested mark inside it. `**@[a](x)**` has no spelling that reads back as
+    // both, so the mark inside the mention goes and the mention stays — the
+    // same trade the formula block above makes.
+    let atoms: Vec<(usize, usize)> = joined
+        .iter()
+        .filter(|m| matches!(m.kind, MarkKind::Mention | MarkKind::Date))
+        .map(|m| (m.start, m.end))
+        .collect();
+    joined.retain(|m| {
+        matches!(m.kind, MarkKind::Mention | MarkKind::Date)
+            || !atoms.iter().any(|&(s, e)| s <= m.start && m.end <= e)
+    });
     // a formula whose source starts or ends with a space has no `$…$` spelling
     // — the importer needs a non-space on the inside of both delimiters — so
     // the mark goes and the text stays, which is the same deal as above
@@ -467,6 +680,11 @@ fn kind_order(kind: MarkKind) -> u8 {
         MarkKind::Code => 3,
         MarkKind::Link => 4,
         MarkKind::Math => 5,
+        // the two reference kinds sort after everything: they are atoms, so
+        // their position only matters when they share a boundary with a
+        // styling mark, and outer-first is what the importer expects
+        MarkKind::Mention => 6,
+        MarkKind::Date => 7,
     }
 }
 
@@ -494,12 +712,14 @@ fn split_pieces(out: &mut Vec<Mark>, m: &Mark, at: usize) {
         end: at,
         kind: m.kind,
         url: m.url.clone(),
+        date: m.date.clone(),
     });
     out.push(Mark {
         start: at,
         end: m.end,
         kind: m.kind,
         url: m.url.clone(),
+        date: m.date.clone(),
     });
 }
 
@@ -516,6 +736,11 @@ fn opener_into(out: &mut String, m: &Mark, text: &str) {
         }
         MarkKind::Link => out.push('['),
         MarkKind::Math => out.push('$'),
+        // Both reference kinds open the same way; what separates them is the
+        // close, and the *label* is the span's own text in both cases — the ISO
+        // string for a date, the title as it was when the reference was made
+        // for a mention.
+        MarkKind::Mention | MarkKind::Date => out.push_str("@["),
     }
 }
 
@@ -532,6 +757,13 @@ fn closer_into(out: &mut String, m: &Mark, text: &str) {
         }
         MarkKind::Link => out.push_str(&format!("]({})", link_target(&m.url))),
         MarkKind::Math => out.push('$'),
+        // `@[Title](quire://page/12)` — the address, not the label, so what the
+        // file carries is the *reference*; a reader that has never heard of
+        // Quire still sees a link, and re-importing finds the page again.
+        MarkKind::Mention => out.push_str(&format!("]({})", link_target(&m.url))),
+        // `@[2026-09-22]` — nothing to close but the bracket: the payload is
+        // the visible text, which is also why a date cannot go stale.
+        MarkKind::Date => out.push(']'),
     }
 }
 

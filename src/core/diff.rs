@@ -184,6 +184,11 @@ pub fn kind_label(kind: BlockKind) -> &'static str {
         BlockKind::Link => "Link to page",
         BlockKind::Toc => "Table of contents",
         BlockKind::Embed => "Embed",
+        // Track 3's two kinds. The panel is about a page's own body, so these
+        // read the same names their slash/insert rows carry (SLASH_ITEMS /
+        // INSERT_ITEMS in state.rs) rather than a second spelling.
+        BlockKind::Database => "Table view",
+        BlockKind::Synced => "Synced block",
     }
 }
 
@@ -244,6 +249,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: crate::core::Lang::Plain,
+            db_ref: None,
+            sync_ref: None,
         }
     }
 
@@ -336,6 +343,7 @@ mod tests {
             end: 4,
             kind: MarkKind::Bold,
             url: String::new(),
+            date: None,
         }];
         assert_eq!(
             rows(&compare(&[plain][..], &[marked][..])).len(),

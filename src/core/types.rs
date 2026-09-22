@@ -132,10 +132,39 @@ pub enum BlockKind {
     /// runtime, so the card is the whole feature and its one action is "open
     /// this in the system browser".
     Embed,
+    /// A database view (SPEC §三十九, ADR-0060). `db_ref` names the `databases`
+    /// row this block draws, exactly as a `Page` block names its child page;
+    /// the rows and the columns are the entity's, never the block's, because
+    /// §三十九's "a record may *be* a page" has to keep a page's identity.
+    ///
+    /// Like a `Table` or a `Columns` block it is a **leaf** that owns no child
+    /// blocks: its rows are records and its cells are values, so the projection
+    /// has nothing to hide and no row-index consumer has to translate. What it
+    /// owns is the entity — deleting the block deletes the `databases` row the
+    /// way deleting a `Page` block deletes its child page, and a dangling
+    /// `db_ref` (the entity gone, the block back through an undo) renders one
+    /// muted line, "(deleted database)", exactly as a dangling `page_ref` does.
+    ///
+    /// The eight view layouts are *not* eight kinds: `db_views.layout` (ADR-0060
+    /// / ADR-0064) is which view of this one entity is being drawn, and the six
+    /// `INSERT_ITEMS` placeholders in `state.rs` are the same kinds' entry
+    /// points, lit one phase at a time (D3 lights `Table view`).
+    Database,
+    /// A second view of another block (SPEC §四十, ADR-0052). **Owns no
+    /// content of its own**: `sync_ref` names the source block, and the row
+    /// draws *that* block's text and inline marks, read at projection time.
+    /// `text` stays empty for the life of the block — writing into it would
+    /// create two owners of one sentence, which is exactly what this design
+    /// exists to avoid.
+    ///
+    /// A source that is gone does not blank the row: it renders a read-only
+    /// placeholder, and the row stops being editable, because an edit bound to
+    /// a source nobody can find would have nowhere honest to land (ADR-0052 §2).
+    Synced,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 23] = [
+    pub const ALL: [BlockKind; 25] = [
         BlockKind::Paragraph,
         BlockKind::Heading1,
         BlockKind::Heading2,
@@ -159,6 +188,8 @@ impl BlockKind {
         BlockKind::Math,
         BlockKind::Toc,
         BlockKind::Embed,
+        BlockKind::Synced,
+        BlockKind::Database,
     ];
 
     /// Heading level 1..3 for a heading kind; `None` for anything else. A
@@ -197,9 +228,16 @@ impl BlockKind {
             BlockKind::Math => "math",
             BlockKind::Toc => "toc",
             BlockKind::Embed => "embed",
+            BlockKind::Synced => "synced",
+            BlockKind::Database => "database",
         }
     }
 
+    /// Every kind reads back by name, including `Synced` — which is how the
+    /// Markdown *import* contact is met without a new grammar: §四十 / ADR-0052
+    /// §7 exports a mirror flattened, so there is no marker for this layer to
+    /// recognise, and a file some other tool wrote with the kind spelled out
+    /// becomes an unresolvable mirror rather than a load failure.
     pub fn try_from_str(s: &str) -> Option<BlockKind> {
         BlockKind::ALL.iter().copied().find(|k| k.as_str() == s)
     }
@@ -362,6 +400,12 @@ pub enum MarkKind {
     /// source without its delimiters, so the mark is the only place math knows
     /// about; `url` is unused.
     Math,
+    /// A @page mention (SPEC §四十). The span text is the page title;
+    /// `url` holds `quire://page/<id>`. `date` is unused.
+    Mention,
+    /// An inline date (SPEC §四十). The span text is the ISO date string;
+    /// `url` is empty; `date` holds the ISO date.
+    Date,
 }
 
 impl MarkKind {
@@ -373,6 +417,8 @@ impl MarkKind {
             MarkKind::Code => "code",
             MarkKind::Link => "link",
             MarkKind::Math => "math",
+            MarkKind::Mention => "mention",
+            MarkKind::Date => "date",
         }
     }
 
@@ -384,18 +430,23 @@ impl MarkKind {
             "code" => Some(MarkKind::Code),
             "link" => Some(MarkKind::Link),
             "math" => Some(MarkKind::Math),
+            "mention" => Some(MarkKind::Mention),
+            "date" => Some(MarkKind::Date),
             _ => None,
         }
     }
 }
 
-/// One styled range. `url` is only meaningful for `MarkKind::Link`.
+/// One styled range. `url` is only meaningful for `MarkKind::Link` and
+/// `MarkKind::Mention`; `date` is only meaningful for `MarkKind::Date`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mark {
     pub start: usize,
     pub end: usize,
     pub kind: MarkKind,
     pub url: String,
+    /// Only used for `MarkKind::Date` (ISO date string, e.g. "2026-09-22").
+    pub date: Option<String>,
 }
 
 impl Mark {
@@ -405,6 +456,37 @@ impl Mark {
 
     pub fn intersects(&self, start: usize, end: usize) -> bool {
         self.start < end && self.end > start
+    }
+
+    /// The text that goes into the **one** payload column the `marks` table
+    /// has (`url`, ADR-0050). A link and a mention put their address there; a
+    /// date has no address, so its ISO string travels there instead — that
+    /// column is a text payload, and this method is the only place that knows
+    /// which kind puts what in it. Without it a date mark would load back with
+    /// its date nowhere: the table has no second column to hold it.
+    pub fn stored_payload(&self) -> &str {
+        match self.kind {
+            MarkKind::Date => self.date.as_deref().unwrap_or(""),
+            _ => &self.url,
+        }
+    }
+
+    /// The inverse of `stored_payload`: the payload column comes back and each
+    /// kind's own field takes it. The round trip is pinned by a test, because
+    /// "reads back as itself" is the whole contract of a storage shape.
+    pub fn from_stored(start: usize, end: usize, kind: MarkKind, payload: String) -> Mark {
+        let is_date = kind == MarkKind::Date;
+        Mark {
+            start,
+            end,
+            kind,
+            url: if is_date { String::new() } else { payload.clone() },
+            date: if is_date {
+                (!payload.is_empty()).then_some(payload)
+            } else {
+                None
+            },
+        }
     }
 }
 
@@ -449,6 +531,35 @@ pub struct Block {
     /// is only ever read as the key for its colour. Meaningless for other kinds,
     /// where it stays `Plain` — a colour on a paragraph is `color`/`background`.
     pub lang: Lang,
+    /// The database a `Database` block draws (SPEC §三十九, ADR-0060), the
+    /// shape `page_ref` gave a `Page` block and for the same reason: the entity
+    /// has to be reachable from the block without the block *being* it, because
+    /// a record may itself be a page and a page's data may never be derived.
+    /// Meaningless for every other kind, where it stays `None`.
+    ///
+    /// `None` on a `Database` block and a `Some` pointing at a deleted row are
+    /// two different things and only the second one has a word for it: `None`
+    /// is a block whose entity has not been written yet (the two are created in
+    /// one batch — `Command::MakeDatabase` — so it is a state only a torn file
+    /// or a hand-edit produces), while a dangling id is ADR-0060's
+    /// "(deleted database)": the entity is gone and the block is back.
+    ///
+    /// **Not a foreign key**, for the same reason `page_ref` is not: the entity
+    /// is deleted by the change that drops the block (ADR-0060), and a block
+    /// whose ref dangles is a *state* the renderer has a word for, not a
+    /// failure the load reports.
+    pub db_ref: Option<crate::core::database::DatabaseId>,
+    /// The source block a `Synced` block mirrors (SPEC §四十, ADR-0052).
+    /// `None` for every other kind; on a `Synced` block it means either "no
+    /// source was picked yet" or "the source is gone" — the row can tell the
+    /// two apart only by trying, and both read as the same read-only
+    /// placeholder, which is the honest answer in either case.
+    ///
+    /// **Not a foreign key.** Nothing cascades: deleting the source leaves the
+    /// mirror in place and visible, and deleting the mirror leaves the source
+    /// untouched. A cascade here would mean "removing one view destroys the
+    /// content", which is the one outcome ADR-0052 refuses above all others.
+    pub sync_ref: Option<BlockId>,
 }
 
 /// One file that lives next to the database (SPEC §三十七 批次 A, §十八's

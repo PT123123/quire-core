@@ -284,7 +284,7 @@ mod tests {
             kind: BlockKind::Paragraph,
             text: "hello from the lan".into(),
             checked: false,
-            marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
+            marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None }],
             color: ColorKind::Default,
             background: ColorKind::Default,
             page_ref: None,
@@ -293,6 +293,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
+            db_ref: None,
+            sync_ref: None,
         });
         let shared_row = state.blocks[0].clone();
         state.blocks.push(Block {

@@ -314,7 +314,8 @@ fn a_recovered_database_is_searchable_straight_away() {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
-            }),
+        db_ref: None,
+        sync_ref: None,            }),
         ])
         .unwrap();
         drop(repo);
@@ -474,7 +475,8 @@ fn snapshot_cost() {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
-        })
+        db_ref: None,
+        sync_ref: None,        })
         .collect();
     {
         let repo = SqliteRepository::open(&path).unwrap();
@@ -591,6 +593,8 @@ mod version_files {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
+            db_ref: None,
+            sync_ref: None,
         }
     }
 
@@ -710,6 +714,7 @@ mod version_files {
             end: 4,
             kind: MarkKind::Bold,
             url: String::new(),
+            date: None,
         }];
         repo.apply(&[
             Change::PageCreated(Page {

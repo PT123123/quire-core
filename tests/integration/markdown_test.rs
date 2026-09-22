@@ -7,7 +7,7 @@ use quire::core::persistence::Change;
 use quire::core::types::{
     AttachmentId, Block, BlockId, BlockKind, Lang, Mark, MarkKind, OrderKey, Page, PageFont, PageId,
 };
-use quire::services::export_service::export_page;
+use quire::services::export_service::{export_page, export_page_with};
 use quire::services::import_service::{import_markdown, parse_inline, parse_markdown, ParsedBlock};
 
 fn block(id: u64, kind: BlockKind, text: &str) -> Block {
@@ -28,7 +28,8 @@ fn block(id: u64, kind: BlockKind, text: &str) -> Block {
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
-    }
+        db_ref: None,
+        sync_ref: None,    }
 }
 
 fn todo(id: u64, text: &str, checked: bool) -> Block {
@@ -45,6 +46,7 @@ fn mark(start: usize, end: usize, kind: MarkKind) -> Mark {
         end,
         kind,
         url: String::new(),
+        date: None,
     }
 }
 
@@ -54,6 +56,7 @@ fn link(start: usize, end: usize, url: &str) -> Mark {
         end,
         kind: MarkKind::Link,
         url: url.into(),
+        date: None,
     }
 }
 
@@ -1273,4 +1276,189 @@ fn an_embedded_address_is_not_parsed_for_marks() {
     assert_eq!(back[0].kind, BlockKind::Embed);
     assert_eq!(back[0].text, url);
     assert!(back[0].marks.is_empty(), "marks were parsed out of a url");
+}
+
+// ── the reference layer's two inline atoms (SPEC §四十, ADR-0050) ───────────
+//
+// `@page mention` and `@date` are the first marks whose payload is not a
+// styling choice: a mention carries an address, a date carries its own text.
+// Both travel in the **one** payload column the `marks` table has, and these
+// tests pin both halves of that contract — the Markdown spelling, and the
+// kind that decides how the spelling is read back.
+
+fn mention(start: usize, end: usize, page: u64) -> Mark {
+    Mark {
+        start,
+        end,
+        kind: MarkKind::Mention,
+        url: format!("quire://page/{page}"),
+        date: None,
+    }
+}
+
+fn date(start: usize, end: usize, iso: &str) -> Mark {
+    Mark {
+        start,
+        end,
+        kind: MarkKind::Date,
+        url: String::new(),
+        date: Some(iso.into()),
+    }
+}
+
+#[test]
+fn a_mention_exports_as_a_link_to_its_page_and_reads_back_as_a_mention() {
+    // the label is the span's own text and the address is the reference, so the
+    // file carries something a reader who has never heard of Quire can still
+    // follow — and the import finds the page again rather than a bare link
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "see Project Atlas for the plan"),
+        vec![mention(4, 17, 12)],
+    );
+    let md = export_page(&[b]);
+    assert_eq!(md, "see @[Project Atlas](quire://page/12) for the plan\n");
+
+    let (text, marks) = parse_inline("@[Project Atlas](quire://page/12)");
+    assert_eq!(text, "Project Atlas");
+    assert_eq!(marks.len(), 1, "one mark, not a link plus a mention: {marks:#?}");
+    assert_eq!(marks[0].kind, MarkKind::Mention);
+    assert_eq!(marks[0].url, "quire://page/12");
+    assert_eq!(marks[0].date, None, "a mention carries no date");
+
+    // and the export of what came back is byte-identical — the round trip the
+    // content channel promises (§二十六)
+    let back = blocks_of(&import_markdown(&md, &page(), &mut counter(1)));
+    assert_eq!(export_page(&back), md);
+}
+
+#[test]
+fn an_export_that_knows_the_workspace_names_each_page_as_it_is_called_now() {
+    // SPEC §四十 "页面别名": a reference stores an **id**, so the characters in
+    // the block are whatever the title was when the reference was made. A file
+    // the writer copies out has to say what the screen says, so the caller that
+    // has a workspace hands one in — and that is the whole difference between
+    // this and `export_page`, which keeps the stored text for every caller that
+    // does not (a test, the LAN page writer).
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "see Project Atlas"),
+        vec![mention(4, 17, 12)],
+    );
+    let live = |id: PageId| (id == PageId(12)).then(|| "Atlas (2026)".to_string());
+    assert_eq!(
+        export_page_with(&[b.clone()], &live, &|_| None),
+        "see @[Atlas (2026)](quire://page/12)
+"
+    );
+    // ...and the address is untouched, so re-importing still finds the page
+    let (text, marks) = parse_inline("@[Atlas (2026)](quire://page/12)");
+    assert_eq!(text, "Atlas (2026)");
+    assert_eq!(marks[0].kind, MarkKind::Mention);
+    assert_eq!(marks[0].url, "quire://page/12");
+
+    // no workspace, or an id that names no page: the block's own characters
+    assert_eq!(
+        export_page(&[b.clone()]),
+        "see @[Project Atlas](quire://page/12)
+"
+    );
+    assert_eq!(
+        export_page_with(&[b.clone()], &|_| None, &|_| None),
+        "see @[Project Atlas](quire://page/12)
+"
+    );
+
+    // and a title that cannot sit between `@[` and `]` keeps them too: the
+    // importer reads the label's bytes verbatim, so a `]` in there would close
+    // the atom early and the text would come back different
+    let bracket = |_: PageId| Some("a] b".to_string());
+    assert_eq!(
+        export_page_with(&[b], &bracket, &|_| None),
+        "see @[Project Atlas](quire://page/12)
+"
+    );
+}
+
+#[test]
+fn a_date_exports_as_its_own_iso_text_and_reads_back_as_a_date() {
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "ship 2026-09-22 at last"),
+        vec![date(5, 15, "2026-09-22")],
+    );
+    let md = export_page(&[b]);
+    assert_eq!(md, "ship @[2026-09-22] at last\n");
+
+    let (text, marks) = parse_inline("@[2026-09-22]");
+    assert_eq!(text, "2026-09-22");
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0].kind, MarkKind::Date);
+    assert_eq!(marks[0].date.as_deref(), Some("2026-09-22"));
+    assert_eq!(marks[0].url, "", "a date carries no address");
+
+    let back = blocks_of(&import_markdown(&md, &page(), &mut counter(1)));
+    assert_eq!(export_page(&back), md);
+}
+
+#[test]
+fn a_bracket_with_a_web_target_stays_an_ordinary_link() {
+    // the *target* is what makes a mention, not the label and not the `@`: a
+    // `@[…](https://…)` somebody typed by hand is a link, and reading it as a
+    // reference would invent a page that is not there.
+    //
+    // Nothing is consumed by the attempt either — the `@` that did not open a
+    // mention is ordinary text, so the text keeps it and the link covers only
+    // the label. That is the honest reading: no character of the source is
+    // silently dropped for a syntax that did not match.
+    let (text, marks) = parse_inline("@[docs](https://example.com/x)");
+    assert_eq!(text, "@docs");
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0].kind, MarkKind::Link, "the target is a web address, not a page");
+    assert_eq!((marks[0].start, marks[0].end), (1, 5), "the mark covers the label, not the `@`");
+}
+
+#[test]
+fn a_bracket_that_is_not_exactly_an_iso_date_stays_prose() {
+    // the guard is the whole shape, not "looks date-ish". A near miss that
+    // became an atom would then have no spelling of its own and would come
+    // back as something else — so a near miss stays text, deliberately.
+    for s in ["@[2026-9-22]", "@[2026-09-22T10:00]", "@[today]", "@[2026/09/22]", "@[20260922]"] {
+        let (text, marks) = parse_inline(s);
+        assert_eq!(text, s, "{s} is prose");
+        assert!(marks.is_empty(), "{s} produced {marks:#?}");
+    }
+    assert_eq!(parse_inline("@[2026-09-22]").1.len(), 1, "and the exact shape does become one");
+}
+
+#[test]
+fn a_mention_is_an_atom_so_a_bold_run_over_it_gives_way() {
+    // `**@[a](x)**` has no spelling that reads back as both, and the export
+    // keeps the reference and drops the styling — the same trade a formula
+    // already makes, for the same reason
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "Project Atlas"),
+        vec![
+            Mark {
+                start: 0,
+                end: 13,
+                kind: MarkKind::Bold,
+                url: String::new(),
+                date: None,
+            },
+            mention(0, 13, 12),
+        ],
+    );
+    assert_eq!(export_page(&[b]), "@[Project Atlas](quire://page/12)\n");
+}
+
+#[test]
+fn two_adjacent_dates_are_not_joined_into_one() {
+    // the run-joining rule compares the *payload*, and a date's payload is its
+    // own text rather than `url` — comparing `url` alone would merge these two
+    // into one span holding both dates
+    let b = with_marks(
+        block(1, BlockKind::Paragraph, "2026-09-222026-09-23"),
+        vec![date(0, 10, "2026-09-22"), date(10, 20, "2026-09-23")],
+    );
+    let md = export_page(&[b]);
+    let (_, marks) = parse_inline(md.trim_end());
+    assert_eq!(marks.len(), 2, "two dates, not one: {md:?} -> {marks:#?}");
 }

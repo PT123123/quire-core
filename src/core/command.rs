@@ -4,11 +4,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::database::{
+    CellValue, DatabaseDraft, DatabaseId, Property, PropertyId, Record, RecordId, View, ViewId,
+};
 use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
 use super::types::{
-    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, PageId,
+    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page,
+    PageId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +64,19 @@ pub enum Command {
     /// Toggle an inline mark over `[start..end]` (byte offsets): a same-kind
     /// mark covering the range is removed, otherwise intersecting same-kind
     /// marks are replaced by one new mark (M6).
-    ToggleMark { id: BlockId, start: usize, end: usize, kind: MarkKind, url: String },
+    ToggleMark { id: BlockId, start: usize, end: usize, kind: MarkKind, url: String, date: Option<String> },
+    /// Insert a reference atom at `at` (SPEC §四十): `label` replaces the text
+    /// from `at` onwards — the `@` and whatever was typed as a filter — and the
+    /// label's own bytes become a `Mention` or a `Date` mark. `url` non-empty
+    /// means a mention (`quire://page/<id>`), empty means a date whose payload
+    /// is `date`.
+    ///
+    /// **One command, not `ReplaceText` + `ToggleMark`.** `exec_all` plans every
+    /// command in a batch against the same pre-state, so a `ToggleMark` riding
+    /// behind a `ReplaceText` would be planned against the *old* text: it would
+    /// clamp its end to the old length and land on the wrong bytes. The two
+    /// halves of "type @, pick a page" are one user action and one Ctrl+Z.
+    InsertReference { id: BlockId, at: usize, label: String, kind: MarkKind, url: String, date: Option<String> },
     /// Tab on a list item: nest it under the previous list item (depth 1 max).
     IndentList { id: BlockId },
     /// Shift+Tab on a nested list item: promote it back to top level,
@@ -114,6 +130,181 @@ pub enum Command {
     /// the caret can land on, so the last block in it going away leaves
     /// something nothing can click into (SPEC §三十七 批次 B).
     ColumnsAddBlock { id: BlockId },
+
+    // ─── SPEC §三十九 Database (Track 3, D3) ─────────────────────────────────
+    //
+    // The five commands the drawn layer adds. Two properties hold for all of
+    // them and are worth stating once:
+    //
+    // * **The plan is a pure function of the command.** `plan` sees a
+    //   `Document` (blocks) and nothing else — no SQL, no ids it can allocate
+    //   for a table that is not `blocks` — so every id, every old value and
+    //   every width travels *in* the command, allocated or read by the caller
+    //   that can. `Command::InsertImage` set the precedent: the caller that has
+    //   the attachment table is the caller that picks the attachment id.
+    // * **One command, one `Entry`, one Ctrl+Z.** §三十九 requires both delete
+    //   directions (a record, and the page a record is the face of) to be one
+    //   undo step, and that is exactly what a change list is.
+    /// Turn a line into a database block, and create the entity, its `title`
+    /// column and its first view **in the same batch** (ADR-0060/0061: a
+    /// database that cannot be drawn is one no path may create, so the four rows
+    /// that make one appear together).
+    ///
+    /// The `draft` carries the three rows with their ids already allocated
+    /// (`Database::new` → `title_property` → `first_view`), because the plan
+    /// layer can allocate block ids and nothing else. Both the "Turn into" menu
+    /// and the slash and "+" menus route here rather than through
+    /// `SetBlockType`, which is why `SetBlockType { kind: Database }` is
+    /// **refused** below: a caller that got there would create a block with no
+    /// entity, and a block with no entity is a database that draws nothing.
+    MakeDatabase { id: BlockId, draft: DatabaseDraft },
+    /// One new column, at the end of the schema (`ord` past the last one). The
+    /// `property` travels whole — name, kind, config, id and ord — because the
+    /// plan layer has no `db_properties` table to read `ord` from, exactly as
+    /// `MakeDatabase` carries its own three rows.
+    ///
+    /// This is what makes the drawn table more than a title column: without it
+    /// a database made by the app has exactly one column forever, and no cell
+    /// of any of D3's four inline editors could ever be reached. The command is
+    /// the *storage* half only — editing a column's name, kind or options after
+    /// the fact is `PropertyRenamed` / `PropertyKindSet`, whose UI is D5's.
+    AddDatabaseProperty { block: BlockId, property: Property },
+    /// One new row at `ord` (the end of the listing, which is what the view's
+    /// "new row" line means). `record` is allocated by the caller — the store's
+    /// ids are its own table's, and ADR-0067 means the app never loads them all
+    /// to find the highest.
+    ///
+    /// The row is **bare** (ADR-0063's lazy page): no page is created, so a
+    /// thousand-row import creates no pages, and the page arrives when someone
+    /// opens the row.
+    AddDatabaseRecord {
+        block: BlockId,
+        record: RecordId,
+        ord: OrderKey,
+    },
+    /// Delete one row: its values, the record, and — when it is page-backed —
+    /// the page it owns. `record`, `values` and `page` are read by the caller
+    /// (the plan layer cannot read `db_values` or `pages`), which is what makes
+    /// the undo exact instead of a reconstruction.
+    ///
+    /// The whole `Record` travels rather than an id, because the undo needs its
+    /// `ord` and its page pointer and neither is derivable: an undo that put the
+    /// row back at the end of the listing would be a different row.
+    ///
+    /// The forward order is ADR-0063's `[values, record, page?]` and the revert
+    /// is its exact reverse (`[page?, record, values]`), because `apply` is one
+    /// transaction with foreign keys **on**: a value row cannot outlive its
+    /// record on the way out, and a record cannot name a page that does not
+    /// exist yet on the way back. Deleting the *page* first (the sidebar's path,
+    /// or a parent page's recursive delete) is SQL's `ON DELETE CASCADE` and not
+    /// this command — both ends are the same state, which is the property D1's
+    /// test pins.
+    DeleteDatabaseRecord {
+        block: BlockId,
+        record: Record,
+        values: Vec<(PropertyId, CellValue)>,
+        /// The page row to write back when `record.page` is `Some`: the title,
+        /// the parent and the appearance all have to come back, and a rebuild
+        /// from the id alone would invent them.
+        page: Option<Page>,
+    },
+    /// One cell, in ADR-0062's stored shape. `from` is the value as it is stored
+    /// right now (a point read the caller made); `to` is `CellValue::Empty` when
+    /// the edit cleared the cell, which **removes the row** rather than writing
+    /// a blank — absence is this design's one representation of empty, so a
+    /// number cell is never `0`.
+    ///
+    /// A write aimed at a derived kind (`created time` / `last edited time`) is
+    /// a caller error with no sensible meaning: the plan refuses it rather than
+    /// recording a `CellSet` that no read path would ever consult (ADR-0068).
+    SetDatabaseCell {
+        block: BlockId,
+        record: RecordId,
+        property: PropertyId,
+        from: CellValue,
+        to: CellValue,
+    },
+    /// Replace a view's rules document whole (ADR-0064). D3 writes it for two
+    /// things — a column's width and a column being hidden — and both are edits
+    /// of `columns`/`widths` inside the document, so the caller passes the whole
+    /// new text. Replaced rather than merged in storage for ADR-0064's reason:
+    /// the document is the view's own truth, and merging it in two places is how
+    /// its shape ends up defined twice.
+    SetDatabaseViewDefinition {
+        block: BlockId,
+        view: ViewId,
+        from: String,
+        to: String,
+    },
+    /// One new view of the database a block draws — D5's switcher `+`: a row
+    /// in `db_views` with its own layout, born with an empty rules document
+    /// (ADR-0060: a view is `db_views.layout`, not a block kind; ADR-0064: the
+    /// rules are the document, and a new view has none yet).
+    ///
+    /// The row travels whole — id, name, layout, ord — because the plan layer
+    /// can allocate none of them (`MakeDatabase`'s rule, applied to the one
+    /// table whose rows the app keeps out of memory). The id is the caller's
+    /// watermark (ADR-0072), the name defaults to the layout's label and is
+    /// renameable later, and the ord is past the last view so a new view lands
+    /// at the switcher's end.
+    ///
+    /// The inverse is the view alone: a view nobody has edited yet holds no
+    /// document and owns no rows, so `ViewDeleted` is the whole of the undo.
+    AddDatabaseView { block: BlockId, view: View },
+    /// Set (or clear) a `formula` column's expression — D6's formula editor.
+    /// The strings are the column's **whole `config` document** before and
+    /// after (ADR-0061's one document per column), read-edit-written by the
+    /// caller through `core::database_formula::config_set_formula`, so the keys
+    /// this command does not own pass through untouched (ADR-0074's discipline,
+    /// applied to a column) and one edit is one change and one Ctrl+Z.
+    ///
+    /// The plan is the same shape `SetDatabaseViewDefinition`'s is — replace
+    /// whole, revert to the whole previous text — because the *validation*
+    /// (that the expression parses, that its column names exist, that the
+    /// dependency graph stays acyclic, ADR-0082's save-time checks) happened in
+    /// the caller before this command was built: `core::command::plan` sees a
+    /// `Document` and no store, and a formula's schema is the store's answer.
+    SetDatabaseFormula {
+        block: BlockId,
+        property: PropertyId,
+        from: String,
+        to: String,
+    },
+    /// Turn a line into a **linked database** (SPEC §三十九 「操作」, ADR-0085):
+    /// a `Database` block that draws *another* block's entity — `db_ref` names
+    /// a database that already exists, and nothing is copied. There is no new
+    /// block kind and no second pointer column for it, on purpose: every read
+    /// and every write already resolves through `db_ref` (`db_ref_of` → the
+    /// catalog, the window read, `SetDatabaseCell`), so "reads the source's
+    /// data and view definitions, writes land on the source" holds by
+    /// construction — there is no other database anywhere for it to be about.
+    /// The one thing this command carries that `MakeDatabase` does not is the
+    /// absence of a creation: no `databases` row is born here, and its revert
+    /// therefore deletes no entity (undo of a link leaves the source whole —
+    /// the exact opposite of `MakeDatabase`'s revert, which is what makes the
+    /// two commands different words).
+    ///
+    /// `core::command::plan` cannot check that `db` names a live entity (the
+    /// catalog is the caller's), so the caller checks; a link aimed at an id
+    /// that died between pick and click would dangle and draw ADR-0060's one
+    /// muted line — a state the renderer already has a word for, not a failure.
+    LinkDatabase { id: BlockId, db: DatabaseId },
+    /// Replace a database's record template (SPEC §三十九 「操作」's 数据库模板,
+    /// ADR-0086) — the same replace-whole shape `SetDatabaseFormula` has,
+    /// because the same validation rule applies: the document was built and
+    /// read back by the caller (`database_template`), and `plan` sees a
+    /// `Document` and no store. `from == to` is not an undo step.
+    ///
+    /// The template belongs to the *entity* the block draws — the same
+    /// refusal `AddDatabaseProperty` makes when the two ids could disagree,
+    /// with the same reason: a template aimed at another database would be a
+    /// prefill no row of this block's view ever sees.
+    SetDatabaseTemplate {
+        block: BlockId,
+        db: DatabaseId,
+        from: String,
+        to: String,
+    },
 }
 
 /// The grid shape the "+", the slash menu and "Turn into" hand out. Three
@@ -291,7 +482,8 @@ fn new_child(doc: &mut Document, page: PageId, parent: BlockId, order: OrderKey,
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
-    }
+        db_ref: None,
+        sync_ref: None,    }
 }
 
 /// One empty cell of table `parent`, ordered by `order`.
@@ -444,7 +636,8 @@ fn insert_attachment(
         img_percent: 100,
         columns: 0,
         lang: Lang::Plain,
-    };
+        db_ref: None,
+        sync_ref: None,    };
     Some(Entry {
         apply: vec![Change::AttachmentAdded(attachment), Change::BlockInserted(new)],
         // Undo drops the reference only. The row and the file stay: redo must
@@ -688,7 +881,8 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 img_percent: 100,
                 columns: 0,
                 lang: Lang::Plain,
-            };
+                db_ref: None,
+                sync_ref: None,            };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
                 revert: vec![Change::BlockDeleted { id: new_id }],
@@ -720,7 +914,8 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 img_percent: 100,
                 columns: 0,
                 lang: Lang::Plain,
-            };
+                db_ref: None,
+                sync_ref: None,            };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
                 revert: vec![Change::BlockDeleted { id: new_id }],
@@ -1082,6 +1277,17 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 // layout, not to the Turn-into menu
                 return None;
             }
+            if kind == BlockKind::Database {
+                // A `Database` block is only half of a database: the other half
+                // is the entity, its title column and its first view, and their
+                // ids are not this layer's to allocate. `MakeDatabase` is the one
+                // command that makes the block and those three rows in one batch
+                // (ADR-0060), and both menus route through it — so a caller that
+                // arrives here has skipped the only path that works, and a block
+                // with no entity draws nothing at all. Refusing is the honest
+                // answer; doing it halfway is how a database loses its rows.
+                return None;
+            }
             if (kind == BlockKind::Table || kind == BlockKind::Columns)
                 && (doc.page_blocks(page).iter().any(|x| x.parent == Some(id))
                     || inside_container(doc, id))
@@ -1205,6 +1411,286 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry { apply, revert })
         }
 
+        // ─── SPEC §三十九 Database ───────────────────────────────────────────
+        Command::MakeDatabase { id, draft } => {
+            let b = doc.block(id)?;
+            let old = b.kind;
+            // The same two refusals `SetBlockType` makes, for the same reasons:
+            // a cell's kind belongs to its grid, and a block that already owns
+            // blocks cannot become a leaf (its children would vanish behind the
+            // view with no way back).
+            if matches!(old, BlockKind::TableCell | BlockKind::Column)
+                || inside_container(doc, id)
+                || b.db_ref.is_some()
+            {
+                return None;
+            }
+            if doc.page_blocks(page).iter().any(|x| x.parent == Some(id)) {
+                return None;
+            }
+            let db = draft.database.id;
+            Some(Entry {
+                // Order matters and is not stylistic: the entity exists before
+                // the pointer names it (the column has no foreign key, but the
+                // *renderer* would draw a dangling ref for one frame otherwise),
+                // and the title column and the first view are written with it —
+                // ADR-0061's "no path may create a database that cannot be
+                // drawn", which is why they travel in the same batch.
+                apply: vec![
+                    Change::DatabaseCreated(draft.database.clone()),
+                    Change::PropertyAdded(draft.title.clone()),
+                    Change::ViewAdded(draft.view.clone()),
+                    Change::BlockDbRefSet {
+                        id,
+                        db: Some(db),
+                    },
+                    Change::BlockKindSet {
+                        id,
+                        kind: BlockKind::Database,
+                    },
+                ],
+                // Three changes, not five: deleting the entity cascades its
+                // columns and its views away (ADR-0061/0064), so the properties
+                // and the views do not have to be taken back one by one. The
+                // pointer is cleared first — in reverse, that is the last thing
+                // done and the first thing undone, so the block is never left
+                // pointing at a row that is on its way out.
+                revert: vec![
+                    Change::BlockKindSet { id, kind: old },
+                    Change::BlockDbRefSet { id, db: None },
+                    Change::DatabaseDeleted { id: db },
+                ],
+            })
+        }
+
+        Command::AddDatabaseProperty { block, property } => {
+            let b = doc.block(block)?;
+            let db = b.db_ref?;
+            // The column belongs to the entity this *block* draws, so a property
+            // aimed at another database is refused rather than written: the two
+            // ids travel separately in the command and could disagree, and the
+            // result would be a column no view of this block can ever show.
+            if property.db != db {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::PropertyAdded(property.clone())],
+                // Deleting the column cascades its values away (ADR-0062), so
+                // the inverse is the column alone — and the value rows come back
+                // only if the undo that puts them back runs after this one,
+                // which is why the store's delete and this share a transaction
+                // boundary and nothing else has to be listed here.
+                revert: vec![Change::PropertyDeleted { id: property.id }],
+            })
+        }
+
+        Command::AddDatabaseRecord { block, record, ord } => {
+            let b = doc.block(block)?;
+            let db = b.db_ref?;
+            Some(Entry {
+                apply: vec![Change::RecordCreated(Record::bare(record, db, ord))],
+                // The inverse is the record alone: a row that was just created
+                // has no values and no page (it is born bare, ADR-0063), so
+                // undoing its creation cannot leave anything behind.
+                revert: vec![Change::RecordDeleted { id: record }],
+            })
+        }
+
+        Command::DeleteDatabaseRecord {
+            block,
+            record,
+            values,
+            page,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() {
+                return None;
+            }
+            let id = record.id;
+            let mut apply: Vec<Change> = Vec::with_capacity(values.len() + 2);
+            let mut revert: Vec<Change> = Vec::with_capacity(values.len() + 2);
+            // The forward order is ADR-0063's, and the revert is its reverse.
+            // `apply` is one transaction with foreign keys on, so the two orders
+            // are not interchangeable: a value row cannot outlive its record on
+            // the way out, and on the way back the record cannot name a page
+            // that has not been written yet.
+            for (property, value) in values {
+                // "Remove this value" is `CellSet { value: Empty }` and not a
+                // delete change of its own: ADR-0062 makes the absent row *the*
+                // representation of empty, so one variant covers writing a value
+                // and clearing one, and the undo is the same variant with the
+                // value it had.
+                apply.push(Change::CellSet {
+                    record: id,
+                    property: property,
+                    value: CellValue::Empty,
+                });
+                revert.push(Change::CellSet {
+                    record: id,
+                    property: property,
+                    value: value.clone(),
+                });
+            }
+            apply.push(Change::RecordDeleted { id });
+            if let Some(page) = page {
+                apply.push(Change::PageDeleted { id: page.id });
+                revert.push(Change::PageCreated(page.clone()));
+            }
+            revert.push(Change::RecordCreated(record));
+            Some(Entry { apply, revert })
+        }
+
+        Command::SetDatabaseCell {
+            block,
+            record,
+            property,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to {
+                // The same write twice is not an undo step: a click that lands on
+                // the value a checkbox already has must not push a history entry.
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::CellSet {
+                    record,
+                    property,
+                    value: to.clone(),
+                }],
+                revert: vec![Change::CellSet {
+                    record,
+                    property,
+                    value: from,
+                }],
+            })
+        }
+
+        Command::SetDatabaseViewDefinition {
+            block,
+            view,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::ViewDefinitionSet {
+                    id: view,
+                    definition: to,
+                }],
+                revert: vec![Change::ViewDefinitionSet {
+                    id: view,
+                    definition: from,
+                }],
+            })
+        }
+
+        Command::AddDatabaseView { block, view } => {
+            let b = doc.block(block)?;
+            let db = b.db_ref?;
+            // The view belongs to the entity this *block* draws — the same
+            // refusal `AddDatabaseProperty` makes, for the same reason: the two
+            // ids travel separately and could disagree, and the result would be
+            // a view no tab of this block can ever show.
+            if view.db != db {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::ViewAdded(view.clone())],
+                revert: vec![Change::ViewDeleted { id: view.id }],
+            })
+        }
+
+        Command::SetDatabaseFormula {
+            block,
+            property,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to {
+                // The same write twice is not an undo step (the rule
+                // `SetDatabaseCell` states); a config that did not change has
+                // nothing to undo.
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::PropertyConfigSet { id: property, config: to }],
+                revert: vec![Change::PropertyConfigSet {
+                    id: property,
+                    config: from,
+                }],
+            })
+        }
+
+        // ─── SPEC §三十九 「操作」: the linked database (ADR-0085) ────────────
+        //
+        // The same two refusals `MakeDatabase` makes (a cell belongs to its
+        // grid, a container's children would vanish behind the view), plus the
+        // one `MakeDatabase` cannot reach: a block that already draws an
+        // entity — own or linked, `db_ref` does not say which and does not
+        // need to — must not be repointed, for the reason `BlockDbRefSet`'s
+        // doc gives: a silently moved pointer is a database someone else's
+        // rows vanished into.
+        Command::LinkDatabase { id, db } => {
+            let b = doc.block(id)?;
+            let old = b.kind;
+            if matches!(old, BlockKind::TableCell | BlockKind::Column)
+                || inside_container(doc, id)
+                || b.db_ref.is_some()
+            {
+                return None;
+            }
+            if doc.page_blocks(page).iter().any(|x| x.parent == Some(id)) {
+                return None;
+            }
+            Some(Entry {
+                // The pointer before the kind, as `MakeDatabase` writes them:
+                // the renderer that sees kind 23 reads `db_ref` in the same
+                // batch, so no frame shows a database block with no entity
+                // behind it.
+                apply: vec![
+                    Change::BlockDbRefSet { id, db: Some(db) },
+                    Change::BlockKindSet {
+                        id,
+                        kind: BlockKind::Database,
+                    },
+                ],
+                revert: vec![
+                    Change::BlockKindSet { id, kind: old },
+                    Change::BlockDbRefSet { id, db: None },
+                ],
+            })
+        }
+
+        // ─── SPEC §三十九 「操作」: the record template (ADR-0086) ────────────
+        //
+        // The entity check is the one fact `plan` *can* see (the block's own
+        // pointer), and it is enough: a template write names the database this
+        // block draws or it is refused. The document itself is the caller's —
+        // it was read from the catalog, edited there and validated there
+        // (`database_template`'s shapes), and `from == to` writes nothing.
+        Command::SetDatabaseTemplate { block, db, from, to } => {
+            let b = doc.block(block)?;
+            if b.db_ref != Some(db) || from == to {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::DatabaseTemplateSet {
+                    id: db,
+                    template: to,
+                }],
+                revert: vec![Change::DatabaseTemplateSet {
+                    id: db,
+                    template: from,
+                }],
+            })
+        }
+
         Command::ToggleTodoChecked { id } => {
             let b = doc.block(id)?;
             if b.kind != BlockKind::Todo {
@@ -1226,7 +1712,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             })
         }
 
-        Command::ToggleMark { id, start, end, kind, url } => {
+        Command::ToggleMark { id, start, end, kind, url, date } => {
             let b = doc.block(id)?;
             let (start, end) = (start.min(end), end.max(start));
             let end = end.min(b.text.len());
@@ -1248,7 +1734,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 new_marks.push(m.clone());
             }
             if !was_covered {
-                new_marks.push(Mark { start, end, kind, url });
+                new_marks.push(Mark { start, end, kind, url, date });
                 new_marks.sort_by_key(|m| (m.start, m.end));
             }
             if new_marks == b.marks {
@@ -1257,6 +1743,50 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry {
                 apply: vec![Change::BlockMarksSet { id, marks: new_marks }],
                 revert: vec![Change::BlockMarksSet { id, marks: b.marks.clone() }],
+            })
+        }
+
+        Command::InsertReference { id, at, label, kind, url, date } => {
+            let b = doc.block(id)?;
+            let at = at.min(b.text.len());
+            if !b.text.is_char_boundary(at) {
+                return None;
+            }
+            let mut text = b.text.clone();
+            text.truncate(at);
+            text.push_str(&label);
+            let (start, end) = (at, text.len());
+            if start == end {
+                return None; // an empty label makes no atom
+            }
+            // The same rule `ToggleMark` applies, and for the same reason: an
+            // atom of this kind that intersects the new span is replaced rather
+            // than kept, while every other kind is left alone (the projection
+            // clamps a span that the shorter text has outrun, which is how
+            // typing inside a marked stretch has always been tolerated).
+            let mut marks: Vec<Mark> = b
+                .marks
+                .iter()
+                .filter(|m| !(m.kind == kind && m.intersects(start, end)))
+                .cloned()
+                .collect();
+            marks.push(Mark {
+                start,
+                end,
+                kind,
+                url,
+                date,
+            });
+            marks.sort_by_key(|m| (m.start, m.end));
+            Some(Entry {
+                apply: vec![
+                    Change::BlockTextSet { id, text: text.clone() },
+                    Change::BlockMarksSet { id, marks },
+                ],
+                revert: vec![
+                    Change::BlockTextSet { id, text: b.text.clone() },
+                    Change::BlockMarksSet { id, marks: b.marks.clone() },
+                ],
             })
         }
 
@@ -1598,7 +2128,8 @@ mod tests {
                 img_percent: 100,
                 columns: 0,
                 lang: Lang::Plain,
-            });
+                db_ref: None,
+                sync_ref: None,            });
             doc.set_page_blocks(page, v);
             prev = Some(order);
             ids.push(id);
@@ -1650,6 +2181,106 @@ mod tests {
         exec(&mut doc, &mut hist, page, Command::ReplaceText { id: ids[0], text: String::new() }).unwrap();
         exec(&mut doc, &mut hist, page, Command::MergeBackward { id: ids[0] }).unwrap();
         assert_eq!(doc.page_blocks(page).len(), 2);
+    }
+
+    /// SPEC §四十 / ADR-0050: "@Pro" plus a pick lands as **one** step. The
+    /// two halves cannot be two commands in one batch — `exec_all` plans every
+    /// command against the same pre-state, so a `ToggleMark` riding behind a
+    /// `ReplaceText` would be planned against the old text and clamp its span
+    /// to the old length — so the command does both, and one Ctrl+Z takes the
+    /// atom, its characters and the `@` back together.
+    #[test]
+    fn an_inserted_reference_replaces_the_filter_and_undoes_as_one_step() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let id = ids[0];
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ReplaceText { id, text: "see @Pro".into() },
+        )
+        .unwrap();
+        let typed = doc.block(id).unwrap().clone();
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertReference {
+                id,
+                at: 4,
+                label: "Project Atlas".into(),
+                kind: MarkKind::Mention,
+                url: "quire://page/12".into(),
+                date: None,
+            },
+        )
+        .unwrap();
+        let b = doc.block(id).unwrap();
+        assert_eq!(b.text, "see Project Atlas", "the filter and its @ are gone");
+        assert_eq!(b.marks.len(), 1);
+        assert_eq!(b.marks[0].kind, MarkKind::Mention);
+        assert_eq!((b.marks[0].start, b.marks[0].end), (4, 17));
+        assert_eq!(b.marks[0].url, "quire://page/12");
+        assert_eq!(b.marks[0].date, None);
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(
+            doc.block(id).unwrap(),
+            &typed,
+            "one undo restored the text and the atom together"
+        );
+
+        // a date is the same command with an empty address and its payload
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertReference {
+                id,
+                at: 0,
+                label: "2026-09-22".into(),
+                kind: MarkKind::Date,
+                url: String::new(),
+                date: Some("2026-09-22".into()),
+            },
+        )
+        .unwrap();
+        let b = doc.block(id).unwrap();
+        // the undo left "see @Pro", so an atom at 0 replaces the whole line
+        assert_eq!(b.text, "2026-09-22");
+        assert_eq!(b.marks[0].kind, MarkKind::Date);
+        assert_eq!((b.marks[0].start, b.marks[0].end), (0, 10));
+        assert_eq!(b.marks[0].date.as_deref(), Some("2026-09-22"));
+    }
+
+    /// An atom of the same kind already sitting on the span is *replaced*, not
+    /// stacked: the primary key of the `marks` table is `(block, start, kind)`,
+    /// so two mentions over one span could not both be stored anyway.
+    #[test]
+    fn a_second_reference_over_the_same_bytes_replaces_the_first() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let id = ids[0];
+        exec(&mut doc, &mut hist, page, Command::ReplaceText { id, text: "@x".into() }).unwrap();
+        for target in [12u64, 13] {
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::InsertReference {
+                    id,
+                    at: 0,
+                    label: "Atlas".into(),
+                    kind: MarkKind::Mention,
+                    url: format!("quire://page/{target}"),
+                    date: None,
+                },
+            )
+            .unwrap();
+        }
+        let b = doc.block(id).unwrap();
+        assert_eq!(b.marks.len(), 1, "one atom per span");
+        assert_eq!(b.marks[0].url, "quire://page/13");
+        assert_eq!(b.text, "Atlas");
     }
 
     #[test]
@@ -1708,7 +2339,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
-        };
+            db_ref: None,
+            sync_ref: None,        };
         let c1 = doc.alloc_block_id();
         let c2 = doc.alloc_block_id();
         let p2 = doc.alloc_block_id();
@@ -1765,7 +2397,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
-        };
+            db_ref: None,
+            sync_ref: None,        };
         let a = doc.alloc_block_id();
         let b = doc.alloc_block_id();
         let c = doc.alloc_block_id();
@@ -1857,7 +2490,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         assert_eq!(doc.block(f).unwrap().marks.len(), 1);
@@ -1866,7 +2499,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         assert!(doc.block(f).unwrap().marks.is_empty());
@@ -1880,7 +2513,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 0, end: 2, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 0, end: 2, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         // overlapping range replaces the old mark instead of stacking
@@ -1888,7 +2521,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         let marks = doc.block(f).unwrap().marks.clone();
@@ -1899,7 +2532,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Italic, url: String::new() },
+            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Italic, url: String::new(), date: None },
         )
         .unwrap();
         assert_eq!(doc.block(f).unwrap().marks.len(), 2);
@@ -2022,7 +2655,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
-        };
+            db_ref: None,
+            sync_ref: None,        };
         let p = mk(&mut doc, source, "p", 10, None);
         let c = mk(&mut doc, source, "c", 12, Some(p.id));
         let t = mk(&mut doc, target, "t", 10, None);
@@ -3162,6 +3796,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
+            db_ref: None,
+            sync_ref: None,
         };
         // the template's body, on its own page, in display order. The keys
         // ascend because that is what a page's rows really look like: a parent

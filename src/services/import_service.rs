@@ -150,7 +150,8 @@ pub fn import_markdown(src: &str, page: &Page, alloc: &mut dyn FnMut() -> BlockI
             img_percent: 100,
             columns: 0,
             lang: parsed.lang,
-        }));
+            db_ref: None,
+            sync_ref: None,        }));
     }
     changes
 }
@@ -231,6 +232,15 @@ fn classify(line: &str) -> ParsedBlock {
     if line.trim() == "<!-- quire:toc -->" {
         return block(BlockKind::Toc, "");
     }
+    // **A database has no marker and no arm here, and that is the decision**
+    // (ADR-0065): it exports as a GitHub-flavored table — a real representation
+    // a human and another tool can both use — and a table of pipe-separated
+    // lines comes back as paragraphs, because a pipe line is text and nothing in
+    // this reader pretends otherwise. The simple grid (ADR-0031) is in exactly
+    // the same position, with the same test pinning it, which is why this is one
+    // sentence here and not a second table parser: schema, property types, record
+    // identities and views do not survive the content channel, by decision
+    // rather than by omission.
     // A line that is nothing but an address reads back as the card that wrote
     // it. Deliberately narrow — one token, an explicit scheme — so a paragraph
     // that merely starts with a url stays a paragraph, and the text is taken
@@ -375,6 +385,12 @@ fn mark_order(kind: MarkKind) -> u8 {
         MarkKind::Code => 3,
         MarkKind::Link => 4,
         MarkKind::Math => 5,
+        // must match `export_service::kind_order`, or a document the app wrote
+        // would come back with its atoms in a different order: both reference
+        // kinds sort last because they are atoms and an outer-first order is
+        // what the writer's boundary walk produces
+        MarkKind::Mention => 6,
+        MarkKind::Date => 7,
     }
 }
 
@@ -404,6 +420,52 @@ fn inline(src: &str, out: &mut String, marks: &mut Vec<Mark>) {
                 continue;
             }
         }
+        // The reference layer's two inline atoms (SPEC §四十; ADR-0050).
+        // Both are spelled `@[…]`, and what follows the closing bracket is what
+        // tells them apart: a `(target)` makes it a mention, nothing does makes
+        // it a date. The *syntax* decides and never the label, so a page that
+        // really is called "2026-09-22" still reads back as a mention.
+        //
+        // This has to come before the generic `[…](…)` branch below: without it
+        // `@` is ordinary text and the label is read as a *link* to
+        // `quire://page/12`, which round-trips as a link and silently loses the
+        // fact that the span was a reference at all.
+        if c == '@' && bytes.get(i) == Some(&b'[') {
+            if let Some((label_end, close)) = link_bounds(bytes, i) {
+                let url = src[label_end + 2..close].trim();
+                if url.starts_with(PAGE_REF_PREFIX) {
+                    let start = out.len();
+                    out.push_str(&src[at + 2..label_end]);
+                    let end = out.len();
+                    marks.push(Mark {
+                        start,
+                        end,
+                        kind: MarkKind::Mention,
+                        url: url.to_string(),
+                        date: None,
+                    });
+                    i = close + 1;
+                    continue;
+                }
+            }
+            if let Some(label_end) = bracket_close(bytes, i) {
+                let label = &src[at + 2..label_end];
+                if crate::core::date::is_iso_date(label) {
+                    let start = out.len();
+                    out.push_str(label);
+                    let end = out.len();
+                    marks.push(Mark {
+                        start,
+                        end,
+                        kind: MarkKind::Date,
+                        url: String::new(),
+                        date: Some(label.to_string()),
+                    });
+                    i = label_end + 1;
+                    continue;
+                }
+            }
+        }
         if c == '[' {
             if let Some((label_end, close)) = link_bounds(bytes, at) {
                 let url = src[label_end + 2..close].trim();
@@ -418,6 +480,7 @@ fn inline(src: &str, out: &mut String, marks: &mut Vec<Mark>) {
                         end,
                         kind: MarkKind::Link,
                         url: url.to_string(),
+                        date: None,
                     });
                 }
                 i = close + 1;
@@ -437,6 +500,7 @@ fn inline(src: &str, out: &mut String, marks: &mut Vec<Mark>) {
                         end,
                         kind: MarkKind::Strike,
                         url: String::new(),
+                        date: None,
                     });
                 }
                 i = close + n;
@@ -464,6 +528,7 @@ fn inline(src: &str, out: &mut String, marks: &mut Vec<Mark>) {
                             end,
                             kind: *kind,
                             url: String::new(),
+                            date: None,
                         });
                     }
                 }
@@ -488,6 +553,7 @@ fn inline(src: &str, out: &mut String, marks: &mut Vec<Mark>) {
                     end,
                     kind: MarkKind::Math,
                     url: String::new(),
+                    date: None,
                 });
                 i = close + 1;
                 continue;
@@ -576,6 +642,7 @@ fn code_span(out: &mut String, marks: &mut Vec<Mark>, raw: &str) {
             end,
             kind: MarkKind::Code,
             url: String::new(),
+            date: None,
         });
     }
 }
@@ -646,6 +713,28 @@ fn emphasis_closer(bytes: &[u8], open: usize, n: usize, marker: u8) -> Option<us
 /// For a `[` at `at`: the index of the `]` and of the closing `)`, or `None`
 /// when this bracket is not a link. `\]` is escaped, a nested bracket pair
 /// inside the label is skipped over, and the target may hold parentheses.
+/// The address a mention carries, borrowed from the one module that knows
+/// its spelling (`core::reference`). ADR-0026 settled this form for a
+/// block-level reference and an inline one is the same reference one level
+/// down — which is also what makes a mention readable by the same jump path a
+/// `quire://page` link already uses.
+pub use crate::core::reference::PAGE_SCHEME as PAGE_REF_PREFIX;
+
+/// The `]` closing a `[….]` opened at `at`, or `None`. Deliberately the
+/// simplest possible scan — it exists for the *date* atom, whose spelling has
+/// no `(target)` and therefore cannot go through `link_bounds`.
+fn bracket_close(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b']' => return Some(j),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
 fn link_bounds(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
     let mut j = at + 1;
     let mut depth = 0usize;

@@ -200,6 +200,21 @@ impl Document {
                         b.page_ref = *page;
                     }
                 }
+                // SPEC §三十九 / ADR-0060: the entity a `Database` block draws.
+                // The document is where the block's kind and its pointer live —
+                // the records and the cells behind the pointer are not blocks at
+                // all, so every other §三十九 change falls into the `_` arm at
+                // the end of this match and only storage acts on it.
+                Change::BlockDbRefSet { id, db } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.db_ref = *db;
+                    }
+                }
+                Change::BlockSyncSet { id, source } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.sync_ref = *source;
+                    }
+                }
                 Change::BlockAttachmentSet { id, attachment } => {
                     if let Some(b) = self.block_mut(*id) {
                         b.attachment = *attachment;
@@ -266,7 +281,8 @@ mod tests {
             img_percent: 100,
             columns: 0,
             lang: Lang::Plain,
-        }
+            db_ref: None,
+            sync_ref: None,        }
     }
 
     use super::super::types::ColorKind;

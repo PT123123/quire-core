@@ -222,8 +222,10 @@ pub fn snippet(text: &str, terms: &[String]) -> String {
 /// so it is left alone. The match itself is never snapped away. When snapping
 /// would leave less than half of the requested window — an unbroken run (a URL,
 /// a base64 blob) filling it — the raw cut is kept: a partial word beats an
-/// empty snippet. Shared with the repo-less local search (`app::workspace`).
-pub(crate) fn snap_to_words(
+/// empty snippet. Shared with the repo-less local search (`app::workspace`),
+/// which is why it is `pub` rather than `pub(crate)`: since the split the two
+/// live in different crates.
+pub fn snap_to_words(
     chars: &[char],
     start: usize,
     end: usize,

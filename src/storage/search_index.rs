@@ -338,7 +338,7 @@ mod tests {
     }
 
     /// Manual FTS5 capability probe behind ADR-0014:
-    /// `cargo test --lib search_index -- --ignored --nocapture`
+    /// `cargo test -p quire-core --lib search_index -- --ignored --nocapture`
     #[test]
     #[ignore = "one-off capability probe, not an assertion"]
     fn fts5_capabilities() {

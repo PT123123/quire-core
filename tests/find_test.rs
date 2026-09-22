@@ -3,8 +3,8 @@
 // Chinese offsets on char boundaries, and the empty-term shapes the bar hits
 // while the user types.
 
-use quire::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, PageId};
-use quire::services::find_service::{FindHit, FindSession};
+use quire_core::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, PageId};
+use quire_core::services::find_service::{FindHit, FindSession};
 
 fn block(id: u64, text: &str) -> Block {
     Block {
@@ -16,8 +16,8 @@ fn block(id: u64, text: &str) -> Block {
         text: text.into(),
         checked: false,
         marks: Vec::new(),
-        color: quire::core::ColorKind::Default,
-        background: quire::core::ColorKind::Default,
+        color: quire_core::core::ColorKind::Default,
+        background: quire_core::core::ColorKind::Default,
         page_ref: None,
         folded: false,
         attachment: None,

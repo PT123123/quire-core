@@ -5,14 +5,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use quire::core::persistence::{Change, Repository};
-use quire::core::types::{
+use quire_core::core::persistence::{Change, Repository};
+use quire_core::core::types::{
     Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId, PersistedState,
 };
-use quire::services::search_service::SearchService;
-use quire::storage::search_index::SearchRequest;
-use quire::storage::SqliteRepository;
-use quire::testing::ScratchDir;
+use quire_core::services::search_service::SearchService;
+use quire_core::storage::search_index::SearchRequest;
+use quire_core::storage::SqliteRepository;
+use quire_core::testing::ScratchDir;
 
 fn page(id: u64, title: &str) -> Page {
     Page {
@@ -42,8 +42,8 @@ fn block(id: u64, page_id: u64, text: &str) -> Block {
         text: text.into(),
         checked: false,
         marks: Vec::new(),
-        color: quire::core::ColorKind::Default,
-        background: quire::core::ColorKind::Default,
+        color: quire_core::core::ColorKind::Default,
+        background: quire_core::core::ColorKind::Default,
         page_ref: None,
         folded: false,
         attachment: None,
@@ -463,8 +463,8 @@ fn a_v1_database_is_backfilled_on_upgrade() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(
-            quire::storage::migrations::user_version(&conn).unwrap(),
-            quire::storage::migrations::CURRENT_VERSION
+            quire_core::storage::migrations::user_version(&conn).unwrap(),
+            quire_core::storage::migrations::CURRENT_VERSION
         );
     }
     // data written before the upgrade is searchable again

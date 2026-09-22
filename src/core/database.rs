@@ -1525,7 +1525,7 @@ pub(crate) mod probe {
         };
         println!(
             "{{\"label\":\"track3-d0-window\",\"date\":\"2026-09-22\",\
-             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"harness\":\"cargo test -p quire-core --release --lib -- --ignored --nocapture\",\
              \"total\":{TOTAL},\"row_height\":32.0,\"viewport_height\":720.0,\
              \"overscan\":{DEFAULT_OVERSCAN},\"realized_top\":{rows},\
              \"realized_middle\":{},\"realized_bottom\":{},\"fetch_limit\":{},\

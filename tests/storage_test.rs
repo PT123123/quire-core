@@ -8,15 +8,15 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use quire::core::persistence::{Change, Repository, StorageError};
-use quire::core::types::{
+use quire_core::core::persistence::{Change, Repository, StorageError};
+use quire_core::core::types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId,
     PersistedState,
 };
-use quire::storage::backup;
-use quire::storage::migrations;
-use quire::storage::SqliteRepository;
-use quire::testing::ScratchDir;
+use quire_core::storage::backup;
+use quire_core::storage::migrations;
+use quire_core::storage::SqliteRepository;
+use quire_core::testing::ScratchDir;
 
 fn page(id: u64, title: &str, parent: Option<u64>, ord: u64) -> Page {
     Page {
@@ -46,8 +46,8 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         text: text.into(),
         checked: false,
         marks: Vec::new(),
-        color: quire::core::ColorKind::Default,
-        background: quire::core::ColorKind::Default,
+        color: quire_core::core::ColorKind::Default,
+        background: quire_core::core::ColorKind::Default,
         page_ref: None,
         folded: false,
         attachment: None,
@@ -486,7 +486,7 @@ fn the_v7_step_adds_attachments_to_a_v6_database() {
 
 #[test]
 fn a_grid_and_its_cells_round_trip_through_storage() {
-    use quire::core::{Mark, MarkKind};
+    use quire_core::core::{Mark, MarkKind};
     let dir = tempfile();
     let path = dir.join("grid.db");
     let table = Block {
@@ -1633,7 +1633,7 @@ fn crash_writer_child() {
 // ── helpers ─────────────────────────────────────────────────────────
 
 /// Manual latency probe for docs/PERFORMANCE.md:
-/// `cargo test --test storage -- --ignored --nocapture save_latency`
+/// `cargo test -p quire-core --test storage -- --ignored --nocapture save_latency`
 #[test]
 #[ignore = "measurement probe, not an assertion"]
 fn save_latency() {
@@ -1721,17 +1721,17 @@ fn block_colors_and_page_moves_round_trip() {
     // text + background color land in the database...
     repo.apply(&[Change::BlockColorSet {
         id: BlockId(10),
-        color: quire::core::ColorKind::Red,
-        background: quire::core::ColorKind::Yellow,
+        color: quire_core::core::ColorKind::Red,
+        background: quire_core::core::ColorKind::Yellow,
     }])
     .unwrap();
     // ...and survive a full reload
     let state = repo.load().unwrap();
     let b = state.blocks.iter().find(|b| b.id == BlockId(10)).unwrap();
-    assert_eq!(b.color, quire::core::ColorKind::Red);
-    assert_eq!(b.background, quire::core::ColorKind::Yellow);
+    assert_eq!(b.color, quire_core::core::ColorKind::Red);
+    assert_eq!(b.background, quire_core::core::ColorKind::Yellow);
     let b = state.blocks.iter().find(|b| b.id == BlockId(11)).unwrap();
-    assert_eq!(b.color, quire::core::ColorKind::Default);
+    assert_eq!(b.color, quire_core::core::ColorKind::Default);
 
     // a cross-page move re-homes the row and its tree position
     repo.apply(&[Change::BlockMovedToPage {
@@ -1746,7 +1746,7 @@ fn block_colors_and_page_moves_round_trip() {
     assert_eq!(moved.page, PageId(2));
     assert_eq!(moved.order, OrderKey(200));
     // the color rode along
-    assert_eq!(moved.color, quire::core::ColorKind::Red);
+    assert_eq!(moved.color, quire_core::core::ColorKind::Red);
     assert!(state.blocks.iter().all(|b| b.id != BlockId(10) || b.page == PageId(2)));
 }
 
@@ -1759,7 +1759,7 @@ fn block_colors_and_page_moves_round_trip() {
 
 mod database_layer {
     use super::*;
-    use quire::core::database::{
+    use quire_core::core::database::{
         CellValue, Database, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId,
         RowRequest, RowWindow, View, ViewId, ViewLayout,
     };
@@ -2446,8 +2446,8 @@ mod database_layer {
     /// served by the schema the step built.
     #[test]
     fn the_v16_step_adds_reference_indexes_to_a_v15_database() {
-        use quire::core::{Mark, MarkKind};
-        use quire::storage::backlinks;
+        use quire_core::core::{Mark, MarkKind};
+        use quire_core::storage::backlinks;
 
         let (_dir, path) = migrated("d1-v16");
         {
@@ -2525,7 +2525,7 @@ fn a_mention_and_a_date_survive_a_reopen_with_their_payloads() {
     // test rules out is the failure that would otherwise be invisible — a date
     // loading back with `date: None`, i.e. its characters still on screen and
     // the atom quietly gone.
-    use quire::core::{Mark, MarkKind};
+    use quire_core::core::{Mark, MarkKind};
 
     let dir = ScratchDir::new("marks-ref");
     let path = dir.join("quire.db");
@@ -2584,8 +2584,8 @@ fn a_mention_and_a_date_survive_a_reopen_with_their_payloads() {
 /// Getting them tangled is how a folded panel starts lying about its own size.
 #[test]
 fn the_panel_carries_the_source_text_and_folds_without_losing_the_count() {
-    use quire::core::{Mark, MarkKind};
-    use quire::storage::backlinks;
+    use quire_core::core::{Mark, MarkKind};
+    use quire_core::storage::backlinks;
 
     let dir = ScratchDir::new("backlinks-fold");
     let path = dir.join("quire.db");
@@ -2651,11 +2651,11 @@ fn the_panel_carries_the_source_text_and_folds_without_losing_the_count() {
 // fixture needs ten lines of helper that nothing else has a use for.
 mod database_property_layer {
     use super::*;
-    use quire::core::database::{
+    use quire_core::core::database::{
         CellValue, Database, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId,
         ValueKind, ViewId,
     };
-    use quire::core::database_property::iso_date;
+    use quire_core::core::database_property::iso_date;
     use std::path::PathBuf;
 
     /// A real file at `CURRENT_VERSION`, migrated by the app itself: standing in

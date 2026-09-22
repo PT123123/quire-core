@@ -608,7 +608,7 @@ mod tests {
     /// A reading for `docs/PERFORMANCE.md`, not a gate. The pixels are random,
     /// which no screen is, so this is the store leg of a paste at its worst.
     /// Run by hand:
-    /// `cargo test --release --lib pasted_screenshot_is_stored -- --ignored --nocapture`
+    /// `cargo test -p quire-core --release --lib pasted_screenshot_is_stored -- --ignored --nocapture`
     #[test]
     #[ignore = "prints a measurement instead of asserting one"]
     fn a_pasted_screenshot_is_stored_in_the_same_time_it_takes_to_decode() {

@@ -1460,7 +1460,7 @@ mod perf {
         );
         println!(
             "{{\"label\":\"track3-d8-formula\",\"date\":\"2026-09-22\",\
-             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"harness\":\"cargo test -p quire-core --release --lib -- --ignored --nocapture\",\
              \"parse_ns\":{parse_ns:.0},\"eval_ns\":{eval_ns:.0},\
              \"window_rows\":{window:.0},\"window_one_column_us\":{one_column_us:.3},\
              \"window_three_columns_us\":{three_columns_us:.3},\

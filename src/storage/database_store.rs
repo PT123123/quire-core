@@ -4058,7 +4058,7 @@ mod probe {
         };
         println!(
             "{{\"label\":\"track3-d1-window\",\"date\":\"2026-09-22\",\
-             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"harness\":\"cargo test -p quire-core --release --lib -- --ignored --nocapture\",\
              \"records\":{ROWS},\"properties\":{},\"insert_ms\":{insert_ms:.1},\
              \"insert_us_per_row\":{:.2},\"window_rows\":{},\"window_fetch_limit\":{},\
              \"window_fetch_offset\":{},\"window_read_us\":{:.1},\"mid_rows\":{},\
@@ -4339,7 +4339,7 @@ mod probe {
         }
         println!(
             "{{\"label\":\"track3-d2-sort\",\"date\":\"2026-09-22\",\
-             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"harness\":\"cargo test -p quire-core --release --lib -- --ignored --nocapture\",\
              \"records\":{ROWS},\"insert_ms\":{insert_ms:.1},\"sorted_top_rows\":{},\
              \"sorted_top_us\":{top_us:.1},\"sorted_bottom_rows\":{},\"sorted_bottom_us\":{bottom_us:.1},\
              \"sorted_all_rows\":{},\"sorted_all_ms\":{:.1},\"unsorted_bottom_us\":{bottom_plain_us:.1},\
@@ -4480,7 +4480,7 @@ mod probe {
         );
         println!(
             "{{\"label\":\"track3-d8-view-switch\",\"date\":\"2026-09-22\",\
-             \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+             \"harness\":\"cargo test -p quire-core --release --lib -- --ignored --nocapture\",\
              \"records\":{ROWS},\"decode_us\":{decode_us:.3},\"row_switch_top_us\":{top_us:.1},\
              \"row_switch_bottom_us\":{bottom_us:.1},\"group_tallies_us\":{groups_us:.1},\
              \"groups\":{},\"whole_switch_us\":{switch_us:.1},\"unwindowed_ms\":{all_ms:.1}}}",
@@ -4596,7 +4596,7 @@ mod probe {
             );
             println!(
                 "{{\"label\":\"track3-d10-search-count\",\"date\":\"2026-09-23\",\
-                 \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+                 \"harness\":\"cargo test -p quire-core --release --lib -- --ignored --nocapture\",\
                  \"records\":{ROWS},\"needle\":\"{needle}\",\"hits\":{expected},\
                  \"record_count_us\":{count_us:.1},\"filtered_count_us\":{unneedled_us:.1},\
                  \"needled_count_us\":{needled_us:.1},\"needled_window_us\":{window_us:.1},\

@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use quire::core::persistence::{Change, Repository, StorageError};
-use quire::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId};
-use quire::services::search_service::SearchService;
-use quire::services::settings_store::{Settings, SettingsStore};
-use quire::storage::backup::{self, KEEP};
-use quire::storage::{Database, SqliteRepository};
-use quire::testing::ScratchDir;
+use quire_core::core::persistence::{Change, Repository, StorageError};
+use quire_core::core::types::{Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId};
+use quire_core::services::search_service::SearchService;
+use quire_core::services::settings_store::{Settings, SettingsStore};
+use quire_core::storage::backup::{self, KEEP};
+use quire_core::storage::{Database, SqliteRepository};
+use quire_core::testing::ScratchDir;
 
 /// A workspace folder that goes away with the test. Each `tempdir()` call used
 /// to be answered by a hand-written `remove_dir_all(&dir).unwrap()` on the
@@ -306,8 +306,8 @@ fn a_recovered_database_is_searchable_straight_away() {
                 text: "字体回退与行高".into(),
                 checked: false,
             marks: Vec::new(),
-        color: quire::core::ColorKind::Default,
-        background: quire::core::ColorKind::Default,
+        color: quire_core::core::ColorKind::Default,
+        background: quire_core::core::ColorKind::Default,
         page_ref: None,
         folded: false,
         attachment: None,
@@ -431,11 +431,11 @@ fn the_report_says_when_no_snapshot_could_be_written() {
 
 /// One-off cost probe for docs/PERFORMANCE.md, not an assertion: what the
 /// startup snapshot costs against a workspace the size of scene D. Run with
-/// `cargo test --test backup -- --ignored --nocapture`.
+/// `cargo test -p quire-core --test backup -- --ignored --nocapture`.
 #[test]
 #[ignore = "one-off cost probe, not an assertion"]
 fn snapshot_cost() {
-    use quire::core::types::PersistedState;
+    use quire_core::core::types::PersistedState;
     use std::time::Instant;
 
     let dir = tempdir();
@@ -467,8 +467,8 @@ fn snapshot_cost() {
             text: format!("block {i} carrying a little text to index"),
             checked: false,
             marks: Vec::new(),
-        color: quire::core::ColorKind::Default,
-        background: quire::core::ColorKind::Default,
+        color: quire_core::core::ColorKind::Default,
+        background: quire_core::core::ColorKind::Default,
         page_ref: None,
         folded: false,
         attachment: None,
@@ -549,12 +549,12 @@ fn snapshot_cost() {
 // housekeeping can tell its files from somebody else's.
 mod version_files {
     use super::{tempdir, SqliteRepository};
-    use quire::core::persistence::{Change, Repository, StorageError};
-    use quire::core::types::{
+    use quire_core::core::persistence::{Change, Repository, StorageError};
+    use quire_core::core::types::{
         Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind,
         OrderKey, Page, PageFont, PageId, PersistedState,
     };
-    use quire::storage::versions as v;
+    use quire_core::storage::versions as v;
     use std::collections::BTreeSet;
 
     fn page(id: u64, title: &str) -> Page {
@@ -883,7 +883,7 @@ mod version_files {
     /// One-off cost probe for docs/PERFORMANCE.md, not an assertion: what one
     /// page's version file costs against the library it came from, what the
     /// twenty-per-page cap bounds that at, and how long the copy takes. Run with
-    /// `cargo test --test backup -- --ignored --nocapture`.
+    /// `cargo test -p quire-core --test backup -- --ignored --nocapture`.
     #[test]
     #[ignore = "one-off cost probe, not an assertion"]
     fn version_cost() {

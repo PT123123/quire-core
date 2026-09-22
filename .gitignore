@@ -1,0 +1,9 @@
+/target
+/target-skia
+/target-wgpu
+/.scratch
+/.build
+/appdata
+*.pdb
+.DS_Store
+/dist

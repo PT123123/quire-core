@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(to_unicode(&once), once);
     }
 
-    // Costs for the docs to quote, not an assertion: `cargo test --release
+    // Costs for the docs to quote, not an assertion: `cargo test -p quire-core --release
     // --lib core::math -- --ignored --nocapture`. A formula renders per *run*
     // at projection time (`build_runs`), so a page whose every line holds one
     // pays this once per line per projection — the number worth knowing before

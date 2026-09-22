@@ -3,12 +3,12 @@
 // in both directions (M6), and the export -> import -> export semantic round
 // trip (Chinese and CRLF).
 
-use quire::core::persistence::Change;
-use quire::core::types::{
+use quire_core::core::persistence::Change;
+use quire_core::core::types::{
     AttachmentId, Block, BlockId, BlockKind, Lang, Mark, MarkKind, OrderKey, Page, PageFont, PageId,
 };
-use quire::services::export_service::{export_page, export_page_with};
-use quire::services::import_service::{import_markdown, parse_inline, parse_markdown, ParsedBlock};
+use quire_core::services::export_service::{export_page, export_page_with};
+use quire_core::services::import_service::{import_markdown, parse_inline, parse_markdown, ParsedBlock};
 
 fn block(id: u64, kind: BlockKind, text: &str) -> Block {
     Block {
@@ -20,8 +20,8 @@ fn block(id: u64, kind: BlockKind, text: &str) -> Block {
         text: text.into(),
         checked: false,
         marks: Vec::new(),
-        color: quire::core::ColorKind::Default,
-        background: quire::core::ColorKind::Default,
+        color: quire_core::core::ColorKind::Default,
+        background: quire_core::core::ColorKind::Default,
         page_ref: None,
         folded: false,
         attachment: None,
@@ -170,7 +170,7 @@ fn export_covers_every_block_kind() {
 
 #[test]
 fn rich_paste_gate_admits_structure_and_rejects_plain_text() {
-    use quire::services::import_service::parse_if_block_structure;
+    use quire_core::services::import_service::parse_if_block_structure;
 
     // multi-block text lands as blocks
     let parsed = parse_if_block_structure("# Title\n\nbody").unwrap();

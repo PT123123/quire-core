@@ -529,7 +529,17 @@ pub fn table_rows(rows: &[RowView], columns: &[TableColumn], pages: &RecordPages
                         property: column.property,
                         kind: column.kind,
                         checked: painted == FLAG_TRUE,
-                        editable: !column.kind.is_computed() && !column.kind.is_derived(),
+                        // A relation is **not** edited in place — not because
+                        // nothing is stored (it is: a list of target ids,
+                        // ADR-0088) but because typing is not how a target is
+                        // chosen. Its cell is painted with the targets' live
+                        // titles and the picker that changes them is its own
+                        // affordance; letting this say `true` would open the
+                        // page's one `TextEdit` over a cell whose stored value
+                        // is a record id.
+                        editable: !column.kind.is_computed()
+                            && !column.kind.is_derived()
+                            && column.kind != PropertyKind::Relation,
                         painted,
                     }
                 })

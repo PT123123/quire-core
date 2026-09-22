@@ -53,9 +53,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
-// The test/probe helpers `EXPLAIN` a statement with its binds, which are
-// `Value`s now that a filter's binds are heterogeneous.
-#[cfg(test)]
+// Binds are `Value`s now that a filter's are heterogeneous: the tests `EXPLAIN`
+// a statement with them, and `values_of` builds the one list this file binds by
+// number rather than through `params!`.
 use rusqlite::types::Value;
 
 use crate::core::database::{
@@ -259,6 +259,255 @@ impl SqliteRepository {
             .optional()
             .map_err(sql)?;
         Ok(title.map(|t| t.unwrap_or_default()))
+    }
+
+    /// Many records' titles at once, through the same `COALESCE`
+    /// [`Self::record_title`] uses for one (ADR-0063's one title home: the
+    /// page's title when the record owns a page, the `title` value row when it
+    /// does not).
+    ///
+    /// The window's relation cells ask for the union of every id they name, so
+    /// a projection makes **one query per relation column**, not one per
+    /// target — the trade `record_pages` already makes for the export
+    /// (ADR-0088).
+    ///
+    /// A record this library does not have is **absent from the map**, and that
+    /// absence is the whole of how a dangling target is represented: the caller
+    /// paints ADR-0088's degradation word for an id it cannot find. An existing
+    /// record whose title is empty is `Some("")` and lands in the map as `""` —
+    /// "this row has no name yet" is a different fact from "this row is gone",
+    /// and only the map's keys can tell them apart.
+    pub fn record_titles(
+        &self,
+        records: &[RecordId],
+    ) -> Result<HashMap<u64, String>, StorageError> {
+        if records.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.database().conn();
+        let ids: Vec<i64> = records.iter().map(|r| id(r.as_u64())).collect();
+        let query = format!(
+            "SELECT r.id, COALESCE(p.title, v.text)
+               FROM db_records r
+               LEFT JOIN pages p ON p.id = r.page
+               LEFT JOIN db_values v ON v.record = r.id
+                    AND v.property = (SELECT id FROM db_properties
+                                      WHERE db = r.db AND kind = 'title'
+                                      ORDER BY ord, id LIMIT 1)
+              WHERE r.id IN ({})",
+            placeholders(ids.len())
+        );
+        let mut stmt = conn.prepare(&query).map_err(sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(ids.iter().copied()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(sql)?;
+        let mut out: HashMap<u64, String> = HashMap::with_capacity(records.len());
+        for row in rows {
+            let (record, title) = row.map_err(sql)?;
+            out.insert(record as u64, title.unwrap_or_default());
+        }
+        Ok(out)
+    }
+
+    /// One column's **items** for each of `records`, in stored order — the same
+    /// batched `db_value_items` read the row query runs for its list columns,
+    /// exposed because a projection needs the *ids* where a `RowView` carries
+    /// painted strings (ADR-0088).
+    ///
+    /// Absent from the map means "relates to nothing": empty is the absence of
+    /// the rows (ADR-0062), so a record with an empty list and a record nobody
+    /// ever picked for are the same state here, which is what lets the caller
+    /// tell "no value" from "a value of zero items".
+    pub fn cell_items(
+        &self,
+        records: &[RecordId],
+        property: PropertyId,
+    ) -> Result<HashMap<u64, Vec<String>>, StorageError> {
+        if records.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<i64> = records.iter().map(|r| id(r.as_u64())).collect();
+        let items = read_items(&self.database().conn(), &ids, &[id(property.as_u64())])?;
+        Ok(items
+            .into_iter()
+            .map(|((record, _), values)| (record as u64, values))
+            .collect())
+    }
+
+    /// One column's value for each of `records`, in the shape its kind stores —
+    /// what a rollup folds (ADR-0089). **One query per shape**, never one per
+    /// record: a window's relation cells can name a hundred targets between
+    /// them, and a point read each would be a hundred round trips to answer one
+    /// cell. The shapes are the store's three columns, the items table, and (for
+    /// the two derived stamps) the record's own row — the same set
+    /// [`SqliteRepository::cell`] answers for one record.
+    ///
+    /// A record with no value is **absent**, so the caller can tell "no value"
+    /// from `0` (ADR-0062). A property that does not exist, or one that is
+    /// computed, answers an empty map: that is [`Self::cell`]'s fold, and it is
+    /// why a hand-edited rollup naming a computed column reads as nothing rather
+    /// than recursing — the read path's depth cap is zero, and it is the
+    /// strictest one there is (ADR-0089).
+    pub fn values_of(
+        &self,
+        records: &[RecordId],
+        property: PropertyId,
+    ) -> Result<HashMap<u64, CellValue>, StorageError> {
+        if records.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.database().conn();
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT kind FROM db_properties WHERE id = ?1",
+                params![property.as_u64() as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some(kind) = kind else {
+            return Ok(HashMap::new());
+        };
+        let kind = PropertyKind::from_stored(&kind);
+        if kind.is_computed() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<i64> = records.iter().map(|r| id(r.as_u64())).collect();
+        let mut out: HashMap<u64, CellValue> = HashMap::new();
+        if kind.is_derived() {
+            // The two stamps are columns of the record, not of `db_values`
+            // (ADR-0068): one read of the rows that have one, and `''` — a
+            // record from before the step — is the absence of a value, exactly
+            // as `cell` reads it.
+            let query = format!(
+                "SELECT id, created, edited FROM db_records WHERE id IN ({})",
+                placeholders(ids.len())
+            );
+            let mut stmt = conn.prepare(&query).map_err(sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(ids.iter().copied()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(sql)?;
+            for row in rows {
+                let (record, created, edited) = row.map_err(sql)?;
+                let stamp = if kind == PropertyKind::CreatedTime {
+                    created
+                } else {
+                    edited
+                };
+                if !stamp.is_empty() {
+                    out.insert(record as u64, CellValue::Text(stamp));
+                }
+            }
+            return Ok(out);
+        }
+        if kind.value_kind() == ValueKind::Items {
+            let items = read_items(&conn, &ids, &[id(property.as_u64())])?;
+            return Ok(items
+                .into_iter()
+                .map(|((record, _), values)| (record as u64, CellValue::Items(values)))
+                .collect());
+        }
+        // The property is the first bind and the id list follows it, so the
+        // placeholders are numbered from 2 — a bare `?` after a `?1` would
+        // silently reuse index 1 and read the property as the first record.
+        let list: String = (2..2 + ids.len())
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT record, text, num, flag FROM db_values
+              WHERE property = ?1 AND record IN ({list})"
+        );
+        let mut binds: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+        binds.push(Value::Integer(id(property.as_u64())));
+        binds.extend(ids.iter().copied().map(Value::Integer));
+        let mut stmt = conn.prepare(&query).map_err(sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(binds.iter().cloned()), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(sql)?;
+        for row in rows {
+            let (record, text, num, flag) = row.map_err(sql)?;
+            let value = match kind.value_kind() {
+                ValueKind::Number => num.map(CellValue::Number).unwrap_or(CellValue::Empty),
+                ValueKind::Flag => CellValue::Flag(flag != 0),
+                _ => CellValue::Text(text),
+            };
+            if !value.is_empty() {
+                out.insert(record as u64, value);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` records of one database, as `(record, title)`, whose title
+    /// contains `needle` — what a relation's picker offers (ADR-0088).
+    ///
+    /// The needle is matched the way ADR-0087's view search matches — a
+    /// case-folded `INSTR` over the same `COALESCE` the title comes from, so the
+    /// list and the cell agree about what a row is called — and the list is
+    /// **capped**: a picker that listed a 10 000-row database would be
+    /// `database::window`'s red line broken through the back door, so the cap is
+    /// the feature's shape rather than a performance tweak. An empty needle
+    /// lists the first `limit` rows, which is what a picker shows before
+    /// anything is typed.
+    pub fn records_named(
+        &self,
+        db: DatabaseId,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, String)>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.database().conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.id, COALESCE(p.title, v.text)
+                   FROM db_records r
+                   LEFT JOIN pages p ON p.id = r.page
+                   LEFT JOIN db_values v ON v.record = r.id
+                        AND v.property = (SELECT id FROM db_properties
+                                          WHERE db = r.db AND kind = 'title'
+                                          ORDER BY ord, id LIMIT 1)
+                  WHERE r.db = ?1
+                    AND (?2 = ''
+                         OR INSTR(LOWER(COALESCE(COALESCE(p.title, v.text), '')),
+                                  LOWER(?2)) > 0)
+                  ORDER BY r.ord, r.id
+                  LIMIT ?3",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    id(db.as_u64()),
+                    needle,
+                    limit.min(i64::MAX as usize) as i64
+                ],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (record, title) = row.map_err(sql)?;
+            out.push((record as u64, title.unwrap_or_default()));
+        }
+        Ok(out)
     }
 
     /// A record's two instants, as step 17 stores them (ADR-0068), or `None`

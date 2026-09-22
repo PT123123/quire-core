@@ -305,6 +305,78 @@ pub enum Command {
         from: String,
         to: String,
     },
+    /// Write a relation cell **and, in the same batch, the back-pointers that
+    /// write implies** (SPEC §三十九's 双向关系, ADR-0088).
+    ///
+    /// This is one command rather than a `SetDatabaseCell` plus N more because
+    /// ADR-0084's requirement is that the forward change and the back-pointers
+    /// land in one change batch: a half-written pair — this row points at that
+    /// one and that one does not point back — is not a state any undo direction
+    /// can name, so it is not a state this build can produce. One command means
+    /// one `Entry`, which means one Ctrl+Z, which is the same shape
+    /// `DeleteDatabaseRecord` already has for its values + record + page.
+    ///
+    /// `mirrors` carries the back-pointer writes, already resolved by the
+    /// caller: for each target record whose mirror cell changes, the record, the
+    /// mirror column, and the value before and after. `plan` adds them to the
+    /// entry verbatim, because it sees a `Document` and no store — which column
+    /// the back-pointer *is* was answered by the config the caller read, and
+    /// which records are related was answered by the cell's own stored list.
+    ///
+    /// A relation is **not** a two-way write by definition: a one-way column
+    /// passes an empty `mirrors` and this is an ordinary cell write.
+    SetRelation {
+        block: BlockId,
+        record: RecordId,
+        property: PropertyId,
+        from: CellValue,
+        to: CellValue,
+        /// `(target record, mirror column, before, after)` — one entry per
+        /// back-pointer that changes.
+        mirrors: Vec<(RecordId, PropertyId, CellValue, CellValue)>,
+    },
+    /// Declare what a relation column points at, and — when the pairing is
+    /// asked for — make the two columns each other's back-pointer (ADR-0088).
+    ///
+    /// Two config documents in one batch, because a two-way relation is a
+    /// property of the *pair*: writing only this side's `mirror` key would leave
+    /// the other column with no idea it has a partner, and the read of the very
+    /// next frame would paint a back-pointer that never appears. So the entry
+    /// carries `to` for this column and `mirror`'s own before/after for the
+    /// other, and both land together — one Ctrl+Z, and no frame in between can
+    /// see half a pair.
+    ///
+    /// The four refusals that make the mirror map an involution
+    /// (`database_relation::check_pair`) ran in the caller, before this command
+    /// was built: they need the catalog, and `plan` has none.
+    SetRelationConfig {
+        block: BlockId,
+        property: PropertyId,
+        from: String,
+        to: String,
+        /// The other config documents this declaration changes — the partner
+        /// being paired, and (when a pairing is being broken or moved) the
+        /// partner being dropped. Each is `(column, its config before, its
+        /// config after)`, and an unchanged pair is skipped in `plan`.
+        mirrors: Vec<(PropertyId, String, String)>,
+    },
+    /// Set (or clear) a **rollup** column's settings — its relation, its target
+    /// column and its fold (ADR-0089).
+    ///
+    /// `SetDatabaseFormula`'s shape, and deliberately a second command rather
+    /// than a shared one: both replace a column's whole `config` document, but
+    /// what a *name* promises matters here. `plan` cannot validate either
+    /// (validation needs the catalog), so the caller is the only thing standing
+    /// between a wrong config and the file — and a caller reading
+    /// "SetDatabaseFormula" while writing a rollup's relation and aggregate is
+    /// how the wrong refusal set gets applied to the wrong kind. The two
+    /// commands differ in exactly the way their validations do.
+    SetDatabaseRollup {
+        block: BlockId,
+        property: PropertyId,
+        from: String,
+        to: String,
+    },
 }
 
 /// The grid shape the "+", the slash menu and "Turn into" hand out. Three
@@ -1627,6 +1699,28 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             })
         }
 
+        // The formula arm's shape, for the other computed kind — and the same
+        // guards, because the two commands exist separately for the reason
+        // `SetDatabaseRollup`'s own doc gives.
+        Command::SetDatabaseRollup {
+            block,
+            property,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::PropertyConfigSet { id: property, config: to }],
+                revert: vec![Change::PropertyConfigSet {
+                    id: property,
+                    config: from,
+                }],
+            })
+        }
+
         // ─── SPEC §三十九 「操作」: the linked database (ADR-0085) ────────────
         //
         // The same two refusals `MakeDatabase` makes (a cell belongs to its
@@ -1689,6 +1783,110 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                     template: from,
                 }],
             })
+        }
+
+        // ─── SPEC §三十九's two-way relation (ADR-0088) ──────────────────────
+        //
+        // One cell and every back-pointer it owns, in one entry. The two halves
+        // are gathered rather than derived: `plan` cannot ask what a mirror
+        // column is (that is the catalog's answer) and cannot read the cell
+        // that is being replaced (that is the store's), so the caller resolved
+        // both and this arm's whole job is to make them one undo step.
+        Command::SetRelation {
+            block,
+            record,
+            property,
+            from,
+            to,
+            mirrors,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() {
+                return None;
+            }
+            let mut apply: Vec<Change> = Vec::with_capacity(1 + mirrors.len());
+            let mut revert: Vec<Change> = Vec::with_capacity(1 + mirrors.len());
+            // The forward half is skipped when the pick did not change — which
+            // happens whenever the chosen set is the same but a back-pointer
+            // still needs repair — and the same rule `SetDatabaseCell` states
+            // applies to each back-pointer: an unchanged value is not an undo
+            // step.
+            if from != to {
+                apply.push(Change::CellSet {
+                    record,
+                    property,
+                    value: to,
+                });
+                revert.push(Change::CellSet {
+                    record,
+                    property,
+                    value: from,
+                });
+            }
+            for (target, mirror, before, after) in mirrors {
+                if before == after {
+                    continue;
+                }
+                apply.push(Change::CellSet {
+                    record: target,
+                    property: mirror,
+                    value: after,
+                });
+                revert.push(Change::CellSet {
+                    record: target,
+                    property: mirror,
+                    value: before,
+                });
+            }
+            if apply.is_empty() {
+                return None;
+            }
+            Some(Entry { apply, revert })
+        }
+
+        // Both config documents, one entry. `from == to` collapses to "only the
+        // other side changed", which is the repair case: declaring the pairing
+        // again after editing one side of it.
+        Command::SetRelationConfig {
+            block,
+            property,
+            from,
+            to,
+            mirrors,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() {
+                return None;
+            }
+            let mut apply: Vec<Change> = Vec::with_capacity(1 + mirrors.len());
+            let mut revert: Vec<Change> = Vec::with_capacity(1 + mirrors.len());
+            if from != to {
+                apply.push(Change::PropertyConfigSet {
+                    id: property,
+                    config: to,
+                });
+                revert.push(Change::PropertyConfigSet {
+                    id: property,
+                    config: from,
+                });
+            }
+            for (other, before, after) in mirrors {
+                if before == after {
+                    continue;
+                }
+                apply.push(Change::PropertyConfigSet {
+                    id: other,
+                    config: after,
+                });
+                revert.push(Change::PropertyConfigSet {
+                    id: other,
+                    config: before,
+                });
+            }
+            if apply.is_empty() {
+                return None;
+            }
+            Some(Entry { apply, revert })
         }
 
         Command::ToggleTodoChecked { id } => {

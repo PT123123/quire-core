@@ -177,9 +177,15 @@ impl PairRefusal {
 ///    one write trigger itself forever.
 /// 2. **The partner must be a relation.** Pairing with a text column would
 ///    store back-pointers nowhere.
-/// 3. **It must point back.** The candidate has to live in this column's target
-///    database *and* declare this column's database as its target; anything
-///    else is a coincidence of ids, not a two-way relation.
+/// 3. **It must point back — or be free to be pointed back.** The candidate has
+///    to live in this column's target database, and it has to either already
+///    declare this column's database as its target or declare no target at all.
+///    The second half is not a loophole: the accepted declaration *is* what
+///    writes the candidate's `target` (one batch, both sides), so a brand-new
+///    back-pointer column arrives with nothing declared and leaves paired. A
+///    candidate declaring a *third* database is the coincidence of ids this
+///    refusal is for — pairing it would leave a column whose own list shows one
+///    database while its back-pointer names another.
 /// 4. **It must be free.** Because the map is an involution, accepting a
 ///    pairing is symmetric: this function accepting it is also what makes
 ///    `mirror(mirror(a)) == a` true, and a candidate that already answers to
@@ -197,7 +203,10 @@ pub fn check_pair(
     if facts.kind != PropertyKind::Relation {
         return Err(PairRefusal::NotARelation);
     }
-    if facts.db != forward_target || facts.target != Some(forward_db) {
+    if facts.db != forward_target {
+        return Err(PairRefusal::NotABackPointer);
+    }
+    if matches!(facts.target, Some(declared) if declared != forward_db) {
         return Err(PairRefusal::NotABackPointer);
     }
     match facts.mirror {
@@ -302,6 +311,20 @@ mod tests {
                 &facts(PropertyKind::Relation, 2, Some(1), Some(7))
             ),
             Ok(())
+        );
+        // A brand-new back-pointer column: it declares no target yet, and the
+        // accepted declaration is what writes one. Refusing this would make the
+        // one-shot pairing — the gesture a user actually makes — impossible.
+        assert_eq!(
+            check_pair(
+                forward,
+                forward_db,
+                forward_target,
+                candidate,
+                &facts(PropertyKind::Relation, 2, None, None)
+            ),
+            Ok(()),
+            "a free relation in the target database is free to be the back-pointer"
         );
         // The four refusals.
         assert_eq!(

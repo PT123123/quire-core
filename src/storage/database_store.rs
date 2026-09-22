@@ -40,21 +40,39 @@
 //      `created time` / `last edited time` cell is `db_records.created` /
 //      `.edited`, never a `db_values` row, and the write path is what stamps
 //      them.
+//   6. **The view's rules compile into the same statement** (D4, ADR-0076): the
+//      filter tree, the sort list and the group are turned into this
+//      statement's `WHERE` / `ORDER BY` / group predicate by
+//      `storage::database_query` — the module that owns every piece of SQL
+//      text the rules produce — and this file is the only place that executes
+//      it. The red line (「filter / sort 在 SQL 侧完成，不在 UI 侧过滤」) is
+//      that split: the query is built with the rules *inside* it, so the
+//      window slices the filtered order and no Rust code ever holds rows to
+//      throw them away.
 
 use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
+// The test/probe helpers `EXPLAIN` a statement with its binds, which are
+// `Value`s now that a filter's binds are heterogeneous.
+#[cfg(test)]
+use rusqlite::types::Value;
 
 use crate::core::database::{
     CellValue, Database, DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind,
-    RealizedRows, Record, RecordId, RecordTimestamps, RowRequest, RowView, RowWindow, SortColumn,
-    SortSpec, ValueKind, View, ViewGeometry, ViewId,
+    RealizedRows, Record, RecordId, RecordTimestamps, RowRequest, RowView, RowWindow, ValueKind,
+    View, ViewGeometry, ViewId,
 };
-use crate::core::database_view::RecordPages;
+// The tests compile requests with sort terms; the read path's own ORDER BY
+// lives in `database_query` now.
+#[cfg(test)]
+use crate::core::database::SortSpec;
+use crate::core::database_view::{GroupKey, GroupSpec, RecordPages};
 use crate::core::persistence::StorageError;
 use crate::core::types::{OrderKey, PageId};
 
 use super::database::{ord_from_db, ord_to_db};
+use super::database_query::{count_query, group_query, row_query_in_group, row_query_plan};
 use super::repository::{require_hit, SqliteRepository};
 
 /// The one clock in the database layer (ADR-0068): SQLite's own, read as the
@@ -372,13 +390,24 @@ impl SqliteRepository {
     /// from SQL. The arcs are D0's and D1's halves meeting — the window is
     /// still computed *before* any row is asked for, and the fetch is handed
     /// nothing but the window.
+    ///
+    /// D4 narrows the count instead of the rows: a request carrying a filter is
+    /// counted by [`Self::filtered_count`] — `COUNT(*)` over the same
+    /// predicate the row read runs — so the window is a slice of the *filtered*
+    /// table. Filter 10 000 rows down to 3 and this realizes 3 rows, because 3
+    /// is what the window arithmetic was handed; the unfiltered count would
+    /// have made this function hold the table in order to discard it.
     pub fn realized_rows(
         &self,
         req: &RowRequest<'_>,
         geometry: ViewGeometry,
         scroll_y: f32,
     ) -> Result<RealizedRows, StorageError> {
-        let total = self.record_count(req.db)?;
+        let total = if req.filter.is_some() {
+            self.filtered_count(req)?
+        } else {
+            self.record_count(req.db)?
+        };
         let mut failure = None;
         let realized = RealizedRows::scroll_to(total, geometry, scroll_y, |window| {
             match self.window_rows(req, window) {
@@ -395,6 +424,90 @@ impl SqliteRepository {
             Some(e) => Err(e),
             None => Ok(realized),
         }
+    }
+
+    /// How many rows the view's rules admit — `COUNT(*)` over the same `FROM`
+    /// and `WHERE` the row read runs (`database_query::count_query`), the
+    /// number the window is computed from, computed in SQL **before** any row
+    /// is asked for. The contract the unified tests must pin: filter a
+    /// 10 000-row database down to 3 rows and the window realizes 3 rows,
+    /// because 3 is what `core::database::window` was handed — the alternative
+    /// (fetch the table, filter in Rust) is the defect the red line names, and
+    /// D4's对照 probe measures both so the difference has a number.
+    pub fn filtered_count(&self, req: &RowRequest<'_>) -> Result<usize, StorageError> {
+        let conn = self.database().conn();
+        let plan = count_query(req);
+        let n: i64 = conn
+            .query_row(
+                &plan.sql,
+                params_from_iter(plan.binds.iter().copied()),
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
+        Ok(count(n))
+    }
+
+    /// One view's group list — `(key, count)` per distinct value of the group
+    /// column among the rows the filter admits, normalized into
+    /// [`GroupKey`]s. **Bounded by the groupable kinds** (ADR-0076: checkbox /
+    /// select / status), so this is the list of *headers* and never a second
+    /// copy of the table: a text column's 10 000 distinct values are exactly
+    /// why those kinds do not group.
+    ///
+    /// No order is imposed here: the header order is the schema's own option
+    /// order (ADR-0061), which lives in the column's config JSON where SQL
+    /// cannot see it, so the caller sorts these few rows in Rust. That is not
+    /// the red line bent — the *rows* are SQL's, each group's slice comes from
+    /// its own ordered query; the handful of headers are ordered by the same
+    /// config the option cells are painted from.
+    pub fn group_counts(
+        &self,
+        req: &RowRequest<'_>,
+        spec: &GroupSpec,
+    ) -> Result<Vec<(GroupKey, usize)>, StorageError> {
+        let conn = self.database().conn();
+        let plan = group_query(req, spec);
+        let mut stmt = conn.prepare(&plan.sql).map_err(sql)?;
+        let rows = stmt
+            .query(params_from_iter(plan.binds.iter().copied()))
+            .map_err(sql)?;
+        let mut out: Vec<(GroupKey, usize)> = Vec::new();
+        while let Some(row) = rows.next().map_err(sql)? {
+            let n: i64 = row.get(1).map_err(sql)?;
+            // The key is normalized here, at the only place that has seen the
+            // raw column: SQL's NULL and '' are one group, and a checkbox's 0
+            // and its absence are one group (an untouched box is unchecked).
+            let key = match spec.kind {
+                PropertyKind::Checkbox => GroupKey::of_flag(row.get(0).map_err(sql)?),
+                _ => GroupKey::of_text(row.get::<_, Option<String>>(0).map_err(sql)?.as_deref()),
+            };
+            match out.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, total)) => *total += count(n),
+                None => out.push((key, count(n))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// One group's slice of the window — `skip` of the group's own leading rows
+    /// and `len` after them, in the view's order. The `LIMIT`/`OFFSET` apply
+    /// *inside the group* (the group's predicate is in the `WHERE`), which is
+    /// what keeps a grouped 10 000-row database as virtualized as an ungrouped
+    /// one: the rows that exist as objects are the viewport's, wherever they
+    /// sit relative to their group's header.
+    pub fn window_rows_in_group(
+        &self,
+        req: &RowRequest<'_>,
+        spec: &GroupSpec,
+        key: &GroupKey,
+        skip: usize,
+        len: usize,
+    ) -> Result<Vec<RowView>, StorageError> {
+        run_row_query(
+            &self.database().conn(),
+            row_query_in_group(req, spec, key, skip, len),
+            req,
+        )
     }
 
     /// The highest `ord` in one database, or `None` when it has no rows — what
@@ -560,8 +673,6 @@ impl DbTable {
     }
 }
 
-
-
 /// A record's two instants, or `None` when there is no such record. The free
 /// function takes the connection its caller already holds — the method on the
 /// repository is this plus the lock — because a store method that reached back
@@ -608,227 +719,60 @@ fn derived_cell(
     })
 }
 
-/// The `db_records` column a derived kind projects (ADR-0068), or `None` for
-/// every other kind. A derived cell costs no `db_values` join at all: the stamp
-/// is already on the row the query is walking.
-fn derived_column(kind: PropertyKind) -> Option<&'static str> {
-    match kind {
-        PropertyKind::CreatedTime => Some("created"),
-        PropertyKind::LastEditedTime => Some("edited"),
-        _ => None,
-    }
-}
+// The statement builders live in `super::database_query` (D4, ADR-0076): the
+// filter tree, the sort list and the group are all compiled into SQL text there,
+// and this file is the only caller that runs the result. What stays here is the
+// *execution* — prepare, run, paint — shared by the three read shapes the
+// statements serve: the window's slice, a group's slice, and the export's
+// whole-table control read.
 
-/// One statement under construction: its `SELECT`, its `FROM`, and the binds its
-/// placeholders take *in the order they were emitted*.
-///
-/// The counter is why this is a struct at all. A sort term is a join and a bind
-/// that arrive *after* the visible columns, and hand-counted `?N`s are how a
-/// window read would silently bind a property id into a `LIMIT`.
-struct Sql {
-    select: String,
-    from: String,
-    binds: Vec<i64>,
-}
-
-impl Sql {
-    /// The next placeholder, and the bind it stands for.
-    fn bind(&mut self, value: i64) -> String {
-        self.binds.push(value);
-        format!("?{}", self.binds.len())
-    }
-}
-
-/// A statement and the binds that go with it, built together so the two cannot
-/// disagree about what `?4` is.
-struct RowQuery {
-    sql: String,
-    binds: Vec<i64>,
-}
-
-/// The query a row read runs, with its binds.
-///
-/// One `LEFT JOIN` per *visible* property against `db_values` on
-/// `(record, property)` — the primary key, so every join is an index probe
-/// rather than a scan — plus the record's page, plus one more join when the
-/// view sorts by a column it does not show. The row's title is ADR-0063's
-/// `COALESCE(p.title, t.text)`, and a *visible* title column reads through the
-/// same expression: a page-backed record's title is `pages.title` and nothing
-/// else, whether the view shows the column or not.
-///
-/// A derived kind (`created time` / `last edited time`) joins **nothing**: its
-/// value is `db_records.created` / `.edited`, a column of the row already being
-/// walked (ADR-0068). Its three slots keep every other column's shape — the
-/// stamp in the `text` slot, two NULLs beside it — so nothing downstream needs
-/// a special case to read one.
-///
-/// A sort becomes this statement's `ORDER BY`, emitted here and nowhere else:
-/// §三十九 puts the order in SQL, and the reason shows in the window clause — a
-/// window is a *slice of an order*, so rows sliced in Rust and sorted afterwards
-/// would be the wrong 31 rows. Which column the comparison runs in is
-/// `SortColumn`'s choice (`v1.num` for a number, `v1.text` for a date), and that
-/// choice is the whole reason `2` sorts before `10`.
-///
-/// `LIMIT`/`OFFSET` are the window. They are appended only when a window was
-/// asked for, so the control read is the same query minus those two clauses and
-/// the difference between the two numbers is the window and nothing else.
-fn row_query_plan(req: &RowRequest<'_>, window: Option<RowWindow>) -> RowQuery {
-    let mut sql = Sql {
-        select: String::from("SELECT r.id, COALESCE(p.title, t.text)"),
-        from: String::from(" FROM db_records r LEFT JOIN pages p ON p.id = r.page"),
-        binds: Vec::new(),
-    };
-    let title_bind = sql.bind(id(req.title.as_u64()));
-    sql.from.push_str(&format!(
-        " LEFT JOIN db_values t ON t.record = r.id AND t.property = {title_bind}"
-    ));
-
-    // The (text, num, flag) triple each visible column's cell is read from. The
-    // alias names stay dense even when a derived column takes no join, so the
-    // numbering a plan prints is the numbering of the joins it really made.
-    let mut slots: Vec<(String, String, String)> = Vec::with_capacity(req.columns.len());
-    for column in req.columns {
-        match derived_column(column.kind) {
-            Some(stamp) => slots.push((format!("r.{stamp}"), "NULL".into(), "NULL".into())),
-            None => {
-                let alias = format!("v{}", slots.len());
-                let bind = sql.bind(id(column.id.as_u64()));
-                sql.from.push_str(&format!(
-                    " LEFT JOIN db_values {alias} ON {alias}.record = r.id \
-                     AND {alias}.property = {bind}"
-                ));
-                let text = if column.id == req.title {
-                    format!("COALESCE(p.title, {alias}.text)")
-                } else {
-                    format!("{alias}.text")
-                };
-                slots.push((text, format!("{alias}.num"), format!("{alias}.flag")));
-            }
-        }
-    }
-    for (text, num, flag) in &slots {
-        sql.select.push_str(&format!(", {text}, {num}, {flag}"));
-    }
-
-    let order = match req.sort {
-        Some(sort) => {
-            let expr = sort_expression(req, sort, &mut sql, &slots);
-            // Where the blanks go, said out loud (ADR-0062's rule, ADR-0069's
-            // statement of it): "sort by number" does not mean "float the rows
-            // with no number to the top", and SQLite puts NULLs first. The
-            // nullness term is always ascending, so a *descending* sort does not
-            // turn the blanks around either; the last term is the database's own
-            // listing order, so equal rows always come back in one order.
-            let empty = match sort.column {
-                SortColumn::Text => format!("({expr} IS NULL OR {expr} = '')"),
-                SortColumn::Number | SortColumn::Flag => format!("({expr} IS NULL)"),
-                SortColumn::Created => "(r.created = '')".to_string(),
-                SortColumn::Edited => "(r.edited = '')".to_string(),
-            };
-            let direction = if sort.descending { "DESC" } else { "ASC" };
-            format!(" ORDER BY {empty} ASC, {expr} {direction}, r.ord, r.id")
-        }
-        None => " ORDER BY r.ord, r.id".to_string(),
-    };
-
-    let database = sql.bind(id(req.db.as_u64()));
-    let mut text = format!("{}{} WHERE r.db = {database}{order}", sql.select, sql.from);
-    if let Some(window) = window {
-        let limit = sql.bind(window.len() as i64);
-        let offset = sql.bind(window.start as i64);
-        text.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
-    }
-    RowQuery {
-        sql: text,
-        binds: sql.binds,
-    }
-}
-
-/// The SQL expression one sort compares. Four cases, in the order they are
-/// asked, and each is a decision:
-///
-/// * a derived kind is `r.created` / `r.edited` — no join;
-/// * the title column is ADR-0063's `COALESCE`, because a page-backed record's
-///   title is `pages.title` and its value row may not exist at all;
-/// * a column the view shows reuses the alias its cell is read through;
-/// * a column the view *hides* gets a join of its own — a view document may sort
-///   by one (ADR-0064), and one extra index probe per row is what that costs.
-fn sort_expression(
-    req: &RowRequest<'_>,
-    sort: SortSpec,
-    sql: &mut Sql,
-    slots: &[(String, String, String)],
-) -> String {
-    // Which slot of the triple the comparison wants: 0 text, 1 num, 2 flag. The
-    // two derived columns are not read through a slot at all.
-    let slot = match sort.column {
-        SortColumn::Text => 0,
-        SortColumn::Number => 1,
-        SortColumn::Flag => 2,
-        SortColumn::Created => return "r.created".to_string(),
-        SortColumn::Edited => return "r.edited".to_string(),
-    };
-    if sort.property == req.title {
-        // The title's one home is the `COALESCE` — whether the column is visible
-        // or not, and `t` is joined either way.
-        return match slot {
-            0 => "COALESCE(p.title, t.text)".to_string(),
-            1 => "t.num".to_string(),
-            _ => "t.flag".to_string(),
-        };
-    }
-    if let Some(visible) = req.columns.iter().position(|c| c.id == sort.property) {
-        let (text, num, flag) = &slots[visible];
-        return match slot {
-            0 => text.clone(),
-            1 => num.clone(),
-            _ => flag.clone(),
-        };
-    }
-    // One hidden sort column, so one alias. `s` rather than `v` to keep the
-    // visible joins' numbering readable in a plan.
-    let alias = "s0";
-    let bind = sql.bind(id(sort.property.as_u64()));
-    sql.from.push_str(&format!(
-        " LEFT JOIN db_values {alias} ON {alias}.record = r.id AND {alias}.property = {bind}"
-    ));
-    match slot {
-        0 => format!("{alias}.text"),
-        1 => format!("{alias}.num"),
-        _ => format!("{alias}.flag"),
-    }
-}
-
-/// The statement one row read runs, and its binds — for the probe, which prints
-/// the query it measured (D1's evidence table). The read path itself goes
-/// through [`row_query_plan`] directly, because it needs both halves at once.
+/// The statement one row read runs, and its binds — for the tests and the
+/// probe, which print (and `EXPLAIN`) the query they measured (D1's evidence
+/// table). The read path itself goes through [`row_query_plan`] directly,
+/// because it needs both halves at once.
 #[cfg(test)]
 fn row_query(req: &RowRequest<'_>, window: Option<RowWindow>) -> String {
     row_query_plan(req, window).sql
 }
 
 /// The bind values `row_query`'s placeholders take, in the order the plan
-/// emitted them: the title property, the visible properties, the sorted property
-/// when the view hides it, the database, then the window.
+/// emitted them: the title property, the visible properties, then — per sort
+/// term and per filter clause the view hides — the hidden column's id, the
+/// filter's own values, the database, then the window. A `Value` and not an
+/// `i64` because a filter's binds are heterogeneous by design: a number clause
+/// binds a `REAL`, a text clause a string, an id an integer.
 #[cfg(test)]
-fn row_binds(req: &RowRequest<'_>, window: Option<RowWindow>) -> Vec<i64> {
+fn row_binds(req: &RowRequest<'_>, window: Option<RowWindow>) -> Vec<Value> {
     row_query_plan(req, window).binds
 }
 
-/// Run `row_query`, assemble the rows, and paint every cell through its column
-/// (`core::database_property::paint`: an option id becomes a name, a number
-/// goes through its format, a file id through the window's attachment names).
+/// The windowed (or, with `None`, whole-table) row read: build the statement
+/// with the view's rules compiled in, run it, paint it.
 fn read_rows(
     conn: &Connection,
     req: &RowRequest<'_>,
     window: Option<RowWindow>,
 ) -> Result<Vec<RowView>, StorageError> {
-    let plan = row_query_plan(req, window);
-    let mut stmt = conn.prepare(&plan.sql).map_err(sql)?;
+    run_row_query(conn, row_query_plan(req, window), req)
+}
+
+/// Run one row-shaped statement and paint what it came back with
+/// (`core::database_property::paint`: an option id becomes a name, a number
+/// goes through its format, a file id through the window's attachment names).
+/// All three read shapes — the window's slice, a group's slice, the export's
+/// whole-table control read — end here, so the painting rules exist once and
+/// the only thing that differs between them is the statement.
+fn run_row_query(
+    conn: &Connection,
+    query: super::database_query::RowQuery,
+    req: &RowRequest<'_>,
+) -> Result<Vec<RowView>, StorageError> {
+    let super::database_query::RowQuery { sql: text, binds } = query;
+    let mut stmt = conn.prepare(&text).map_err(sql)?;
     let mut raw: Vec<RawRow> = Vec::new();
     {
         let mut rows = stmt
-            .query(params_from_iter(plan.binds.iter().copied()))
+            .query(params_from_iter(binds.iter().copied()))
             .map_err(sql)?;
         while let Some(row) = rows.next().map_err(sql)? {
             let record = row.get::<_, i64>(0).map_err(sql)?;
@@ -2466,7 +2410,7 @@ mod tests {
         window: RowWindow,
     ) -> Vec<String> {
         let mut req = RowRequest::new(DatabaseId(1), PropertyId(1), columns);
-        req.sort = sort;
+        req.sorts = sort.as_slice();
         repo.window_rows(&req, window)
             .unwrap()
             .iter()
@@ -2849,7 +2793,8 @@ mod tests {
         // The order really is the statement's: nothing in this crate sorts a
         // `Vec` of rows, and the SQL says which column it compares.
         let mut req = RowRequest::new(db.id, PropertyId(1), &columns);
-        req.sort = SortSpec::of(&number, false);
+        let sort = SortSpec::of(&number, false);
+        req.sorts = sort.as_slice();
         let query = row_query(&req, Some(whole));
         assert!(
             query.contains("ORDER BY (v0.num IS NULL) ASC, v0.num ASC, r.ord, r.id"),
@@ -2859,7 +2804,8 @@ mod tests {
             !query.contains("CAST"),
             "a number is never cast text: {query}"
         );
-        req.sort = SortSpec::of(&text, true);
+        let sort = SortSpec::of(&text, true);
+        req.sorts = sort.as_slice();
         let query = row_query(&req, Some(whole));
         assert!(
             query.contains("ORDER BY (v1.text IS NULL OR v1.text = '') ASC, v1.text DESC, r.ord, r.id"),
@@ -2962,7 +2908,8 @@ mod tests {
             ],
         );
         let mut req = RowRequest::new(db.id, PropertyId(1), &columns);
-        req.sort = SortSpec::of(&hidden, false);
+        let sort = SortSpec::of(&hidden, false);
+        req.sorts = sort.as_slice();
         let query = row_query(&req, Some(RowWindow { start: 0, end: 10 }));
         assert!(query.contains("LEFT JOIN db_values s0 "), "{query}");
         assert!(
@@ -3106,7 +3053,8 @@ mod tests {
         );
         let columns = vec![created, edited, number];
         let mut req = RowRequest::new(DatabaseId(1), PropertyId(1), &columns);
-        req.sort = Some(SortSpec::of(&columns[1], true).unwrap());
+        let sort = SortSpec::of(&columns[1], true).unwrap();
+        req.sorts = std::slice::from_ref(&sort);
         let rows = repo
             .window_rows(&req, RowWindow { start: 0, end: 1 })
             .unwrap();
@@ -3773,10 +3721,12 @@ mod probe {
             db: db.id,
             title: title.id,
             columns: &columns,
-            sort: Some(sort),
+            sorts: std::slice::from_ref(&sort),
+            filter: None,
         };
         let plain = RowRequest {
-            sort: None,
+            sorts: &[],
+            filter: None,
             ..sorted
         };
         let geometry = ViewGeometry::new(32.0, 720.0);
@@ -3840,11 +3790,13 @@ mod probe {
         assert_eq!(sql_first, values[..top.len()].to_vec());
 
         // And the date column, ordered the way the stored shape promises.
+        let date_sort = SortSpec::of(&date, true).unwrap();
         let by_date = RowRequest {
             db: db.id,
             title: title.id,
             columns: &columns,
-            sort: Some(SortSpec::of(&date, true).unwrap()),
+            sorts: std::slice::from_ref(&date_sort),
+            filter: None,
         };
         let started = Instant::now();
         let date_rows = repo.window_rows(&by_date, top).unwrap();

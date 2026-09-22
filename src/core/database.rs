@@ -31,6 +31,7 @@
 // fourteen kinds *are*: the two derived time kinds stop pretending to be text
 // values (ADR-0068), and `RowRequest` grows the sort the view will compile.
 
+use super::database_view::FilterNode;
 use super::types::{OrderKey, PageId};
 
 /// Extra rows kept realized above and below the visible band, so a scroll of
@@ -548,10 +549,10 @@ pub enum SortColumn {
 /// which way. Compiled in `core` (this is the *decision*) and turned into SQL by
 /// `storage::database_store` (that is the *statement*) — §三十九's "filter and
 /// sort happen in SQL, not in the UI" is only true if the order is emitted
-/// there, so nothing in this crate sorts a `Vec` of rows.
-///
-/// One term, not a list: D2 sorts by one column, and the view document's
-/// `sorts` array (ADR-0064) is D4's to compile into as many terms as it names.
+/// there, so nothing in this crate sorts a `Vec` of rows. D4 grew the single
+/// term into the list a view's `sorts` array names (ADR-0076); the ORDER BY
+/// builder applies them most significant first, with the listing order as the
+/// tie-break after the last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortSpec {
     pub property: PropertyId,
@@ -768,6 +769,45 @@ impl PartialEq for CellValue {
 
 impl Eq for CellValue {}
 
+/// One new database's three rows, with their ids already allocated — what
+/// `Command::MakeDatabase` carries so that the entity, its `title` column and
+/// its first view are created in the same batch as the block that draws them
+/// (ADR-0060/0061).
+///
+/// **Why the ids travel in the command** rather than being allocated inside the
+/// plan: `core::command::plan` sees a `Document` and can allocate block ids, and
+/// `databases` / `db_properties` / `db_views` are three other tables whose rows
+/// the app never loads in full (ADR-0067 keeps records out, and a database has
+/// a handful of columns and views but the ids still have to be unique against
+/// rows a *deleted* database left behind). The caller with the store in hand —
+/// `AppState` — holds a watermark per table and hands the next ids over, which is
+/// the shape `Command::InsertImage` already uses for an attachment id.
+///
+/// The type is a struct rather than three parameters so a caller cannot hand the
+/// three rows over in the wrong order, and so `MakeDatabase`'s doc can point at
+/// one thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseDraft {
+    pub database: Database,
+    pub title: Property,
+    pub view: View,
+}
+
+impl DatabaseDraft {
+    /// The three rows a database is born with: itself, its `title` column
+    /// (ADR-0061, `ord = 0`) and its first view (a `table`, ADR-0060's default
+    /// layout). The order of the arguments is the order they are written in and
+    /// the order of the fields: a draft cannot name an id twice.
+    pub fn new(id: DatabaseId, title: PropertyId, view: ViewId, name: impl Into<String>) -> Self {
+        let database = Database::new(id, name);
+        DatabaseDraft {
+            title: database.title_property(title),
+            view: database.first_view(view),
+            database,
+        }
+    }
+}
+
 /// Everything about the database layer that a startup load carries: the
 /// entities, their columns, their views. **Not their records and not their
 /// cells** — ADR-0067: a row exists only inside a window, so a database with
@@ -806,29 +846,49 @@ impl DatabaseCatalog {
 /// What one window read needs to know: which database, which `title` column
 /// (the caller read it out of the catalog a moment ago, and ADR-0063's
 /// `COALESCE` cannot be written without it), the columns the view shows, in
-/// the order the row's cells come back in, and the column the view is ordered
-/// by. The title column may appear in `columns` or not — a row's title is
-/// [`RowView::title`] either way.
+/// the order the row's cells come back in, the order the rows come back in,
+/// and the filter the rows must pass. The title column may appear in `columns`
+/// or not — a row's title is [`RowView::title`] either way.
+///
+/// D4 grew the request in the two directions ADR-0070 predicted it would:
+///
+/// * `sorts` is a **list** of terms now. The document's `sorts` array is
+///   compiled in `core::database_view` and every term becomes its own slice of
+///   the statement's `ORDER BY` — a window is a slice of the *whole* order, so
+///   a second sort key can no more be applied in Rust than the first could.
+///   The database's own listing order (`r.ord, r.id`) stays the tie-break
+///   after the last term, which is what makes a re-read of one window the same
+///   rows.
+/// * `filter` is ADR-0064's rule **tree**, parsed in `core::database_view` and
+///   turned into the statement's `WHERE` by `storage::database_query`. The red
+///   line ("filter / sort 在 SQL 侧完成，不在 UI 侧过滤") lives in that split:
+///   core decides *what* was asked, storage decides *which SQL* asks it, and
+///   no code between them ever sees a row to throw away.
 #[derive(Debug, Clone, Copy)]
 pub struct RowRequest<'a> {
     pub db: DatabaseId,
     pub title: PropertyId,
     pub columns: &'a [Property],
     /// The order the rows come back in, as SQL was told to produce it
-    /// (ADR-0069). `None` is the database's own listing order — `db_records.ord`
-    /// — which is also every sort's tie-break, so a view is never in an order
-    /// nothing defined.
-    pub sort: Option<SortSpec>,
+    /// (ADR-0069/0070), most significant term first. Empty is the database's
+    /// own listing order — `db_records.ord` — which is also every sort's
+    /// tie-break, so a view is never in an order nothing defined.
+    pub sorts: &'a [SortSpec],
+    /// The filter the rows must pass (ADR-0064's tree, ADR-0076's compilation),
+    /// or `None` for every row. `None` and "a tree that filters nothing" are
+    /// the same `WHERE` — the compiler emits both as no constraint.
+    pub filter: Option<&'a FilterNode>,
 }
 
 impl<'a> RowRequest<'a> {
-    /// The request a fresh view makes: the columns, no sort.
+    /// The request a fresh view makes: the columns, no rules.
     pub fn new(db: DatabaseId, title: PropertyId, columns: &'a [Property]) -> Self {
         RowRequest {
             db,
             title,
             columns,
-            sort: None,
+            sorts: &[],
+            filter: None,
         }
     }
 }

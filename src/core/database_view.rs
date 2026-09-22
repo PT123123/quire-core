@@ -28,8 +28,8 @@
 // loud, and D5 turns one arm of it into a real view per phase.
 
 use super::database::{
-    DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind, RowWindow, RowView, View,
-    ViewId, ViewLayout,
+    DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind, RowWindow, RowView, SortSpec,
+    View, ViewId, ViewLayout,
 };
 use super::database_property::{json::Json, PropertyOptions};
 use super::types::PageId;
@@ -571,4 +571,988 @@ pub fn options_of(property: &Property) -> Vec<OptionChoice> {
             color: option.color.clone(),
         })
         .collect()
+}
+
+// ─── D4: the view's rules (filter / sort / group) ────────────────────────────
+//
+// ADR-0064 put a view's rules in one JSON document because SQL never filters on
+// *them* — it filters on the values, through the query the rules are compiled
+// into. D3 owned two keys of that document (`columns`, `widths`) and passed the
+// rest through untouched (ADR-0074). D4 owns the other three: `filter`,
+// `sorts`, `groups`.
+//
+// The split this section is the first half of:
+//
+//     the document (JSON)                       ← here: parsed, typed, degraded
+//          │  ViewRules
+//          ▼
+//     storage::database_query  (the SQL)         ← the WHERE / ORDER BY / GROUP BY
+//          │  one statement
+//          ▼
+//     the window (`core::database::window`)      ← the same window as D0's
+//
+// Nothing here writes SQL and nothing here reads a row: this half is pure, so
+// "what did the user ask for" can be tested without a file, and the red line
+// (filter / sort in SQL, not in the UI) is a boundary between two modules
+// rather than a rule someone has to remember.
+//
+// **The degradation rules are decisions, and they are stated once, here**:
+//
+// * the document does not parse, or its `filter` is not a shape this build can
+//   read (a group whose children are not an array, nesting past
+//   [`FILTER_MAX_DEPTH`]) → **the whole filter is dropped** and `note` says so
+//   on screen. A view that cannot be opened is worse than one that is not
+//   filtered (ADR-0064), and a filter that was *silently* ignored is worse than
+//   both — it shows rows the user did not ask for with nothing to explain them.
+// * a single clause names a column that is gone, a column whose kind cannot be
+//   compared that way (`contains` on a number), or a value that is not the
+//   shape its column stores (`"next tuesday"` as a date) → **that clause** is
+//   dropped and counted in `note`. This is ADR-0064's rule for a deleted
+//   property — the view loses the clause and shows more rows instead of failing
+//   to open — applied to the other ways one clause can be unreadable.
+// * a sort term or a group that cannot be compiled is dropped **quietly**: an
+//   order or a grouping is a way of *looking* at rows, never a way of hiding
+//   them, so the honest failure ("this is not sorted the way the document says")
+//   is visible in the first frame rather than needing a sentence.
+// * an explicitly empty group (`{"and":[]}`, what the panel leaves behind when
+//   its last rule is deleted) is **no filter at all** and produces no note: it
+//   is the normal state of a view nobody has filtered, not a degradation.
+
+/// The comparisons the filter panel offers, and the only ones the parser accepts
+/// for a kind — one list for both, so the menu can never offer something the
+/// compiler would refuse.
+///
+/// Which comparisons a kind has is a decision per kind, and each row of the
+/// table is the reason the enum is not just "eq":
+///
+/// | kind | comparisons | why |
+/// |------|-------------|-----|
+/// | title / text / url / email / phone | contains, is, is not, is/is-not empty | words are matched by substring; ordering words by bytes is not a question a user asks |
+/// | date / created time / last edited time | is, is not, before, on-or-before, after, on-or-after, is/is-not empty | a date is compared as its stored fixed-width text (ADR-0062), so bytes *are* time order |
+/// | number | is, is not, `>` `≥` `<` `≤`, is/is-not empty | compared in `db_values.num`, so `2` is less than `10` |
+/// | checkbox | is, is/is-not empty | a checkbox has two states and an absence |
+/// | select / status | is, is not, is any of, is/is-not empty | values are option **ids** (ADR-0061), so "is any of" is an `IN` over ids and a substring match on a label is not a thing SQL can do over a JSON config |
+/// | multi-select / files | has, has any of, is/is-not empty | the value is `db_value_items` rows, so "has" is an `EXISTS` probe (ADR-0062's predicted shape) |
+/// | formula / rollup / relation | — | the value is computed at projection time and not stored (ADR-0062), so there is nothing for SQL to compare. D6 may add comparisons that compute the cell first |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FilterOp {
+    /// A substring of the text (or, for a list column, one item it holds).
+    Contains,
+    /// Is this value — the option **id** for a pick, the number for a number,
+    /// the stored shape for a date, the checked state for a checkbox.
+    Eq,
+    /// Is a value *other* than this one. An empty cell matches neither `Eq` nor
+    /// `Ne`: it holds no value to be either.
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    /// One of several option ids (select / status) or items (multi-select /
+    /// files).
+    AnyOf,
+    IsEmpty,
+    IsNotEmpty,
+}
+
+/// The list's order is the panel's order, and the int is the index — the same
+/// rule `PropertyKind`'s ints follow, so adding a comparison appends a number
+/// instead of renumbering one.
+pub const FILTER_OPS: [FilterOp; 10] = [
+    FilterOp::Contains,
+    FilterOp::Eq,
+    FilterOp::Ne,
+    FilterOp::Gt,
+    FilterOp::Gte,
+    FilterOp::Lt,
+    FilterOp::Lte,
+    FilterOp::AnyOf,
+    FilterOp::IsEmpty,
+    FilterOp::IsNotEmpty,
+];
+
+impl FilterOp {
+    /// The document's word for this comparison. Stable strings, because they
+    /// are written into `db_views.definition` and read by later builds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilterOp::Contains => "contains",
+            FilterOp::Eq => "eq",
+            FilterOp::Ne => "ne",
+            FilterOp::Gt => "gt",
+            FilterOp::Gte => "gte",
+            FilterOp::Lt => "lt",
+            FilterOp::Lte => "lte",
+            FilterOp::AnyOf => "any-of",
+            FilterOp::IsEmpty => "is-empty",
+            FilterOp::IsNotEmpty => "is-not-empty",
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<FilterOp> {
+        FILTER_OPS.iter().copied().find(|op| op.as_str() == s)
+    }
+
+    /// The index `storage`'s SQL emitter and the panel's int legend agree on.
+    pub fn index(self) -> usize {
+        FILTER_OPS.iter().position(|op| *op == self).unwrap_or(0)
+    }
+
+    pub fn from_index(at: usize) -> Option<FilterOp> {
+        FILTER_OPS.get(at).copied()
+    }
+
+    /// Whether this comparison asks for a value at all. `is (not) empty` does
+    /// not, which is why a clause of one of those with no value is complete.
+    pub fn needs_value(self) -> bool {
+        !matches!(self, FilterOp::IsEmpty | FilterOp::IsNotEmpty)
+    }
+
+    /// The comparisons one kind's panel offers — and, in the parser, the set a
+    /// clause of that kind is admissible against.
+    pub fn ops_for(kind: PropertyKind) -> &'static [FilterOp] {
+        match kind {
+            PropertyKind::Title
+            | PropertyKind::Text
+            | PropertyKind::Url
+            | PropertyKind::Email
+            | PropertyKind::Phone => &[
+                FilterOp::Contains,
+                FilterOp::Eq,
+                FilterOp::Ne,
+                FilterOp::IsEmpty,
+                FilterOp::IsNotEmpty,
+            ],
+            PropertyKind::Date | PropertyKind::CreatedTime | PropertyKind::LastEditedTime => &[
+                FilterOp::Eq,
+                FilterOp::Ne,
+                FilterOp::Lt,
+                FilterOp::Lte,
+                FilterOp::Gt,
+                FilterOp::Gte,
+                FilterOp::IsEmpty,
+                FilterOp::IsNotEmpty,
+            ],
+            PropertyKind::Number => &[
+                FilterOp::Eq,
+                FilterOp::Ne,
+                FilterOp::Gt,
+                FilterOp::Gte,
+                FilterOp::Lt,
+                FilterOp::Lte,
+                FilterOp::IsEmpty,
+                FilterOp::IsNotEmpty,
+            ],
+            PropertyKind::Checkbox => {
+                &[FilterOp::Eq, FilterOp::IsEmpty, FilterOp::IsNotEmpty]
+            }
+            PropertyKind::Select | PropertyKind::Status => &[
+                FilterOp::Eq,
+                FilterOp::Ne,
+                FilterOp::AnyOf,
+                FilterOp::IsEmpty,
+                FilterOp::IsNotEmpty,
+            ],
+            PropertyKind::MultiSelect | PropertyKind::Files => &[
+                FilterOp::Contains,
+                FilterOp::AnyOf,
+                FilterOp::IsEmpty,
+                FilterOp::IsNotEmpty,
+            ],
+            // Computed kinds store nothing to compare (ADR-0062), so they have
+            // no comparisons at all — and a clause naming one is a clause the
+            // parser drops, with the note saying why.
+            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation => &[],
+        }
+    }
+
+    /// What the panel's comparison button (and its menu) says. The wording is
+    /// per kind where a kind means something different by the same comparison:
+    /// "after" is what a date comparison is called, and `>` is what a number's
+    /// is.
+    pub fn label(self, kind: PropertyKind) -> &'static str {
+        let temporal = matches!(
+            kind,
+            PropertyKind::Date | PropertyKind::CreatedTime | PropertyKind::LastEditedTime
+        );
+        let list = matches!(kind, PropertyKind::MultiSelect | PropertyKind::Files);
+        match self {
+            FilterOp::Contains => {
+                if list {
+                    "has"
+                } else {
+                    "contains"
+                }
+            }
+            FilterOp::Eq => "is",
+            FilterOp::Ne => "is not",
+            FilterOp::Gt => {
+                if temporal {
+                    "after"
+                } else {
+                    ">"
+                }
+            }
+            FilterOp::Gte => {
+                if temporal {
+                    "on or after"
+                } else {
+                    "\u{2265}"
+                }
+            }
+            FilterOp::Lt => {
+                if temporal {
+                    "before"
+                } else {
+                    "<"
+                }
+            }
+            FilterOp::Lte => {
+                if temporal {
+                    "on or before"
+                } else {
+                    "\u{2264}"
+                }
+            }
+            FilterOp::AnyOf => {
+                if list {
+                    "has any of"
+                } else {
+                    "is any of"
+                }
+            }
+            FilterOp::IsEmpty => "is empty",
+            FilterOp::IsNotEmpty => "is not empty",
+        }
+    }
+}
+
+/// The value side of one comparison, in the shape the column stores.
+///
+/// [`FilterValue::Missing`] is "the rule exists but its value is not filled in
+/// yet" — what the panel has between "add a rule" and the user typing. It
+/// compiles to **no constraint**, deliberately: a half-written rule that hid
+/// rows would be a filter the user never asked for, and a panel that could not
+/// be left half-written would make "add a rule" a minefield. The document
+/// stores it as `null`, so a half-written rule survives a restart as a
+/// half-written rule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterValue {
+    Missing,
+    Text(String),
+    Number(f64),
+    Flag(bool),
+    Any(Vec<String>),
+}
+
+impl FilterValue {
+    /// Whether the panel draws this as a filled-in value. `Missing` (and an
+    /// empty `Any`) are what the row paints as "not set yet".
+    pub fn is_set(&self) -> bool {
+        match self {
+            FilterValue::Missing => false,
+            FilterValue::Any(items) => !items.is_empty(),
+            FilterValue::Text(text) => !text.is_empty(),
+            FilterValue::Number(_) | FilterValue::Flag(_) => true,
+        }
+    }
+
+    /// What the row's value button shows: the value as it is stored. A pick's
+    /// ids are turned into option names by the caller (which is the layer that
+    /// can read the column's config); this is the honest fallback.
+    pub fn display(&self) -> String {
+        match self {
+            FilterValue::Missing => String::new(),
+            FilterValue::Text(text) => text.clone(),
+            FilterValue::Number(num) => format!("{num}"),
+            FilterValue::Flag(true) => "checked".into(),
+            FilterValue::Flag(false) => "unchecked".into(),
+            FilterValue::Any(items) => items.join(", "),
+        }
+    }
+}
+
+/// One parsed comparison: which column, how it is compared, and against what.
+/// The **kind travels with the clause** because the parser already had to read
+/// it to know which comparisons were admissible — so the SQL emitter is a total
+/// function over [`FilterClause`] and never has to consult a schema again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterClause {
+    pub property: PropertyId,
+    pub kind: PropertyKind,
+    pub op: FilterOp,
+    pub value: FilterValue,
+}
+
+/// ADR-0064's filter tree, parsed. The document's three shapes plus the one
+/// this slice added — `{"not":{…}}` — because 与/或/非 is what a filter panel
+/// has to be able to say and "neither a nor b" is not expressible with the
+/// other two.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterNode {
+    /// `{"and":[…]}`
+    All(Vec<FilterNode>),
+    /// `{"or":[…]}`
+    Any(Vec<FilterNode>),
+    /// `{"not":{…}}` — one child, since `not` of a set is what `Ne` and
+    /// De Morgan already say.
+    Not(Box<FilterNode>),
+    /// `{"property":7,"op":"eq","value":…}`
+    Clause(FilterClause),
+}
+
+impl FilterNode {
+    /// Whether this node constrains nothing (an empty group). The caller maps
+    /// it to "no filter" so the statement has no `WHERE` at all.
+    pub fn is_vacuous(&self) -> bool {
+        match self {
+            FilterNode::All(children) | FilterNode::Any(children) => children.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// How many clauses this tree holds — the number the header button shows
+    /// ("Filter · 2"), counted over the whole tree so a nested document counts
+    /// the way the panel's flat view would.
+    pub fn clause_count(&self) -> usize {
+        match self {
+            FilterNode::All(children) | FilterNode::Any(children) => {
+                children.iter().map(FilterNode::clause_count).sum()
+            }
+            FilterNode::Not(child) => child.clause_count(),
+            FilterNode::Clause(_) => 1,
+        }
+    }
+
+    /// The document's JSON for this node — what `ViewDefinition::set_filter`
+    /// writes back (ADR-0074's read-edit-write of the text).
+    pub fn to_json(&self) -> Json {
+        match self {
+            FilterNode::All(children) => Json::Object(vec![(
+                "and".to_string(),
+                Json::Array(children.iter().map(FilterNode::to_json).collect()),
+            )]),
+            FilterNode::Any(children) => Json::Object(vec![(
+                "or".to_string(),
+                Json::Array(children.iter().map(FilterNode::to_json).collect()),
+            )]),
+            FilterNode::Not(child) => {
+                Json::Object(vec![("not".to_string(), child.to_json())])
+            }
+            FilterNode::Clause(clause) => Json::Object(vec![
+                (
+                    "property".to_string(),
+                    Json::Number(clause.property.as_u64() as f64),
+                ),
+                (
+                    "op".to_string(),
+                    Json::Text(clause.op.as_str().to_string()),
+                ),
+                ("value".to_string(), value_json(&clause.value)),
+            ]),
+        }
+    }
+}
+
+fn value_json(value: &FilterValue) -> Json {
+    match value {
+        FilterValue::Missing => Json::Null,
+        FilterValue::Text(text) => Json::Text(text.clone()),
+        FilterValue::Number(num) => Json::Number(*num),
+        FilterValue::Flag(flag) => Json::Bool(*flag),
+        FilterValue::Any(items) => {
+            Json::Array(items.iter().map(|i| Json::Text(i.clone())).collect())
+        }
+    }
+}
+
+/// The filter subset the panel can draw and edit: one `and`/`or` root over
+/// clauses, each clause optionally inverted (a `not` around a single clause).
+///
+/// A tree outside that subset — a group inside a group, a `not` around a group
+/// — answers `None`, and the panel then **refuses to edit** rather than
+/// reshaping the user's rules into something it can represent. The table still
+/// filters by the tree it has (the compiler reads the whole recursive shape),
+/// which is the honest split: the SQL side delivers the document ADR-0064
+/// describes, and the panel delivers the subset D4 has a UI for. Nested groups
+/// arrive with the board view's group editor (D5).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FlatFilter {
+    /// `true` = the root is an `or` ("match any"), `false` = an `and`.
+    pub any: bool,
+    pub clauses: Vec<FlatClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlatClause {
+    pub clause: FilterClause,
+    pub invert: bool,
+}
+
+impl FlatFilter {
+    /// Read the panel's view of a parsed tree. `None` = this tree is not one the
+    /// panel may rewrite.
+    pub fn from_tree(tree: Option<&FilterNode>) -> Option<FlatFilter> {
+        let Some(tree) = tree else {
+            return Some(FlatFilter::default());
+        };
+        match tree {
+            // `All([])`/`Any([])` — the panel's own "no rules" state — come back
+            // as an empty flat list of the same flavour.
+            FilterNode::All(children) | FilterNode::Any(children) => {
+                let any = matches!(tree, FilterNode::Any(_));
+                let mut clauses = Vec::with_capacity(children.len());
+                for child in children {
+                    match child {
+                        FilterNode::Clause(clause) => clauses.push(FlatClause {
+                            clause: clause.clone(),
+                            invert: false,
+                        }),
+                        FilterNode::Not(inner) => match &**inner {
+                            FilterNode::Clause(clause) => clauses.push(FlatClause {
+                                clause: clause.clone(),
+                                invert: true,
+                            }),
+                            _ => return None,
+                        },
+                        _ => return None,
+                    }
+                }
+                Some(FlatFilter { any, clauses })
+            }
+            FilterNode::Clause(clause) => Some(FlatFilter {
+                any: false,
+                clauses: vec![FlatClause {
+                    clause: clause.clone(),
+                    invert: false,
+                }],
+            }),
+            FilterNode::Not(inner) => match &**inner {
+                FilterNode::Clause(clause) => Some(FlatFilter {
+                    any: false,
+                    clauses: vec![FlatClause {
+                        clause: clause.clone(),
+                        invert: true,
+                    }],
+                }),
+                _ => None,
+            },
+        }
+    }
+
+    /// The tree this flat list means. An empty list is `All([])`, which the
+    /// parser reads back as "no filter" — so deleting the last rule and
+    /// re-opening the view is the same view.
+    pub fn to_tree(&self) -> FilterNode {
+        let children: Vec<FilterNode> = self
+            .clauses
+            .iter()
+            .map(|flat| {
+                let clause = FilterNode::Clause(flat.clause.clone());
+                if flat.invert {
+                    FilterNode::Not(Box::new(clause))
+                } else {
+                    clause
+                }
+            })
+            .collect();
+        if self.any {
+            FilterNode::Any(children)
+        } else {
+            FilterNode::All(children)
+        }
+    }
+}
+
+/// The column a grouped view groups by (SPEC §三十九's `group by`). One column,
+/// not a list: ADR-0064 stores `groups` as an array so a later build can nest,
+/// and D4 reads its first entry.
+///
+/// **Only the option-bounded kinds may group** — `checkbox`, `select`,
+/// `status`. The reason is the red line itself: a group header is an entity the
+/// view has to place in the scroll surface, so the list of headers has to be
+/// small enough to compute in full (it is `COUNT(*) GROUP BY`, a handful of
+/// rows). Grouping by `text` or by a date would make that list as long as the
+/// table — 10 000 headers to realize is exactly what "group by must not become
+/// 10 000 rows" forbids. A future slice can group by a number by bucketing it,
+/// which is a different question (what the buckets are) and not one to guess at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSpec {
+    pub property: PropertyId,
+    pub kind: PropertyKind,
+}
+
+impl GroupSpec {
+    /// The kinds whose distinct values a schema already bounds: a checkbox has
+    /// two states, a select/status has its option list (ADR-0061) plus "no
+    /// value".
+    pub fn admits(kind: PropertyKind) -> bool {
+        matches!(
+            kind,
+            PropertyKind::Checkbox | PropertyKind::Select | PropertyKind::Status
+        )
+    }
+}
+
+/// One group's key, normalized out of what SQL returns: the raw column value
+/// for a select is an option id or nothing, and for a checkbox it is 0, 1 or
+/// nothing — and "nothing" and "unchecked" are the same group, because an
+/// untouched checkbox is unchecked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupKey {
+    /// No value: a select/status cell nobody set, or a checkbox nobody touched.
+    Empty,
+    /// A select/status option id — the stored value, even when the schema no
+    /// longer has that option (the group header then names the id itself,
+    /// ADR-0069's fold applied to a header).
+    Option(String),
+    Checked,
+    /// `flag = 0` **and** no row at all.
+    Unchecked,
+}
+
+impl GroupKey {
+    /// The `GROUP BY` expression's value, normalized: SQL's `NULL` and `''` are
+    /// the same group, and so are a checkbox's `0` and its absence.
+    pub fn of_text(value: Option<&str>) -> GroupKey {
+        match value {
+            Some(text) if !text.is_empty() => GroupKey::Option(text.to_string()),
+            _ => GroupKey::Empty,
+        }
+    }
+
+    pub fn of_flag(value: Option<i64>) -> GroupKey {
+        match value {
+            Some(flag) if flag != 0 => GroupKey::Checked,
+            _ => GroupKey::Unchecked,
+        }
+    }
+}
+
+/// One group's rows inside a window: which group, at which **entry index** the
+/// slice starts (its header's position plus the skipped rows, so the caller can
+/// place the fetched rows without recomputing the walk), how many of its
+/// leading rows to skip, and how many to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSlice {
+    pub group: usize,
+    /// The entry index of the slice's first row (never the header's).
+    pub at: usize,
+    pub skip: usize,
+    pub len: usize,
+}
+
+/// The window arithmetic for a **grouped** view, and the answer to "a group
+/// header must not become a row".
+///
+/// The grouped view's scroll surface is a list of *entries*: for every group, a
+/// header entry followed by its rows. `total_entries = Σ(count + 1)` — a number
+/// computed from the group counts, which SQL produced with one `GROUP BY` over
+/// an option-bounded column (never from the rows). The window is then computed
+/// over that list by D0's own `core::database::window`, exactly as it is over
+/// rows when nothing is grouped, and this function maps the entry window onto
+/// the queries that realize it:
+///
+/// * `headers` — the headers that fall inside the window (usually one or two:
+///   a header is one entry tall),
+/// * `rows` — one slice per group that overlaps the window, with the offset
+///   *inside that group*.
+///
+/// So a 10 000-row database grouped into three groups realizes three headers
+/// and one window of rows — and a group with 10 000 rows in it realizes the
+/// same 31 rows it would if it were ungrouped. **Nothing here realizes a
+/// header per group**: the group list is walked to accumulate entry positions
+/// (a few integers per group), which is what makes this O(groups) and not
+/// O(entries).
+pub fn group_window(counts: &[usize], window: RowWindow) -> GroupWindow {
+    let mut out = GroupWindow {
+        headers: Vec::new(),
+        rows: Vec::new(),
+    };
+    let mut at = 0usize;
+    for (group, count) in counts.iter().copied().enumerate() {
+        let header = at;
+        let first_row = header + 1;
+        at = first_row + count;
+        // Above the window: this group's entries are all behind us.
+        if at <= window.start {
+            continue;
+        }
+        // Below the window: groups are in list order, so every later one is
+        // further down and the walk can stop.
+        if header >= window.end {
+            break;
+        }
+        if header >= window.start {
+            out.headers.push((group, header));
+        }
+        let low = first_row.max(window.start);
+        let high = at.min(window.end);
+        if high > low {
+            out.rows.push(GroupSlice {
+                group,
+                at: low,
+                skip: low - first_row,
+                len: high - low,
+            });
+        }
+    }
+    out
+}
+
+/// What one grouped window realizes: the headers on screen, and one slice of
+/// rows per group that reaches into the viewport.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupWindow {
+    /// `(group index, entry index)` per header inside the window. The entry
+    /// index is what places it in the scroll surface.
+    pub headers: Vec<(usize, usize)>,
+    pub rows: Vec<GroupSlice>,
+}
+
+impl GroupWindow {
+    /// Rows this window realizes — the number the RAM gate is about, and the
+    /// one that must stay a viewport's worth however many rows the database
+    /// has (a group header costs one more). Named `realized` rather than
+    /// `rows` because `rows` is already the field of slices it sums.
+    pub fn realized(&self) -> usize {
+        self.rows.iter().map(|slice| slice.len).sum()
+    }
+}
+
+/// A view's rules, as this build reads them out of its document. `note` is the
+/// **visible degradation**: a filter the document held that this build could
+/// not apply, in the words the block draws. Empty is the ordinary case.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ViewRules {
+    pub filter: Option<FilterNode>,
+    /// Most significant term first (ADR-0070's list).
+    pub sorts: Vec<SortSpec>,
+    pub group: Option<GroupSpec>,
+    pub note: String,
+}
+
+/// The deepest filter tree this build reads. [`Json`] already refuses to parse
+/// past its own depth limit, so this is a second, tighter bound for the one
+/// document whose shape is recursive: a filter eight groups deep is not a
+/// filter anyone wrote, and the failure is the visible one (the tree is ignored
+/// and the block says so) rather than a deep recursion in the compiler.
+const FILTER_MAX_DEPTH: usize = 8;
+
+impl ViewDefinition {
+    /// The document's rules, parsed against the database's schema.
+    ///
+    /// The schema is needed for two things and no more: which property a clause
+    /// names (so a clause naming a deleted column can be dropped, ADR-0064) and
+    /// which kind it is (so the comparisons a clause asks for can be checked
+    /// against the ones its kind has). Reading the document without a schema
+    /// would mean the compiler had to consult one per clause instead.
+    pub fn rules(&self, db: DatabaseId, catalog: &DatabaseCatalog) -> ViewRules {
+        let mut rules = ViewRules::default();
+        let mut notes: Vec<String> = Vec::new();
+        let mut dropped = 0usize;
+
+        if let Some(filter) = self.document.get("filter") {
+            match filter {
+                Json::Null => {}
+                json => match parse_filter(json, db, catalog, &mut dropped, 0) {
+                    Err(()) => notes.push(
+                        "This view's filter could not be read and was ignored.".to_string(),
+                    ),
+                    Ok(None) => {}
+                    Ok(Some(node)) => {
+                        // A group that constrains nothing is no filter at all —
+                        // the state the panel leaves behind when its last rule
+                        // is deleted.
+                        if !node.is_vacuous() {
+                            rules.filter = Some(node);
+                        }
+                    }
+                },
+            }
+        }
+        if dropped > 0 {
+            notes.push(if dropped == 1 {
+                "1 filter rule was dropped: its column is gone, or cannot be compared that way."
+                    .to_string()
+            } else {
+                format!(
+                    "{dropped} filter rules were dropped: their columns are gone, or cannot be compared that way."
+                )
+            });
+        }
+
+        // Sorts: terms whose column is gone, or whose kind has no order a user
+        // would recognise (ADR-0070's table), are dropped quietly — an order is
+        // a way of looking at rows, never a way of hiding them, so a dropped
+        // term shows itself in the first frame.
+        if let Some(Json::Array(terms)) = self.document.get("sorts") {
+            for term in terms {
+                let Some(property) = term.get("property").and_then(Json::as_u64) else {
+                    continue;
+                };
+                let property = PropertyId(property);
+                let Some(row) = catalog.properties_of(db).find(|p| p.id == property) else {
+                    continue;
+                };
+                let descending = matches!(term.get("descending"), Some(Json::Bool(true)));
+                if let Some(spec) = SortSpec::of(row, descending) {
+                    rules.sorts.push(spec);
+                }
+            }
+        }
+
+        // One group, from the array's first entry.
+        if let Some(Json::Array(groups)) = self.document.get("groups") {
+            for entry in groups {
+                let Some(property) = entry.as_u64() else {
+                    continue;
+                };
+                let property = PropertyId(property);
+                let Some(row) = catalog.properties_of(db).find(|p| p.id == property) else {
+                    continue;
+                };
+                if GroupSpec::admits(row.kind) {
+                    rules.group = Some(GroupSpec {
+                        property,
+                        kind: row.kind,
+                    });
+                }
+                break;
+            }
+        }
+
+        rules.note = notes.join(" ");
+        rules
+    }
+
+    /// Replace the `filter` key with this tree (ADR-0074: one key of the
+    /// document, read-edited-written as text). `None` writes JSON `null` —
+    /// "this view has no filter" — rather than removing the key, so a later
+    /// build reading the document sees that the key is known and empty.
+    pub fn set_filter(&mut self, filter: Option<&FilterNode>) {
+        self.put(
+            "filter",
+            match filter {
+                Some(node) => node.to_json(),
+                None => Json::Null,
+            },
+        );
+    }
+
+    /// Replace the `sorts` key with this list, most significant first.
+    pub fn set_sorts(&mut self, sorts: &[SortSpec]) {
+        self.put(
+            "sorts",
+            Json::Array(
+                sorts
+                    .iter()
+                    .map(|sort| {
+                        Json::Object(vec![
+                            (
+                                "property".to_string(),
+                                Json::Number(sort.property.as_u64() as f64),
+                            ),
+                            ("descending".to_string(), Json::Bool(sort.descending)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    /// Replace the `groups` key with this one column — or with an empty array,
+    /// which is "no grouping" and deliberately not the absence of the key.
+    pub fn set_group(&mut self, group: Option<PropertyId>) {
+        self.put(
+            "groups",
+            Json::Array(
+                group
+                    .map(|id| Json::Number(id.as_u64() as f64))
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+    }
+}
+
+/// One node of ADR-0064's filter tree. `Err(())` when the *skeleton* is not a
+/// shape this build reads (a group whose children are not an array, or nesting
+/// past [`FILTER_MAX_DEPTH`]) — the whole filter is then dropped, note and all.
+/// `Ok(None)` when **this subtree** was dropped: a clause this build cannot
+/// read is skipped and counted, and the tree around it survives — ADR-0064's
+/// rule for a deleted property, applied to the other ways one clause can be
+/// unreadable. A `not` around a dropped clause is dropped with it (a rule that
+/// vanished must not come back as its own negation, hiding every row).
+fn parse_filter(
+    json: &Json,
+    db: DatabaseId,
+    catalog: &DatabaseCatalog,
+    dropped: &mut usize,
+    depth: usize,
+) -> Result<Option<FilterNode>, ()> {
+    if depth > FILTER_MAX_DEPTH {
+        return Err(());
+    }
+    if let Some(children) = json.get("and") {
+        let list = children.as_array().ok_or(())?;
+        let mut out = Vec::with_capacity(list.len());
+        for child in list {
+            if let Some(node) = parse_filter(child, db, catalog, dropped, depth + 1)? {
+                out.push(node);
+            }
+        }
+        return Ok(Some(FilterNode::All(out)));
+    }
+    if let Some(children) = json.get("or") {
+        let list = children.as_array().ok_or(())?;
+        let mut out = Vec::with_capacity(list.len());
+        for child in list {
+            if let Some(node) = parse_filter(child, db, catalog, dropped, depth + 1)? {
+                out.push(node);
+            }
+        }
+        return Ok(Some(FilterNode::Any(out)));
+    }
+    if let Some(inner) = json.get("not") {
+        return match parse_filter(inner, db, catalog, dropped, depth + 1)? {
+            Some(node) => Ok(Some(FilterNode::Not(Box::new(node)))),
+            // The rule under the `not` was unreadable, so the `not` goes with
+            // it: a rule that vanished must not come back as its own negation.
+            None => Ok(None),
+        };
+    }
+    match build_clause(json, db, catalog) {
+        Some(clause) => Ok(Some(FilterNode::Clause(clause))),
+        // A clause this build cannot read: skipped, and the tree keeps its
+        // other children. The count is one, because one rule disappeared from
+        // the view.
+        None => {
+            *dropped += 1;
+            Ok(None)
+        }
+    }
+}
+
+/// One clause, or `None` when this build cannot compare this column this way.
+/// Silent on purpose — the caller counts and reports; the reason (gone column,
+/// wrong comparison for the kind, value of the wrong shape) is one sentence in
+/// the note because all three read the same to a user: *that rule is not being
+/// applied*.
+fn build_clause(json: &Json, db: DatabaseId, catalog: &DatabaseCatalog) -> Option<FilterClause> {
+    let property = PropertyId(json.get("property")?.as_u64()?);
+    let kind = catalog.properties_of(db).find(|p| p.id == property)?.kind;
+    let op = FilterOp::try_from_str(json.get("op")?.as_str()?)?;
+    if !FilterOp::ops_for(kind).contains(&op) {
+        return None;
+    }
+    let value = if op.needs_value() {
+        parse_value(json.get("value").unwrap_or(&Json::Null), kind, op)?
+    } else {
+        FilterValue::Missing
+    };
+    // A value of the wrong shape for the kind is a clause this build cannot
+    // apply: `contains` on a number, a number the document wrote as a string,
+    // a date that is not one of ADR-0062's two stored shapes.
+    if op.needs_value() && !value.is_set() && !matches!(value, FilterValue::Missing) {
+        return None;
+    }
+    Some(FilterClause {
+        property,
+        kind,
+        op,
+        value,
+    })
+}
+
+/// The value side of a clause, in the shape its column's kind stores.
+fn parse_value(json: &Json, kind: PropertyKind, op: FilterOp) -> Option<FilterValue> {
+    match kind {
+        PropertyKind::Number => json.as_f64().map(FilterValue::Number),
+        PropertyKind::Checkbox => match json {
+            Json::Bool(flag) => Some(FilterValue::Flag(*flag)),
+            _ => None,
+        },
+        PropertyKind::Date
+        | PropertyKind::CreatedTime
+        | PropertyKind::LastEditedTime => match json {
+            // Only the two stored shapes are comparable: bytes are time order
+            // *because* the shape is fixed width (ADR-0062), so a value that is
+            // not one of them would be compared against something it has
+            // nothing to do with.
+            Json::Text(text) if is_stored_date(text) => Some(FilterValue::Text(text.clone())),
+            Json::Text(text) if text.is_empty() => Some(FilterValue::Missing),
+            _ => None,
+        },
+        PropertyKind::Select
+        | PropertyKind::Status
+        | PropertyKind::MultiSelect
+        | PropertyKind::Files => {
+            if op == FilterOp::AnyOf {
+                parse_list(json)
+            } else {
+                match json {
+                    Json::Text(text) if text.is_empty() => Some(FilterValue::Missing),
+                    Json::Text(text) => Some(FilterValue::Text(text.clone())),
+                    _ => None,
+                }
+            }
+        }
+        // Text-shaped kinds: url / email / phone are never rewritten (ADR-0069)
+        // and neither is title/text, so the filter value is compared verbatim.
+        _ => match json {
+            Json::Text(text) if text.is_empty() => Some(FilterValue::Missing),
+            Json::Text(text) => Some(FilterValue::Text(text.clone())),
+            _ => None,
+        },
+    }
+}
+
+/// An "any of" value: the document's array, or one bare string, which is the
+/// same rule with one option in it. An empty array is the rule nobody has
+/// picked anything for yet — [`FilterValue::Missing`], no constraint, so
+/// "add a rule" can be left half-done without hiding rows.
+fn parse_list(json: &Json) -> Option<FilterValue> {
+    match json {
+        Json::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(item.as_str()?.to_string());
+            }
+            if out.is_empty() {
+                Some(FilterValue::Missing)
+            } else {
+                Some(FilterValue::Any(out))
+            }
+        }
+        Json::Text(text) if !text.is_empty() => Some(FilterValue::Any(vec![text.clone()])),
+        Json::Text(_) => Some(FilterValue::Missing),
+        _ => None,
+    }
+}
+
+/// Whether `text` is one of ADR-0062's two stored date shapes —
+/// `YYYY-MM-DDTHH:MM` or `YYYY-MM-DD` — the only values a date-ish filter may
+/// compare.
+///
+/// A **shape** check and not a calendar one: `database_property::parse_one`
+/// already owns calendar validity for cell input, and a hand-edited
+/// `2026-13-99` reaching a filter would simply match nothing, which is visible
+/// and harmless. Refusing shapes is what keeps a stray `next tuesday` out of a
+/// comparison whose whole correctness rests on fixed width.
+pub fn is_stored_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let digits_at = |at: usize| bytes.get(at).map(u8::is_ascii_digit).unwrap_or(false);
+    let date_ok = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && (0..10).all(|at| at == 4 || at == 7 || digits_at(at));
+    if bytes.len() == 10 {
+        return date_ok;
+    }
+    bytes.len() == 16
+        && date_ok
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && (11..16).all(|at| at == 13 || digits_at(at))
 }

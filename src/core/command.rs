@@ -5,7 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::database::{
-    CellValue, DatabaseDraft, DatabaseId, Property, PropertyId, Record, RecordId, View, ViewId,
+    CellValue, DatabaseDraft, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId,
+    View, ViewId,
 };
 use super::document::{Document, Entry};
 use super::history::History;
@@ -167,7 +168,9 @@ pub enum Command {
     /// a database made by the app has exactly one column forever, and no cell
     /// of any of D3's four inline editors could ever be reached. The command is
     /// the *storage* half only — editing a column's name, kind or options after
-    /// the fact is `PropertyRenamed` / `PropertyKindSet`, whose UI is D5's.
+    /// the fact is `PropertyRenamed` / `PropertyKindSet`, of which the kind has a
+    /// UI (`Command::SetDatabasePropertyKind`, D10) and the name and the options
+    /// still do not.
     AddDatabaseProperty { block: BlockId, property: Property },
     /// One new row at `ord` (the end of the listing, which is what the view's
     /// "new row" line means). `record` is allocated by the caller — the store's
@@ -376,6 +379,34 @@ pub enum Command {
         property: PropertyId,
         from: String,
         to: String,
+    },
+    /// Move a column's **type** (SPEC §三十九 「属性」, ADR-0062's
+    /// `PropertyKindSet` — the one write path that changes what a cell *means*).
+    ///
+    /// ADR-0062 wrote this change's semantics and D1 wrote its storage, and until
+    /// now nothing produced it: the kind is `Change::PropertyKindSet`'s two words,
+    /// `set_property_kind` is its one `UPDATE`, and the only missing piece was a
+    /// hand reaching for it. So this command is deliberately thin — the whole edit
+    /// is `from` → `to` of one word, and its revert is the same word going back.
+    ///
+    /// It carries **no conversion**, which is ADR-0062's rule rather than an
+    /// omission: the values stay in their rows and the next projection paints
+    /// those bytes through the new kind. A `text` column holding `"12"` becomes a
+    /// `number` column holding the text `"12"` in a `REAL`-less row, which is to
+    /// say nothing at all, and an undo puts the words back. Converting per type
+    /// pair is D2's unbuilt half and is not smuggled in here.
+    ///
+    /// What *may not* be answered by a byte-level re-read is a column another
+    /// column depends on — a relation that is paired, a rollup that folds through
+    /// one. Those refusals need the catalog, so they run in the caller
+    /// (`AppState::db_column_kind_set`) exactly as `SetRelationConfig`'s and
+    /// `SetDatabaseRollup`'s do, and `plan` keeps its one job: name the two
+    /// directions of an edit it cannot invalidate.
+    SetDatabasePropertyKind {
+        block: BlockId,
+        property: PropertyId,
+        from: PropertyKind,
+        to: PropertyKind,
     },
 }
 
@@ -1717,6 +1748,29 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 revert: vec![Change::PropertyConfigSet {
                     id: property,
                     config: from,
+                }],
+            })
+        }
+
+        // ADR-0062's change, one word wide, planned the same way: the column's
+        // `kind` forward and back, and no value touched — the revert of a type
+        // change is a type change, never a data restore (which is why no read of
+        // `db_values` happens here or in the store).
+        Command::SetDatabasePropertyKind {
+            block,
+            property,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::PropertyKindSet { id: property, kind: to }],
+                revert: vec![Change::PropertyKindSet {
+                    id: property,
+                    kind: from,
                 }],
             })
         }

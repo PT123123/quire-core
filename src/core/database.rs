@@ -430,6 +430,45 @@ impl PropertyKind {
         PropertyKind::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 
+    /// The word the schema's menus show. Capitalised, and the only place the
+    /// *label* is spelled — the same split `Aggregate::label` and
+    /// `ViewLayout::label` keep: `as_str` is what the file says, `label` is what
+    /// the user is asked to choose. D10 needed this because the kind menu is the
+    /// first place a kind's name is a *choice* rather than a caption, and a row
+    /// reading `multi_select` next to one reading `Rollup` is two spellings of
+    /// one list.
+    pub fn label(self) -> &'static str {
+        match self {
+            PropertyKind::Title => "Title",
+            PropertyKind::Text => "Text",
+            PropertyKind::Number => "Number",
+            PropertyKind::Select => "Select",
+            PropertyKind::MultiSelect => "Multi select",
+            PropertyKind::Status => "Status",
+            PropertyKind::Date => "Date",
+            PropertyKind::Checkbox => "Checkbox",
+            PropertyKind::Url => "Url",
+            PropertyKind::Email => "Email",
+            PropertyKind::Phone => "Phone",
+            PropertyKind::Files => "Files",
+            PropertyKind::CreatedTime => "Created time",
+            PropertyKind::LastEditedTime => "Last edited time",
+            PropertyKind::Formula => "Formula",
+            PropertyKind::Rollup => "Rollup",
+            PropertyKind::Relation => "Relation",
+        }
+    }
+
+    /// The kind's position in [`Self::ALL`] — the number every database
+    /// callback carries as `kind` (Types.slint's legend), which is why a call
+    /// site compares against this rather than against a literal 14.
+    pub fn index(self) -> i32 {
+        Self::ALL
+            .iter()
+            .position(|k| *k == self)
+            .unwrap_or(0) as i32
+    }
+
     /// What a stored string means in this build (ADR-0061's fold): a kind this
     /// build does not know — one a future build wrote — loads as `text` and the
     /// cell draws as text, rather than failing the whole library. `person` folds
@@ -686,6 +725,18 @@ impl ViewLayout {
 
     pub fn try_from_str(s: &str) -> Option<ViewLayout> {
         ViewLayout::ALL.iter().copied().find(|l| l.as_str() == s)
+    }
+
+    /// The layout's number in [`Self::ALL`], which is what the delegate asks
+    /// when it has to decide *what to draw*. `label()` is the switcher's word
+    /// ("Table"), and a predicate written against a display string is a
+    /// predicate that breaks the day the display changes — the same reason a
+    /// cell carries `kind` as a number and its name as a string.
+    pub fn index(self) -> i32 {
+        ViewLayout::ALL
+            .iter()
+            .position(|l| *l == self)
+            .unwrap_or(0) as i32
     }
 
     /// What the view switcher shows. `Form` keeps its one-word name; the layout

@@ -733,7 +733,7 @@ impl SqliteRepository {
         geometry: ViewGeometry,
         scroll_y: f32,
     ) -> Result<RealizedRows, StorageError> {
-        let total = if req.filter.is_some() {
+        let total = if req.filter.is_some() || req.search.is_some() {
             self.filtered_count(req)?
         } else {
             self.record_count(req.db)?
@@ -4486,5 +4486,123 @@ mod probe {
              \"groups\":{},\"whole_switch_us\":{switch_us:.1},\"unwindowed_ms\":{all_ms:.1}}}",
             groups.len()
         );
+    }
+
+    /// SPEC §三十九 「操作」's search box, headless, and the one term D10
+    /// changed: with a needle set, the header's total has to be the *filtered*
+    /// count rather than the table's row count (`AppState::layout_total`), so
+    /// the question is what that one statement costs. Every arm names itself in
+    /// what it asserts — the needle's hit count is recomputed by a plain scan of
+    /// the strings this probe wrote, so a query that ignored the needle could
+    /// not pass the assertion and then print a fast number.
+    #[test]
+    #[ignore = "prints a measurement; run with --release --lib -- --ignored --nocapture"]
+    fn a_search_needle_costs_one_count_and_one_window() {
+        use std::hint::black_box;
+
+        let dir = crate::testing::ScratchDir::new("db-search-count");
+        let path = dir.join("quire.db");
+        let repo = SqliteRepository::open(&path).unwrap();
+
+        let db = Database::new(DatabaseId(1), "Tasks");
+        let title = db.title_property(PropertyId(1));
+        let number = property(2, PropertyKind::Number, 1);
+        let columns = vec![number.clone()];
+        let schema = vec![
+            Change::DatabaseCreated(db.clone()),
+            Change::PropertyAdded(title.clone()),
+            Change::ViewAdded(db.first_view(ViewId(1))),
+            Change::PropertyAdded(number.clone()),
+        ];
+        repo.apply(&schema).unwrap();
+
+        let names: Vec<String> = (0..ROWS).map(|i| format!("Task {i}")).collect();
+        for batch in 0..(ROWS / BATCH) {
+            let mut changes = Vec::with_capacity(BATCH * 2);
+            for i in 0..BATCH {
+                let index = batch * BATCH + i;
+                let record = RecordId(index as u64 + 1);
+                changes.push(Change::RecordCreated(Record::bare(
+                    record,
+                    db.id,
+                    OrderKey(((index as u64) + 1) << 32),
+                )));
+                changes.push(Change::CellSet {
+                    record,
+                    property: title.id,
+                    value: CellValue::Text(names[index].clone()),
+                });
+            }
+            repo.apply(&changes).unwrap();
+        }
+        assert_eq!(repo.record_count(db.id).unwrap(), ROWS);
+
+        let geometry = ViewGeometry::new(32.0, 720.0);
+        let rounds = 200;
+
+        // Two needles, one wide and one narrow, so a reader can see whether the
+        // cost is the scan or the rows that survive it.
+        for needle in ["Task 9", "Task 9999"] {
+            let expected = names.iter().filter(|n| n.contains(needle)).count();
+            let mut req = RowRequest::new(db.id, title.id, &columns);
+            req.search = Some(needle);
+
+            let hit = repo.filtered_count(&req).unwrap();
+            assert_eq!(
+                hit, expected,
+                "the count has to answer to the needle — that is the whole of D10's fix"
+            );
+            assert_ne!(hit, ROWS, "and it is not the table's count in a new name");
+
+            let started = Instant::now();
+            for _ in 0..rounds {
+                black_box(repo.filtered_count(&req).unwrap());
+            }
+            let needled_us = started.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+
+            let started = Instant::now();
+            for _ in 0..rounds {
+                black_box(repo.record_count(db.id).unwrap());
+            }
+            let count_us = started.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+
+            let plain = RowRequest::new(db.id, title.id, &columns);
+            let started = Instant::now();
+            for _ in 0..rounds {
+                black_box(repo.filtered_count(&plain).unwrap());
+            }
+            let unneedled_us = started.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+
+            let started = Instant::now();
+            let window = repo.realized_rows(&req, geometry, 0.0).unwrap();
+            let window_us = started.elapsed().as_secs_f64() * 1e6;
+            // A narrow needle realizes fewer than a window — that is the point of
+            // one — so the assertion says what a window read promises rather than
+            // hard-coding the row count of whichever needle is running.
+            assert_eq!(
+                window.realized(),
+                expected.min(31),
+                "the window is still a window: at most its own height, never the hits"
+            );
+            assert_eq!(window.total(), expected, "and it says the filtered total");
+
+            println!("search probe: {ROWS} rows, needle {needle:?}, {expected} hits");
+            println!("  count of the table (what the header said before): {count_us:.1} µs");
+            println!("  filtered count, no needle: {unneedled_us:.1} µs");
+            println!("  filtered count, with the needle: {needled_us:.1} µs");
+            println!(
+                "  one window fetch, with the needle: {window_us:.1} µs ({} rows realized)",
+                window.realized()
+            );
+            println!(
+                "{{\"label\":\"track3-d10-search-count\",\"date\":\"2026-09-23\",\
+                 \"harness\":\"cargo test --release --lib -- --ignored --nocapture\",\
+                 \"records\":{ROWS},\"needle\":\"{needle}\",\"hits\":{expected},\
+                 \"record_count_us\":{count_us:.1},\"filtered_count_us\":{unneedled_us:.1},\
+                 \"needled_count_us\":{needled_us:.1},\"needled_window_us\":{window_us:.1},\
+                 \"window_rows_realized\":{}}}",
+                window.realized()
+            );
+        }
     }
 }

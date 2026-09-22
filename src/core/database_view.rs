@@ -1458,8 +1458,18 @@ fn build_clause(json: &Json, db: DatabaseId, catalog: &DatabaseCatalog) -> Optio
     if !FilterOp::ops_for(kind).contains(&op) {
         return None;
     }
+    // The round trip of `db_filter_add_clause`: a rule the panel has but the
+    // user has not filled in is stored as `"value": null`, and a `null` is not
+    // a number, a bool or a text — so reading it through the kind's own shape
+    // would drop the clause the panel just wrote, and the row would disappear
+    // from under the user's next keystroke. `Missing` is the value this build
+    // already promises (no constraint, drawn as an empty box), so the absent
+    // value answers with it instead of with nothing.
     let value = if op.needs_value() {
-        parse_value(json.get("value").unwrap_or(&Json::Null), kind, op)?
+        match json.get("value") {
+            None | Some(Json::Null) => FilterValue::Missing,
+            Some(json) => parse_value(json, kind, op)?,
+        }
     } else {
         FilterValue::Missing
     };

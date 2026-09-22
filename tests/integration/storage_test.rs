@@ -52,7 +52,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-    }
+        sync_ref: None,    }
 }
 
 fn sample_state() -> PersistedState {
@@ -500,7 +500,7 @@ fn a_grid_and_its_cells_round_trip_through_storage() {
             table.clone(),
             cell(51, 91, "North"),
             Block {
-                marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
+                marks: vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None }],
                 ..cell(52, 92, "South")
             },
             cell(53, 93, "East"),
@@ -523,7 +523,7 @@ fn a_grid_and_its_cells_round_trip_through_storage() {
     assert_eq!(cells.len(), 6);
     assert_eq!(
         cells[1].marks,
-        vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new() }],
+        vec![Mark { start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None }],
         "a cell's inline marks are ordinary block marks"
     );
     // the kind strings on disk are the ones the SPEC names, because the
@@ -2130,6 +2130,207 @@ mod database_layer {
             Some("Kept by the state")
         );
     }
+    /// Step 16 adds no table and no column — it adds **two indexes** over data
+    /// that is already on disk. So the claim is not "a new table arrived
+    /// empty". It is three things at once: the step runs over a real v15 file,
+    /// nothing written before it moved, and the lookups the panel needs are
+    /// served by the schema the step built.
+    #[test]
+    fn the_v16_step_adds_reference_indexes_to_a_v15_database() {
+        use quire::core::{Mark, MarkKind};
+        use quire::storage::backlinks;
+
+        let (_dir, path) = migrated("d1-v16");
+        {
+            // A page to be pointed at, and one block per way of pointing: a
+            // mention inside prose, and a block that *is* the reference
+            // (ADR-0026).
+            let mut mention = block(7, 2, None, 1, "see Project Atlas");
+            mention.marks = vec![Mark {
+                start: 4,
+                end: 17,
+                kind: MarkKind::Mention,
+                url: "quire://page/1".into(),
+                date: None,
+            }];
+            let mut link = block(8, 2, None, 2, "Project Atlas");
+            link.kind = BlockKind::Page;
+            link.page_ref = Some(PageId(1));
+            let state = PersistedState {
+                pages: vec![page(1, "Project Atlas"), page(2, "Notes")],
+                blocks: vec![mention, link],
+                meta: BTreeMap::new(),
+                settings: BTreeMap::new(),
+            };
+            SqliteRepository::open(&path)
+                .unwrap()
+                .replace_all(&state)
+                .unwrap();
+        }
+        roll_back(&path, 15);
+
+        // Reopening *is* the step: 15 → 16, and both indexes get built from the
+        // rows that were already there.
+        let repo = SqliteRepository::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+        for index in ["idx_marks_reference", "idx_blocks_page_ref"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{index} was built by the step");
+        }
+
+        // The rows the indexes are *over* were written one version earlier. An
+        // index is derived, so "the step did not disturb the data" is the only
+        // thing that can go wrong invisibly — a schema check will not catch it.
+        assert_eq!(raw_rows(&path, "blocks"), 2);
+        let found = backlinks::references_of(&conn, PageId(1), 50).unwrap();
+        assert_eq!(
+            found.iter().map(|r| r.block).collect::<Vec<_>>(),
+            vec![BlockId(7), BlockId(8)],
+            "the mention and the block-level reference both point at the page"
+        );
+        assert_eq!(backlinks::count_of(&conn, PageId(1)).unwrap(), 2);
+        drop(conn);
+
+        // The same read through the handle the app actually holds.
+        assert_eq!(repo.reference_count(PageId(1)).unwrap(), 2);
+    }
+}
+
+#[test]
+fn a_mention_and_a_date_survive_a_reopen_with_their_payloads() {
+    // The `marks` table has exactly **one** payload column (`url`), and the
+    // reference layer puts two different things in it (ADR-0050): a mention's
+    // address, and a date's own ISO text. `Mark::stored_payload` and
+    // `Mark::from_stored` are the only place that mapping lives, and what this
+    // test rules out is the failure that would otherwise be invisible — a date
+    // loading back with `date: None`, i.e. its characters still on screen and
+    // the atom quietly gone.
+    use quire::core::{Mark, MarkKind};
+
+    let dir = ScratchDir::new("marks-ref");
+    let path = dir.join("quire.db");
+    let mut b = block(7, 1, None, 1, "see Project Atlas on 2026-09-22");
+    b.marks = vec![
+        Mark {
+            start: 4,
+            end: 17,
+            kind: MarkKind::Mention,
+            url: "quire://page/12".into(),
+            date: None,
+        },
+        Mark {
+            start: 21,
+            end: 31,
+            kind: MarkKind::Date,
+            url: String::new(),
+            date: Some("2026-09-22".into()),
+        },
+    ];
+    let state = PersistedState {
+        pages: vec![page(1, "Notes", None, 1)],
+        blocks: vec![b.clone()],
+        meta: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    SqliteRepository::open(&path).unwrap().replace_all(&state).unwrap();
+    let loaded = SqliteRepository::open(&path).unwrap().load().unwrap();
+    let back = loaded.blocks.iter().find(|x| x.id == BlockId(7)).unwrap();
+    assert_eq!(back.marks, b.marks, "both payloads came back in the field that owns them");
+
+    // and the layer underneath really is one column: the date's ISO text is
+    // what the row holds, rather than an empty string with the date nowhere
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT kind, url FROM marks WHERE block = 7 ORDER BY start")
+        .unwrap();
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("mention".to_string(), "quire://page/12".to_string()),
+            ("date".to_string(), "2026-09-22".to_string()),
+        ],
+        "the kind strings are the ones the SPEC names, and a date's text is the payload"
+    );
+}
+
+/// The panel asks two different questions — *which* blocks, and *how many*. The
+/// list is what gets drawn (capped, so a page referenced 200 times cannot push
+/// the prose off the screen); the count is what the folded line says instead.
+/// Getting them tangled is how a folded panel starts lying about its own size.
+#[test]
+fn the_panel_carries_the_source_text_and_folds_without_losing_the_count() {
+    use quire::core::{Mark, MarkKind};
+    use quire::storage::backlinks;
+
+    let dir = ScratchDir::new("backlinks-fold");
+    let path = dir.join("quire.db");
+    let mut blocks: Vec<Block> = (0..5u64)
+        .map(|i| {
+            let text = format!("line {i} about Atlas");
+            let mut b = block(10 + i, 2, None, 1 + i, &text);
+            b.marks = vec![Mark {
+                start: 9,
+                end: 14,
+                kind: MarkKind::Mention,
+                url: "quire://page/1".into(),
+                date: None,
+            }];
+            b
+        })
+        .collect();
+    let mut link = block(99, 2, None, 99, "");
+    link.kind = BlockKind::Page;
+    link.page_ref = Some(PageId(1));
+    blocks.push(link);
+
+    let state = PersistedState {
+        pages: vec![page(1, "Project Atlas", None, 1), page(2, "Notes", None, 2)],
+        blocks,
+        meta: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    SqliteRepository::open(&path)
+        .unwrap()
+        .replace_all(&state)
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let window = backlinks::references_of(&conn, PageId(1), 3).unwrap();
+    assert_eq!(window.len(), 3, "the drawing is capped");
+    assert_eq!(
+        backlinks::count_of(&conn, PageId(1)).unwrap(),
+        6,
+        "but the count is the real total, not the size of the window"
+    );
+
+    let all = backlinks::references_of(&conn, PageId(1), 100).unwrap();
+    assert_eq!(all.len(), 6);
+    assert_eq!(all.iter().filter(|r| r.block_level).count(), 1);
+    assert_eq!(all.iter().filter(|r| !r.block_level).count(), 5);
+    assert!(
+        all.iter().any(|r| r.text == "line 0 about Atlas"),
+        "a row keeps the referring block's own text — that is what the panel shows"
+    );
+    assert!(
+        all.iter().all(|r| r.page == PageId(2)),
+        "every source is on the page the reference was read from"
+    );
 }
 
 // ─── Track 3 · D2: the property system ──────────────────────────────────────

@@ -132,6 +132,23 @@ impl SqliteRepository {
         search_index::matches(&self.db.conn(), req)
     }
 
+    /// The blocks that point at `page` (SPEC §四十), capped at `limit` rows.
+    /// Off the `Repository` trait for the same reason as `search`: it is a
+    /// projection the SQLite backend can answer with an index seek, not a
+    /// change the document carries.
+    pub fn references(
+        &self,
+        page: crate::core::types::PageId,
+        limit: usize,
+    ) -> Result<Vec<crate::storage::backlinks::Reference>, StorageError> {
+        crate::storage::backlinks::references_of(&self.db.conn(), page, limit)
+    }
+
+    /// How many blocks point at `page`, for the folded panel's "and N more".
+    pub fn reference_count(&self, page: crate::core::types::PageId) -> Result<usize, StorageError> {
+        crate::storage::backlinks::count_of(&self.db.conn(), page)
+    }
+
     /// Every attachment row (SPEC §三十七 批次 A). Metadata only — the pixels
     /// stay on disk and reach the UI one visible block at a time. Like
     /// `search`, this is off the `Repository` trait: the change contract
@@ -214,7 +231,7 @@ impl Repository for SqliteRepository {
                 .prepare(
                     "SELECT b.id, b.page, bc.parent, bc.ord, b.kind, b.text, b.checked,
                             b.color, b.bg, b.page_ref, b.folded, b.attachment, b.img_percent,
-                            b.columns, b.lang, b.db_ref
+                            b.columns, b.lang, b.db_ref, b.sync_ref
                      FROM blocks b
                      JOIN block_children bc ON bc.block = b.id",
                 )
@@ -238,6 +255,7 @@ impl Repository for SqliteRepository {
                         r.get::<_, i64>(13)?,
                         r.get::<_, String>(14)?,
                         r.get::<_, Option<i64>>(15)?,
+                        r.get::<_, Option<i64>>(16)?,
                     ))
                 })
                 .map_err(sql)?;
@@ -259,6 +277,7 @@ impl Repository for SqliteRepository {
                     columns,
                     lang,
                     db_ref,
+                    sync_ref,
                 ) = row.map_err(sql)?;
                 let Some(kind) = BlockKind::try_from_str(&kind) else {
                     // Our own writes always emit `as_str()`; an unknown
@@ -294,6 +313,12 @@ impl Repository for SqliteRepository {
                     // block's own render asks (a dangling ref draws
                     // "(deleted database)"), exactly as `page_ref` does.
                     db_ref: db_ref.map(|d| DatabaseId(d as u64)),
+                    // The source a `Synced` block mirrors (ADR-0052). Like
+                    // `page_ref` and `db_ref` before it: loaded as an id and
+                    // resolved nowhere in particular, because "the source is
+                    // gone" is a state the row renders rather than a failure
+                    // the load reports.
+                    sync_ref: sync_ref.map(|b| BlockId(b as u64)),
                 });
             }
         }
@@ -323,12 +348,10 @@ impl Repository for SqliteRepository {
                         "mark on block {block} has unknown kind {kind:?}"
                     )));
                 };
-                marks_by_block.entry(block).or_default().push(Mark {
-                    start: start as usize,
-                    end: end as usize,
-                    kind,
-                    url,
-                });
+                marks_by_block
+                    .entry(block)
+                    .or_default()
+                    .push(Mark::from_stored(start as usize, end as usize, kind, url));
             }
             for b in &mut blocks {
                 if let Some(marks) = marks_by_block.remove(&(b.id.as_u64() as i64)) {
@@ -520,8 +543,8 @@ fn insert_page(tx: &Transaction, page: &Page) -> Result<(), StorageError> {
 fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO blocks (id, page, kind, text, checked, color, bg, page_ref, folded,
-                             attachment, img_percent, columns, lang, db_ref)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                             attachment, img_percent, columns, lang, db_ref, sync_ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             block.id.as_u64() as i64,
             block.page.as_u64() as i64,
@@ -537,6 +560,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
             block.columns as i64,
             block.lang.as_str(),
             block.db_ref.map(|d| d.as_u64() as i64),
+            block.sync_ref.map(|b| b.as_u64() as i64),
         ],
     )
     .map_err(sql)?;
@@ -557,7 +581,7 @@ fn insert_block(tx: &Transaction, block: &Block) -> Result<(), StorageError> {
                 m.start as i64,
                 m.end as i64,
                 m.kind.as_str(),
-                m.url,
+                m.stored_payload(),
             ],
         )
         .map_err(sql)?;
@@ -709,7 +733,7 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 columns: 0,
                 lang: Lang::Plain,
                 db_ref: None,
-            };
+                sync_ref: None,            };
             for m in &block.marks {
                 tx.execute(
                     "INSERT INTO marks (block, start, end, kind, url) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -718,7 +742,7 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                         m.start as i64,
                         m.end as i64,
                         m.kind.as_str(),
-                        m.url,
+                        m.stored_payload(),
                     ],
                 )
                 .map_err(sql)?;
@@ -816,6 +840,20 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                 )
                 .map_err(sql)?;
             require_hit(n, "BlockRefSet", id.as_u64())
+        }
+        // SPEC §四十 / ADR-0052: the same statement again, one column over.
+        // What makes this row different from the two above it is what it does
+        // **not** touch: a mirror's `text` is left alone because there is
+        // nothing in it to write, and the only other writer of `sync_ref` is
+        // the block's own insert.
+        Change::BlockSyncSet { id, source } => {
+            let n = tx
+                .execute(
+                    "UPDATE blocks SET sync_ref = ?2 WHERE id = ?1",
+                    params![id.as_u64() as i64, source.map(|b| b.as_u64() as i64)],
+                )
+                .map_err(sql)?;
+            require_hit(n, "BlockSyncSet", id.as_u64())
         }
         // SPEC §三十九 / ADR-0060: the same statement `BlockRefSet` runs, one
         // column over. A `Database` block's entity is a row of its own table,
@@ -981,6 +1019,13 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
         // (ADR-0074's discipline); storage stores it and does no JSON.
         Change::PropertyConfigSet { id, config } => {
             database_store::set_property_config(tx, *id, config)
+        }
+        // D7 (ADR-0086): the database's record template, replaced whole — the
+        // third of the whole-document writes, on the `databases` row this
+        // time. The caller built the document (`database_template`); storage
+        // stores it and does no JSON.
+        Change::DatabaseTemplateSet { id, template } => {
+            database_store::set_database_template(tx, *id, template)
         }
     }
 }

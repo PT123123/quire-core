@@ -312,7 +312,7 @@ fn a_recovered_database_is_searchable_straight_away() {
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-            }),
+        sync_ref: None,            }),
         ])
         .unwrap();
         drop(repo);
@@ -470,7 +470,7 @@ fn snapshot_cost() {
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-        })
+        sync_ref: None,        })
         .collect();
     {
         let repo = SqliteRepository::open(&path).unwrap();

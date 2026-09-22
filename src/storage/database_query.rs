@@ -318,7 +318,12 @@ pub fn row_query_in_group(
         Some(tree) => format!(" AND ({})", node_predicate(&mut sql, tree, req.title, &slots)),
         None => String::new(),
     };
-    let wh = format!(" WHERE r.db = {db} AND ({group}){filter_part}");
+    // The search predicate travels with the filter, not behind it (ADR-0087):
+    // the group list came from `where_clause`'s answer, and the slice inside
+    // the group must be the *same* row set or a header would count rows its
+    // own group does not show.
+    let search_part = search_predicate(&mut sql, req, &slots);
+    let wh = format!(" WHERE r.db = {db} AND ({group}){filter_part}{search_part}");
     let mut text = format!("{}{}{}{}", sql.select, sql.from, wh, order);
     let limit = sql.bind_int(len as i64);
     let offset = sql.bind_int(skip as i64);
@@ -406,18 +411,96 @@ pub fn range_query(req: &RowRequest<'_>, property: PropertyId, kind: PropertyKin
 }
 
 /// The `WHERE` clause: the database, then the filter tree in one parenthesized
-/// group. `AND` with the tree, never string-concatenated into it — a tree that
-/// compiles to `a OR b` must stay `(a OR b)` or the database predicate would
-/// bind to only one side.
+/// group, then — when a search is running (D7, ADR-0087) — the search
+/// predicate in another. `AND` with each, never string-concatenated into
+/// them: a tree that compiles to `a OR b` must stay `(a OR b)` or the
+/// database predicate would bind to only one side.
+///
+/// The search rides the same clause on purpose. It is a row constraint like
+/// the filter's, and every statement this module builds goes through
+/// `where_clause` — the window read, the count, the group query, a group's
+/// slice, the range query — so a searched view's count, its group headers and
+/// its rows all answer *one* predicate. Compiling it anywhere else would be
+/// the red line's defect in miniature: rows taken and thrown away in Rust.
 fn where_clause(sql: &mut Sql, req: &RowRequest<'_>, slots: &[ColumnSlots]) -> String {
     let db = sql.bind_id(req.db.as_u64());
-    match req.filter {
-        None => format!(" WHERE r.db = {db}"),
-        Some(tree) => {
-            let predicate = node_predicate(sql, tree, req.title, slots);
-            format!(" WHERE r.db = {db} AND ({predicate})")
-        }
+    let filter = match req.filter {
+        None => String::new(),
+        Some(tree) => format!(" AND ({})", node_predicate(sql, tree, req.title, slots)),
+    };
+    let search = search_predicate(sql, req, slots);
+    format!(" WHERE r.db = {db}{filter}{search}")
+}
+
+/// The search predicate (SPEC §三十九 「操作」's 视图内搜索, ADR-0087): one
+/// case-blind substring test per **text-bearing** column the request names,
+/// OR'd, sharing a single bind — the placeholders are positional, so every
+/// arm can name the same `?N`.
+///
+/// The columns searched are the request's own: the title (through its
+/// `COALESCE`, so a page-backed row's `pages.title` is searched, ADR-0063)
+/// plus every column whose kind *stores prose* — text / url / email / phone,
+/// the fixed-width ISO date, the two record stamps. Deliberately **not**
+/// searched: a number (its `num` column has no text, and "50" against 0.5
+/// painted as 50% is the projection's business — the filter panel compares
+/// numbers properly), a checkbox (nothing to read), a select/status (the
+/// stored text is the option **id**, and the option *name* lives in the
+/// config JSON where SQL cannot see it — matching ids would be searching a
+/// surrogate key), the two list kinds (their values are `db_value_items`
+/// rows, and `has` is the panel's comparison), and the computed kinds (they
+/// store nothing, ADR-0062).
+///
+/// The boundary worth restating, because the global search panel (§二十)
+/// sits right next to it in the codebase: this is **not** the FTS5 mirror.
+/// `search_pages`/`search_blocks` index page titles and block texts, and
+/// nothing at all indexes `db_values` — putting cell text into the mirror
+/// would be a derived copy with a write path per keystroke and a prune rule
+/// per bulk path, all to answer a question the live predicate already
+/// answers inside the statement the view was running anyway. The cost is
+/// the one `contains` has had since D4: `INSTR` is a scan, not a seek, and
+/// the needle's case-fold is ASCII-only (LOWER's own boundary, the same one
+/// every text search in this app has).
+fn search_predicate(sql: &mut Sql, req: &RowRequest<'_>, slots: &[ColumnSlots]) -> String {
+    let Some(needle) = req.search else {
+        return String::new();
+    };
+    if needle.trim().is_empty() {
+        // An empty box is "not searching", not "searching for nothing" — the
+        // same reading the filter's vacuous group takes.
+        return String::new();
     }
+    // One bind, shared by every arm: the predicate is a single needle.
+    let bind = sql.bind_text(needle);
+    let mut arms: Vec<String> = Vec::new();
+    // The title is always searched, and it is not always a column of the
+    // request (a view could hide every text column but never the title).
+    arms.push(format!(
+        "INSTR(LOWER(COALESCE(p.title, t.text)), LOWER({bind})) > 0"
+    ));
+    for column in req.columns {
+        let searched = matches!(
+            column.kind,
+            PropertyKind::Text
+                | PropertyKind::Url
+                | PropertyKind::Email
+                | PropertyKind::Phone
+                | PropertyKind::Date
+                | PropertyKind::CreatedTime
+                | PropertyKind::LastEditedTime
+        );
+        if !searched || column.id == req.title {
+            continue;
+        }
+        let expr = column_expr(sql, column.id, SortColumn::Text, req.title, slots);
+        arms.push(format!("INSTR(LOWER({expr}), LOWER({bind})) > 0"));
+    }
+    if arms.is_empty() {
+        // No column can hold the needle: the honest answer is "nothing
+        // matches" — `0`, not `1`, because showing every row under a search
+        // that found nothing would be a lie about the search.
+        return " AND (0)".to_string();
+    }
+    format!(" AND ({})", arms.join(" OR "))
 }
 
 /// The predicate one filter node compiles to. Groups parenthesize themselves;

@@ -3,6 +3,7 @@
 // Slint (docs/ARCHITECTURE.md hard rule 2).
 
 pub mod backup;
+pub mod backlinks;
 pub mod data_location;
 pub mod database;
 /// The view rules' SQL compiler (SPEC §三十九 「操作」, Track 3 D4 / ADR-0076):

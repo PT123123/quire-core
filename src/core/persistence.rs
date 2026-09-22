@@ -67,6 +67,19 @@ pub enum Change {
     /// itself is created/destroyed by the surrounding `PageCreated` /
     /// `PageDeleted` changes in the same batch, not here.
     BlockRefSet { id: BlockId, page: Option<PageId> },
+    /// Point a `Synced` block at the block it mirrors, or clear the pointer
+    /// (`None` = no source: the row renders read-only, §四十 / ADR-0052).
+    /// The same shape `BlockRefSet` gave a `Page` block, for the same reason:
+    /// the pointer is one column and one undo step, and nothing else in the
+    /// batch needs to know about it.
+    ///
+    /// Placed **beside** `BlockRefSet` rather than appended at the end of the
+    /// enum on purpose: `Change` is matched by name everywhere it is consumed
+    /// (there is no ordinal encoding to disturb), and reading the two
+    /// "point a block at something" writes together is worth more than
+    /// keeping the tail pristine for the next writer — the tail is where
+    /// another track appends its own section anyway.
+    BlockSyncSet { id: BlockId, source: Option<BlockId> },
     /// Point an `Image` block at an attachment (SPEC §三十七 批次 A). The
     /// file row itself arrives in the same batch as `AttachmentAdded`; undo
     /// clears this pointer and leaves the file alone (see `AttachmentAdded`).
@@ -200,6 +213,17 @@ pub enum Change {
     /// (`Command::SetDatabaseFormula`) captured the previous document and its
     /// revert names it; a change names what happened, not which way it ran.
     PropertyConfigSet { id: PropertyId, config: String },
+
+    /// A database's record template (SPEC §三十九 「操作」's 数据库模板,
+    /// ADR-0086), **replaced whole** — the document discipline `ViewDefinitionSet`
+    /// and `PropertyConfigSet` follow, applied to the `databases` row: the
+    /// template is one JSON document (`database_template`), the caller
+    /// read-edited-wrote it, and storage stores it doing no JSON. The values
+    /// travel in the shapes [`CellValue`] stores, because a template is a copy
+    /// of content, not a second content format; the prefill that applies them
+    /// is the ordinary `CellSet` write, so nothing on the write path learns a
+    /// new shape.
+    DatabaseTemplateSet { id: DatabaseId, template: String },
 }
 
 /// Every attachment id a change list points at, read off the arm that carries

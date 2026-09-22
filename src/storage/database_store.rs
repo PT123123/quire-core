@@ -113,13 +113,18 @@ impl SqliteRepository {
         let mut catalog = DatabaseCatalog::default();
         {
             let mut stmt = conn
-                .prepare("SELECT id, name FROM databases ORDER BY id")
+                .prepare("SELECT id, name, template FROM databases ORDER BY id")
                 .map_err(sql)?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok(Database {
                         id: DatabaseId(r.get::<_, i64>(0)? as u64),
                         name: r.get(1)?,
+                        // v20 (ADR-0086). `''` is "no template" and the
+                        // document is stored verbatim: parsing is the caller's
+                        // (`database_template::cells_of`), and a document this
+                        // build cannot read folds there, not here.
+                        template: r.get(2)?,
                     })
                 })
                 .map_err(sql)?;
@@ -1116,11 +1121,29 @@ fn placeholders(n: usize) -> String {
 
 pub(crate) fn insert_database(tx: &Transaction, db: &Database) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO databases (id, name) VALUES (?1, ?2)",
-        params![id(db.id.as_u64()), db.name],
+        "INSERT INTO databases (id, name, template) VALUES (?1, ?2, ?3)",
+        params![id(db.id.as_u64()), db.name, db.template],
     )
     .map_err(sql)?;
     Ok(())
+}
+
+/// The template document, replaced whole (ADR-0086). The caller read-edited-
+/// wrote the text (`database_template`'s builders); storage stores it and
+/// does no JSON — the same split `set_view_definition` and
+/// `set_property_config` keep for the other two documents.
+pub(crate) fn set_database_template(
+    tx: &Transaction,
+    db: DatabaseId,
+    template: &str,
+) -> Result<(), StorageError> {
+    let n = tx
+        .execute(
+            "UPDATE databases SET template = ?2 WHERE id = ?1",
+            params![id(db.as_u64()), template],
+        )
+        .map_err(sql)?;
+    require_hit(n, "DatabaseTemplateSet", db.as_u64())
 }
 
 pub(crate) fn rename_database(
@@ -1509,7 +1532,10 @@ pub(crate) fn delete_view(tx: &Transaction, view: ViewId) -> Result<(), StorageE
 /// document, and a record that survives it keeps the birthday it had, not the
 /// moment the file was rewritten.
 pub(crate) struct DatabaseSnapshot {
-    databases: Vec<(i64, String)>,
+    /// The template column (v20, ADR-0086) rides with the row: a checkpoint or
+    /// a LAN pull that dropped it would silently un-template every database —
+    /// the exact class of loss ADR-0066 exists for.
+    databases: Vec<(i64, String, String)>,
     properties: Vec<(i64, i64, String, String, String, i64)>,
     records: Vec<(i64, i64, Option<i64>, i64, String, String)>,
     values: Vec<(i64, i64, String, Option<f64>, i64)>,
@@ -1527,9 +1553,11 @@ pub(crate) fn snapshot_tables(conn: &Connection) -> Result<DatabaseSnapshot, Sto
         views: Vec::new(),
     };
     {
-        let mut stmt = conn.prepare("SELECT id, name FROM databases").map_err(sql)?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, template FROM databases")
+            .map_err(sql)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map_err(sql)?;
         for row in rows {
             snapshot.databases.push(row.map_err(sql)?);
@@ -1617,10 +1645,10 @@ pub(crate) fn restore_tables(
     snapshot: &DatabaseSnapshot,
     kept_pages: &BTreeSet<i64>,
 ) -> Result<(), StorageError> {
-    for (id, name) in &snapshot.databases {
+    for (id, name, template) in &snapshot.databases {
         tx.execute(
-            "INSERT OR REPLACE INTO databases (id, name) VALUES (?1, ?2)",
-            params![id, name],
+            "INSERT OR REPLACE INTO databases (id, name, template) VALUES (?1, ?2, ?3)",
+            params![id, name, template],
         )
         .map_err(sql)?;
     }
@@ -3873,6 +3901,7 @@ mod probe {
             columns: &columns,
             sorts: std::slice::from_ref(&sort),
             filter: None,
+            search: None,
         };
         let plain = RowRequest {
             sorts: &[],
@@ -3947,6 +3976,7 @@ mod probe {
             columns: &columns,
             sorts: std::slice::from_ref(&date_sort),
             filter: None,
+            search: None,
         };
         let started = Instant::now();
         let date_rows = repo.window_rows(&by_date, top).unwrap();

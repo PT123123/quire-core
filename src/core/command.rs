@@ -5,13 +5,14 @@
 use std::collections::{HashMap, HashSet};
 
 use super::database::{
-    CellValue, DatabaseDraft, Property, PropertyId, Record, RecordId, View, ViewId,
+    CellValue, DatabaseDraft, DatabaseId, Property, PropertyId, Record, RecordId, View, ViewId,
 };
 use super::document::{Document, Entry};
 use super::history::History;
 use super::persistence::Change;
 use super::types::{
-    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page, PageId,
+    Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page, PageFont,
+    PageId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +45,19 @@ pub enum Command {
     /// Toggle an inline mark over `[start..end]` (byte offsets): a same-kind
     /// mark covering the range is removed, otherwise intersecting same-kind
     /// marks are replaced by one new mark (M6).
-    ToggleMark { id: BlockId, start: usize, end: usize, kind: MarkKind, url: String },
+    ToggleMark { id: BlockId, start: usize, end: usize, kind: MarkKind, url: String, date: Option<String> },
+    /// Insert a reference atom at `at` (SPEC §四十): `label` replaces the text
+    /// from `at` onwards — the `@` and whatever was typed as a filter — and the
+    /// label's own bytes become a `Mention` or a `Date` mark. `url` non-empty
+    /// means a mention (`quire://page/<id>`), empty means a date whose payload
+    /// is `date`.
+    ///
+    /// **One command, not `ReplaceText` + `ToggleMark`.** `exec_all` plans every
+    /// command in a batch against the same pre-state, so a `ToggleMark` riding
+    /// behind a `ReplaceText` would be planned against the *old* text: it would
+    /// clamp its end to the old length and land on the wrong bytes. The two
+    /// halves of "type @, pick a page" are one user action and one Ctrl+Z.
+    InsertReference { id: BlockId, at: usize, label: String, kind: MarkKind, url: String, date: Option<String> },
     /// Tab on a list item: nest it under the previous list item (depth 1 max).
     IndentList { id: BlockId },
     /// Shift+Tab on a nested list item: promote it back to top level,
@@ -238,6 +251,41 @@ pub enum Command {
         from: String,
         to: String,
     },
+    /// Turn a line into a **linked database** (SPEC §三十九 「操作」, ADR-0085):
+    /// a `Database` block that draws *another* block's entity — `db_ref` names
+    /// a database that already exists, and nothing is copied. There is no new
+    /// block kind and no second pointer column for it, on purpose: every read
+    /// and every write already resolves through `db_ref` (`db_ref_of` → the
+    /// catalog, the window read, `SetDatabaseCell`), so "reads the source's
+    /// data and view definitions, writes land on the source" holds by
+    /// construction — there is no other database anywhere for it to be about.
+    /// The one thing this command carries that `MakeDatabase` does not is the
+    /// absence of a creation: no `databases` row is born here, and its revert
+    /// therefore deletes no entity (undo of a link leaves the source whole —
+    /// the exact opposite of `MakeDatabase`'s revert, which is what makes the
+    /// two commands different words).
+    ///
+    /// `core::command::plan` cannot check that `db` names a live entity (the
+    /// catalog is the caller's), so the caller checks; a link aimed at an id
+    /// that died between pick and click would dangle and draw ADR-0060's one
+    /// muted line — a state the renderer already has a word for, not a failure.
+    LinkDatabase { id: BlockId, db: DatabaseId },
+    /// Replace a database's record template (SPEC §三十九 「操作」's 数据库模板,
+    /// ADR-0086) — the same replace-whole shape `SetDatabaseFormula` has,
+    /// because the same validation rule applies: the document was built and
+    /// read back by the caller (`database_template`), and `plan` sees a
+    /// `Document` and no store. `from == to` is not an undo step.
+    ///
+    /// The template belongs to the *entity* the block draws — the same
+    /// refusal `AddDatabaseProperty` makes when the two ids could disagree,
+    /// with the same reason: a template aimed at another database would be a
+    /// prefill no row of this block's view ever sees.
+    SetDatabaseTemplate {
+        block: BlockId,
+        db: DatabaseId,
+        from: String,
+        to: String,
+    },
 }
 
 /// The grid shape the "+", the slash menu and "Turn into" hand out. Three
@@ -416,7 +464,7 @@ fn new_child(doc: &mut Document, page: PageId, parent: BlockId, order: OrderKey,
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-    }
+        sync_ref: None,    }
 }
 
 /// One empty cell of table `parent`, ordered by `order`.
@@ -570,7 +618,7 @@ fn insert_attachment(
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-    };
+        sync_ref: None,    };
     Some(Entry {
         apply: vec![Change::AttachmentAdded(attachment), Change::BlockInserted(new)],
         // Undo drops the reference only. The row and the file stay: redo must
@@ -815,7 +863,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 columns: 0,
                 lang: Lang::Plain,
                 db_ref: None,
-            };
+                sync_ref: None,            };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
                 revert: vec![Change::BlockDeleted { id: new_id }],
@@ -848,7 +896,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 columns: 0,
                 lang: Lang::Plain,
                 db_ref: None,
-            };
+                sync_ref: None,            };
             Some(Entry {
                 apply: vec![Change::BlockInserted(new)],
                 revert: vec![Change::BlockDeleted { id: new_id }],
@@ -1501,6 +1549,70 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             })
         }
 
+        // ─── SPEC §三十九 「操作」: the linked database (ADR-0085) ────────────
+        //
+        // The same two refusals `MakeDatabase` makes (a cell belongs to its
+        // grid, a container's children would vanish behind the view), plus the
+        // one `MakeDatabase` cannot reach: a block that already draws an
+        // entity — own or linked, `db_ref` does not say which and does not
+        // need to — must not be repointed, for the reason `BlockDbRefSet`'s
+        // doc gives: a silently moved pointer is a database someone else's
+        // rows vanished into.
+        Command::LinkDatabase { id, db } => {
+            let b = doc.block(id)?;
+            let old = b.kind;
+            if matches!(old, BlockKind::TableCell | BlockKind::Column)
+                || inside_container(doc, id)
+                || b.db_ref.is_some()
+            {
+                return None;
+            }
+            if doc.page_blocks(page).iter().any(|x| x.parent == Some(id)) {
+                return None;
+            }
+            Some(Entry {
+                // The pointer before the kind, as `MakeDatabase` writes them:
+                // the renderer that sees kind 23 reads `db_ref` in the same
+                // batch, so no frame shows a database block with no entity
+                // behind it.
+                apply: vec![
+                    Change::BlockDbRefSet { id, db: Some(db) },
+                    Change::BlockKindSet {
+                        id,
+                        kind: BlockKind::Database,
+                    },
+                ],
+                revert: vec![
+                    Change::BlockKindSet { id, kind: old },
+                    Change::BlockDbRefSet { id, db: None },
+                ],
+            })
+        }
+
+        // ─── SPEC §三十九 「操作」: the record template (ADR-0086) ────────────
+        //
+        // The entity check is the one fact `plan` *can* see (the block's own
+        // pointer), and it is enough: a template write names the database this
+        // block draws or it is refused. The document itself is the caller's —
+        // it was read from the catalog, edited there and validated there
+        // (`database_template`'s shapes), and `from == to` writes nothing.
+        Command::SetDatabaseTemplate { block, db, from, to } => {
+            let b = doc.block(block)?;
+            if b.db_ref != Some(db) || from == to {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::DatabaseTemplateSet {
+                    id: db,
+                    template: to,
+                }],
+                revert: vec![Change::DatabaseTemplateSet {
+                    id: db,
+                    template: from,
+                }],
+            })
+        }
+
         Command::ToggleTodoChecked { id } => {
             let b = doc.block(id)?;
             if b.kind != BlockKind::Todo {
@@ -1522,7 +1634,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             })
         }
 
-        Command::ToggleMark { id, start, end, kind, url } => {
+        Command::ToggleMark { id, start, end, kind, url, date } => {
             let b = doc.block(id)?;
             let (start, end) = (start.min(end), end.max(start));
             let end = end.min(b.text.len());
@@ -1544,7 +1656,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 new_marks.push(m.clone());
             }
             if !was_covered {
-                new_marks.push(Mark { start, end, kind, url });
+                new_marks.push(Mark { start, end, kind, url, date });
                 new_marks.sort_by_key(|m| (m.start, m.end));
             }
             if new_marks == b.marks {
@@ -1553,6 +1665,50 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry {
                 apply: vec![Change::BlockMarksSet { id, marks: new_marks }],
                 revert: vec![Change::BlockMarksSet { id, marks: b.marks.clone() }],
+            })
+        }
+
+        Command::InsertReference { id, at, label, kind, url, date } => {
+            let b = doc.block(id)?;
+            let at = at.min(b.text.len());
+            if !b.text.is_char_boundary(at) {
+                return None;
+            }
+            let mut text = b.text.clone();
+            text.truncate(at);
+            text.push_str(&label);
+            let (start, end) = (at, text.len());
+            if start == end {
+                return None; // an empty label makes no atom
+            }
+            // The same rule `ToggleMark` applies, and for the same reason: an
+            // atom of this kind that intersects the new span is replaced rather
+            // than kept, while every other kind is left alone (the projection
+            // clamps a span that the shorter text has outrun, which is how
+            // typing inside a marked stretch has always been tolerated).
+            let mut marks: Vec<Mark> = b
+                .marks
+                .iter()
+                .filter(|m| !(m.kind == kind && m.intersects(start, end)))
+                .cloned()
+                .collect();
+            marks.push(Mark {
+                start,
+                end,
+                kind,
+                url,
+                date,
+            });
+            marks.sort_by_key(|m| (m.start, m.end));
+            Some(Entry {
+                apply: vec![
+                    Change::BlockTextSet { id, text: text.clone() },
+                    Change::BlockMarksSet { id, marks },
+                ],
+                revert: vec![
+                    Change::BlockTextSet { id, text: b.text.clone() },
+                    Change::BlockMarksSet { id, marks: b.marks.clone() },
+                ],
             })
         }
 
@@ -1895,7 +2051,7 @@ mod tests {
                 columns: 0,
                 lang: Lang::Plain,
                 db_ref: None,
-            });
+                sync_ref: None,            });
             doc.set_page_blocks(page, v);
             prev = Some(order);
             ids.push(id);
@@ -1947,6 +2103,106 @@ mod tests {
         exec(&mut doc, &mut hist, page, Command::ReplaceText { id: ids[0], text: String::new() }).unwrap();
         exec(&mut doc, &mut hist, page, Command::MergeBackward { id: ids[0] }).unwrap();
         assert_eq!(doc.page_blocks(page).len(), 2);
+    }
+
+    /// SPEC §四十 / ADR-0050: "@Pro" plus a pick lands as **one** step. The
+    /// two halves cannot be two commands in one batch — `exec_all` plans every
+    /// command against the same pre-state, so a `ToggleMark` riding behind a
+    /// `ReplaceText` would be planned against the old text and clamp its span
+    /// to the old length — so the command does both, and one Ctrl+Z takes the
+    /// atom, its characters and the `@` back together.
+    #[test]
+    fn an_inserted_reference_replaces_the_filter_and_undoes_as_one_step() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let id = ids[0];
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::ReplaceText { id, text: "see @Pro".into() },
+        )
+        .unwrap();
+        let typed = doc.block(id).unwrap().clone();
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertReference {
+                id,
+                at: 4,
+                label: "Project Atlas".into(),
+                kind: MarkKind::Mention,
+                url: "quire://page/12".into(),
+                date: None,
+            },
+        )
+        .unwrap();
+        let b = doc.block(id).unwrap();
+        assert_eq!(b.text, "see Project Atlas", "the filter and its @ are gone");
+        assert_eq!(b.marks.len(), 1);
+        assert_eq!(b.marks[0].kind, MarkKind::Mention);
+        assert_eq!((b.marks[0].start, b.marks[0].end), (4, 17));
+        assert_eq!(b.marks[0].url, "quire://page/12");
+        assert_eq!(b.marks[0].date, None);
+
+        undo(&mut doc, &mut hist, page);
+        assert_eq!(
+            doc.block(id).unwrap(),
+            &typed,
+            "one undo restored the text and the atom together"
+        );
+
+        // a date is the same command with an empty address and its payload
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::InsertReference {
+                id,
+                at: 0,
+                label: "2026-09-22".into(),
+                kind: MarkKind::Date,
+                url: String::new(),
+                date: Some("2026-09-22".into()),
+            },
+        )
+        .unwrap();
+        let b = doc.block(id).unwrap();
+        // the undo left "see @Pro", so an atom at 0 replaces the whole line
+        assert_eq!(b.text, "2026-09-22");
+        assert_eq!(b.marks[0].kind, MarkKind::Date);
+        assert_eq!((b.marks[0].start, b.marks[0].end), (0, 10));
+        assert_eq!(b.marks[0].date.as_deref(), Some("2026-09-22"));
+    }
+
+    /// An atom of the same kind already sitting on the span is *replaced*, not
+    /// stacked: the primary key of the `marks` table is `(block, start, kind)`,
+    /// so two mentions over one span could not both be stored anyway.
+    #[test]
+    fn a_second_reference_over_the_same_bytes_replaces_the_first() {
+        let (mut doc, mut hist, page, ids) = setup();
+        let id = ids[0];
+        exec(&mut doc, &mut hist, page, Command::ReplaceText { id, text: "@x".into() }).unwrap();
+        for target in [12u64, 13] {
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::InsertReference {
+                    id,
+                    at: 0,
+                    label: "Atlas".into(),
+                    kind: MarkKind::Mention,
+                    url: format!("quire://page/{target}"),
+                    date: None,
+                },
+            )
+            .unwrap();
+        }
+        let b = doc.block(id).unwrap();
+        assert_eq!(b.marks.len(), 1, "one atom per span");
+        assert_eq!(b.marks[0].url, "quire://page/13");
+        assert_eq!(b.text, "Atlas");
     }
 
     #[test]
@@ -2006,7 +2262,7 @@ mod tests {
             columns: 0,
             lang: Lang::Plain,
             db_ref: None,
-        };
+            sync_ref: None,        };
         let c1 = doc.alloc_block_id();
         let c2 = doc.alloc_block_id();
         let p2 = doc.alloc_block_id();
@@ -2064,7 +2320,7 @@ mod tests {
             columns: 0,
             lang: Lang::Plain,
             db_ref: None,
-        };
+            sync_ref: None,        };
         let a = doc.alloc_block_id();
         let b = doc.alloc_block_id();
         let c = doc.alloc_block_id();
@@ -2156,7 +2412,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         assert_eq!(doc.block(f).unwrap().marks.len(), 1);
@@ -2165,7 +2421,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 0, end: 5, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         assert!(doc.block(f).unwrap().marks.is_empty());
@@ -2179,7 +2435,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 0, end: 2, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 0, end: 2, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         // overlapping range replaces the old mark instead of stacking
@@ -2187,7 +2443,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Bold, url: String::new() },
+            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Bold, url: String::new(), date: None },
         )
         .unwrap();
         let marks = doc.block(f).unwrap().marks.clone();
@@ -2198,7 +2454,7 @@ mod tests {
             &mut doc,
             &mut hist,
             page,
-            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Italic, url: String::new() },
+            Command::ToggleMark { id: f, start: 1, end: 5, kind: MarkKind::Italic, url: String::new(), date: None },
         )
         .unwrap();
         assert_eq!(doc.block(f).unwrap().marks.len(), 2);
@@ -2322,7 +2578,7 @@ mod tests {
             columns: 0,
             lang: Lang::Plain,
             db_ref: None,
-        };
+            sync_ref: None,        };
         let p = mk(&mut doc, source, "p", 10, None);
         let c = mk(&mut doc, source, "c", 12, Some(p.id));
         let t = mk(&mut doc, target, "t", 10, None);

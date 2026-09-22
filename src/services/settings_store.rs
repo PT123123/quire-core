@@ -367,7 +367,7 @@ mod tests {
             columns: 0,
             lang: Lang::Plain,
             db_ref: None,
-        });
+            sync_ref: None,        });
         state.pages.push(Page {
             id: PageId(1),
             title: "p1".into(),

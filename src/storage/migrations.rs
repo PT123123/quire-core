@@ -6,12 +6,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::core::StorageError;
 
-/// The schema version this build of Quire expects. Step 18 is Track 3's (the
-/// database block reference, ADR-0060); step 16 is Track 2's, so this branch's
-/// chain reaches 18 without a 16 of its own — `ensure_current` applies every
-/// step above the file's version in array order, so a gap closes when the
-/// other branch lands and a fresh file still ends at 18.
-pub const CURRENT_VERSION: i32 = 18;
+/// The schema version this build of Quire expects. Steps 12–15, 17, 18 and 20
+/// are Track 3's (the database layer, ADR-0060–0087; 20 is the record
+/// template, ADR-0086); step 16 is Track 2's and step 19 is Track 4's, both
+/// written in other trees — `ensure_current` applies every step above the
+/// file's version in array order, so the gap closes when the branches land
+/// and a fresh file ends at 20.
+pub const CURRENT_VERSION: i32 = 20;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -312,6 +313,35 @@ CREATE INDEX IF NOT EXISTS idx_db_views_db ON db_views(db);
 "#,
     backfill: None,
 }, Migration {
+    version: 16,
+    label: "reference lookup",
+    // SPEC §四十 / ADR-0051: the backlink panel asks "which blocks point at
+    // this page", and it must not be answered by a full scan of `marks` or of
+    // `blocks` — the panel is drawn with every page open, so the cost is on the
+    // interactive path.
+    //
+    // **Two indexes and no table.** A reference is already stored exactly once:
+    // a mention keeps `quire://page/<id>` in the one payload column `marks`
+    // has (ADR-0050), and a block-level reference keeps `blocks.page_ref`
+    // (ADR-0026). Nothing new is written, so nothing new can drift, and there
+    // is no maintenance path for a bug to hide in — SQLite keeps a B-tree in
+    // step with the rows it indexes, which is the only kind of derived data
+    // this project has never had to send a sweep after.
+    //
+    // `(kind, url)` is what makes the mention probe an index seek: the pair is
+    // exactly the predicate, and the leftmost column alone (kind) is *not*
+    // enough — every mark of the same kind would still be scanned, and a page
+    // with 10 000 bold spans has no mentions to find. `page_ref` gets its own
+    // index for the same reason.
+    sql: r#"
+CREATE INDEX IF NOT EXISTS idx_marks_reference ON marks(kind, url);
+CREATE INDEX IF NOT EXISTS idx_blocks_page_ref ON blocks(page_ref);
+"#,
+    // An index is built by SQLite from rows that are already there, so a v15
+    // library needs no backfill step: the panel reads the same data it would
+    // have read, only faster.
+    backfill: None,
+}, Migration {
     version: 17,
     label: "database record timestamps",
     // ADR-0068: `created time` and `last edited time` are §三十九's two derived
@@ -358,6 +388,64 @@ CREATE INDEX IF NOT EXISTS idx_db_views_db ON db_views(db);
     // question nobody asks is a B-tree every write pays for.
     sql: "",
     backfill: Some(add_db_ref_column),
+}, Migration {
+    version: 19,
+    label: "block sync pointer",
+    // SPEC §四十 / ADR-0052: a `Synced` block is a second view of one other
+    // block, so it needs one place to keep that address — and only that. Its
+    // `text` stays empty for good, which is the part worth holding onto: the
+    // moment a mirror also carried the words, there would be two owners of one
+    // sentence and nothing that could ever prove which one won.
+    //
+    // **Nullable, no `DEFAULT`, and above all no foreign key.** `NULL` reads as
+    // "no source", which covers both a mirror whose source has not been picked
+    // and one whose source was deleted — the projection cannot tell those two
+    // apart and must not have to; ADR-0052 §2 makes both read as the same
+    // read-only placeholder. A `REFERENCES blocks(id)` here would drag
+    // `ON DELETE CASCADE` semantics along with it, and cascading is precisely
+    // what this decision refuses: deleting a *view* must never take the content
+    // with it.
+    //
+    // No index either, for the reason v18 gives: nothing yet asks "which blocks
+    // mirror this one". If such a panel ever exists it gets its own step, and
+    // an index built for a question nobody asks is a B-tree every write pays
+    // for.
+    //
+    // **Why 19.** 17 and 18 are Track 3's database steps and one of them is
+    // already committed. Migrations are the only irreversible thing in this
+    // project, so two features sharing a number costs more than a number that
+    // is briefly unused in one isolated tree — that gap closes the moment the
+    // trees meet, and whose file proves it is the integrator's arithmetic, not
+    // mine.
+    sql: "",
+    backfill: Some(add_sync_ref_column),
+}, Migration {
+    version: 20,
+    label: "database record template",
+    // SPEC §三十九 「操作」's 数据库模板 (Track 3 D7, ADR-0086): the prefill a
+    // database's new records start from, as one JSON document on the
+    // `databases` row itself. A column and not a table, for the reason
+    // ADR-0064 gave for view documents: SQL never filters on a template —
+    // nothing asks "which databases prefill this value" — so a second table
+    // would be a join nobody runs, and the document is the database's own
+    // truth, replaced whole by `Change::DatabaseTemplateSet` (the same
+    // whole-document discipline `db_properties.config` and `db_views.definition`
+    // follow). The values inside it are the shapes `db_values` already stores
+    // (ADR-0086), so applying a template is the ordinary cell write and no
+    // second content format exists to keep in step.
+    //
+    // `NOT NULL DEFAULT ''` keeps `''` meaning "no template" — the same
+    // "empty string is the absence" convention `pages.icon` (v11) uses, and
+    // `database_template::cells_of("")` folds to "no prefill", so a pre-v20
+    // library's databases read as exactly what they were: untemplated.
+    //
+    // **Why 20.** 12–15, 17 and 18 are Track 3's earlier steps; 16 is Track
+    // 2's and 19 is Track 4's, both written after 18 in other trees. The
+    // runner applies every step above the file's version in array order, so a
+    // gap in one isolated tree closes the moment the trees meet — v17's
+    // landing proved that shape.
+    sql: "",
+    backfill: Some(add_database_template_column),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -420,21 +508,23 @@ fn add_record_timestamp_columns(conn: &mut Connection) -> Result<(), StorageErro
     Ok(())
 }
 
-/// Migration 18 body: add `blocks.db_ref` only when it is missing (ADR-0060).
-/// The same "缺哪列补哪列" shape as `page_ref`, `folded` and the two attachment
-/// columns: a half-applied upgrade — the column added by hand, a backup restored
-/// mid-step — converges instead of erroring on a duplicate name.
-fn add_db_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
+/// Migration 20 body: `databases.template`, added only when it is missing —
+/// the same "缺哪列补哪列" convergence the record timestamps (v17) use, so a
+/// half-applied upgrade or a hand-edited file still opens.
+fn add_database_template_column(conn: &mut Connection) -> Result<(), StorageError> {
     let present: i64 = conn
         .query_row(
-            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'db_ref'",
+            "SELECT count(*) FROM pragma_table_info('databases') WHERE name = 'template'",
             [],
             |row| row.get(0),
         )
         .map_err(|e| StorageError::Sql(e.to_string()))?;
     if present == 0 {
-        conn.execute("ALTER TABLE blocks ADD COLUMN db_ref INTEGER", [])
-            .map_err(|e| StorageError::Sql(format!("add db_ref: {e}")))?;
+        conn.execute(
+            "ALTER TABLE databases ADD COLUMN template TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| StorageError::Sql(format!("add databases.template: {e}")))?;
     }
     Ok(())
 }
@@ -525,6 +615,43 @@ fn add_page_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
     if present == 0 {
         conn.execute("ALTER TABLE blocks ADD COLUMN page_ref INTEGER", [])
             .map_err(|e| StorageError::Sql(format!("add page_ref: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migration 18 body: add `blocks.db_ref` only when it is missing (ADR-0060).
+/// The same "缺哪列补哪列" shape as `page_ref`, `folded` and the two attachment
+/// columns: a half-applied upgrade — the column added by hand, a backup restored
+/// mid-step — converges instead of erroring on a duplicate name.
+fn add_db_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'db_ref'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute("ALTER TABLE blocks ADD COLUMN db_ref INTEGER", [])
+            .map_err(|e| StorageError::Sql(format!("add db_ref: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migration 19 body: add `blocks.sync_ref` only when it is missing — same
+/// defensive shape as every late `blocks` column, so a file some older build
+/// (or a hand) half-upgraded converges instead of failing on a duplicate name.
+fn add_sync_ref_column(conn: &mut Connection) -> Result<(), StorageError> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'sync_ref'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Sql(e.to_string()))?;
+    if present == 0 {
+        conn.execute("ALTER TABLE blocks ADD COLUMN sync_ref INTEGER", [])
+            .map_err(|e| StorageError::Sql(format!("add sync_ref: {e}")))?;
     }
     Ok(())
 }

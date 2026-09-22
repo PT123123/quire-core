@@ -109,7 +109,7 @@ mod tests {
             columns: 0,
             lang: Lang::Plain,
             db_ref: None,
-        })
+            sync_ref: None,        })
     }
 
     fn step(apply: Vec<Change>, revert: Vec<Change>) -> Entry {

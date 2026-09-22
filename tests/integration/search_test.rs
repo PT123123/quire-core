@@ -48,7 +48,7 @@ fn block(id: u64, page_id: u64, text: &str) -> Block {
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-    }
+        sync_ref: None,    }
 }
 
 fn repo() -> Arc<SqliteRepository> {

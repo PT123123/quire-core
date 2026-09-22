@@ -25,7 +25,7 @@ fn block(id: u64, text: &str) -> Block {
         columns: 0,
         lang: Lang::Plain,
         db_ref: None,
-    }
+        sync_ref: None,    }
 }
 
 fn hit(block: u64, start: usize, end: usize) -> FindHit {

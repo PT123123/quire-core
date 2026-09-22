@@ -277,6 +277,17 @@ pub const TITLE_PROPERTY_NAME: &str = "Name";
 pub struct Database {
     pub id: DatabaseId,
     pub name: String,
+    /// The database's record template (SPEC §三十九 「操作」's 数据库模板,
+    /// ADR-0086): the prefill every new record starts from, as one JSON
+    /// document — `{"cells":{"<property id>": <value>}}` with each value in
+    /// the exact shape [`CellValue`] stores. That shape *is* the discipline
+    /// the brief states for templates on both tracks: the template is a copy
+    /// of content in the format the store already uses, and no second content
+    /// format is introduced. Empty (`""`) is "no template", which is what a
+    /// database nobody templated stores; the document is replaced whole by
+    /// `Change::DatabaseTemplateSet`, ADR-0074's read-edit-write applied at
+    /// the database level.
+    pub template: String,
 }
 
 impl Database {
@@ -284,6 +295,7 @@ impl Database {
         Database {
             id,
             name: name.into(),
+            template: String::new(),
         }
     }
 
@@ -878,6 +890,16 @@ pub struct RowRequest<'a> {
     /// or `None` for every row. `None` and "a tree that filters nothing" are
     /// the same `WHERE` — the compiler emits both as no constraint.
     pub filter: Option<&'a FilterNode>,
+    /// The view's live search needle (SPEC §三十九 「操作」's 视图内搜索,
+    /// ADR-0087), or `None` when the view is not being searched. Compiled into
+    /// the same `WHERE` as the filter — one OR of substring tests over the
+    /// request's own columns — so a searched view's count, its window and its
+    /// group headers all answer the *same* statement, and there is no second
+    /// row set anywhere. Session state on purpose (ADR-0073's rule): the needle
+    /// is a question the user is currently asking, not a rule they stored, so
+    /// it does not travel in the view's document and the export does not
+    /// carry it.
+    pub search: Option<&'a str>,
 }
 
 impl<'a> RowRequest<'a> {
@@ -889,6 +911,7 @@ impl<'a> RowRequest<'a> {
             columns,
             sorts: &[],
             filter: None,
+            search: None,
         }
     }
 }

@@ -22,10 +22,10 @@
 // projection, and never per frame; the one config parse there is happens once
 // per *column*, so a hundred rows of a select column share one answer.
 //
-// D3 drew `table`; D5 draws the six layouts after it (board, list, calendar,
-// gallery, timeline, form) and `chart` stays refused by name until D7 (SPEC's
-// order is the implementation order): `LayoutSupport::Missing` carries the
-// label the block says out loud.
+// D3 drew `table`, D5 drew the six layouts after it (board, list, calendar,
+// gallery, timeline, form) and D7 drew the eighth, `chart` — SPEC's order is
+// the implementation order, so the list is complete and the only thing left
+// for [`LayoutSupport::Missing`] is a layout a later build invents.
 
 use super::database::{
     DatabaseCatalog, DatabaseId, Property, PropertyId, PropertyKind, RowWindow, RowView, SortSpec,
@@ -60,16 +60,17 @@ pub const WIDTH_MIN: u16 = 60;
 pub const WIDTH_AUTO: u16 = 0;
 
 /// Which layouts this build draws. SPEC §三十九's 「顺序即实现顺序」:
-/// D3 delivered `table`, D5 delivers the next six (board / list / calendar
-/// / gallery / timeline / form), and `chart` stays [`LayoutSupport::Missing`]
-/// until D7 — a view whose layout this build cannot draw still **opens**:
-/// it says which view it is instead of showing a table that is not what the
-/// user asked for.
+/// D3 delivered `table`, D5 delivered the next six (board / list / calendar
+/// / gallery / timeline / form), and D7 delivers `chart` — the last of the
+/// eight, which is why [`LayoutSupport::Missing`] has no producer left. The
+/// variant stays: a *stored* layout string this build does not know folds to
+/// `table` (`ViewLayout::from_stored`), so `Missing` can only mean "a future
+/// build added a ninth layout", and the fold that keeps that honest lives on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutSupport {
-    /// D3's table, and D5's six: drawn by the block's delegate.
+    /// D3's table, D5's six, and D7's chart: drawn by the block's delegate.
     Drawn,
-    /// Recognised, named, not drawn yet (D7: chart).
+    /// Recognised, named, not drawn yet (no layout reaches it in this build).
     Missing,
 }
 
@@ -82,8 +83,8 @@ impl LayoutSupport {
             | ViewLayout::Calendar
             | ViewLayout::Gallery
             | ViewLayout::Timeline
-            | ViewLayout::Form => LayoutSupport::Drawn,
-            ViewLayout::Chart => LayoutSupport::Missing,
+            | ViewLayout::Form
+            | ViewLayout::Chart => LayoutSupport::Drawn,
         }
     }
 
@@ -1623,9 +1624,10 @@ pub fn layout_metrics(layout: ViewLayout) -> LayoutMetrics {
         ViewLayout::Timeline => TableView::TIMELINE_ROW_HEIGHT,
         ViewLayout::Board => TableView::BOARD_CARD_HEIGHT,
         ViewLayout::Gallery => TableView::GALLERY_CARD_HEIGHT,
-        // The calendar's grid and the form's fields are not windows over a
-        // placement unit at all; the numbers are here so a caller that asks
-        // gets the board's own slot rather than a zero to divide by.
+        // The calendar's grid, the form's fields and the chart's plot are not
+        // windows over a placement unit at all; the numbers are here so a
+        // caller that asks gets the table's own row rather than a zero to
+        // divide by.
         ViewLayout::Calendar | ViewLayout::Form | ViewLayout::Chart => {
             TableView::ROW_HEIGHT
         }
@@ -1671,6 +1673,14 @@ impl TableView {
     /// One form field (label + editor) and the form's action row.
     pub const FORM_FIELD_HEIGHT: f32 = 40.0;
     pub const FORM_ACTIONS_HEIGHT: f32 = 48.0;
+    /// The chart's surface below the header, and the legend strip under the
+    /// plot inside it. A constant, like the calendar's grid: the plot is
+    /// **aggregates**, not rows, so the surface does not grow with the data —
+    /// what grows with the data is the *numbers inside the shapes*, and those
+    /// are scalars SQL produced (see the chart branch's contract).
+    pub const CHART_HEIGHT: f32 = 260.0;
+    /// The label strip the three shapes draw their group labels in.
+    pub const CHART_LABEL_HEIGHT: f32 = 24.0;
 
     /// The surface below the header for the layouts that place one unit per
     /// counted item — a table row, a list row, a timeline lane, a board slot.
@@ -1718,6 +1728,13 @@ impl TableView {
     /// cannot be asked to realize a row it does not have.
     pub fn form_surface_height(fields: usize) -> f32 {
         fields as f32 * Self::FORM_FIELD_HEIGHT + Self::FORM_ACTIONS_HEIGHT
+    }
+
+    /// The chart's surface: plot plus label strip, a constant. The chart is
+    /// the second layout (after the form) whose body never grows with the
+    /// data — the red line is about row *objects*, and a chart realizes none.
+    pub fn chart_surface_height() -> f32 {
+        Self::CHART_HEIGHT
     }
 }
 
@@ -1997,5 +2014,201 @@ impl ViewDefinition {
             },
         );
     }
+
+    /// The chart shape this view draws (`"bar"` / `"line"` / `"pie"`), read
+    /// out of the view's own document — D7's one key of ADR-0064's, written
+    /// and read under the same ADR-0074 discipline as `filter`/`sorts`/`groups`
+    /// and D5's `date`/`end`: a view's *shape* is a key of its document, never
+    /// a second table. Anything the word does not name is a bar, which is the
+    /// fold every unknown setting takes (an unparsable chart still opens).
+    pub fn chart_kind(&self) -> ChartKind {
+        self.document
+            .get("chart")
+            .and_then(Json::as_str)
+            .and_then(ChartKind::try_from_str)
+            .unwrap_or(ChartKind::Bar)
+    }
+
+    /// Store the chart shape (`None` = the key's absence, which reads as bar).
+    /// Unlike `set_filter`'s "known and empty" null, absence is honest here:
+    /// bar is both the default and the value a fresh chart means, so writing
+    /// the word adds a key without adding information.
+    pub fn set_chart_kind(&mut self, kind: ChartKind) {
+        self.put("chart", Json::Text(kind.as_str().to_string()));
+    }
+}
+
+/// The three shapes a chart view draws (SPEC §三十九 「视图」: bar / line / pie,
+/// from the existing primitives — no chart library). The int is the index the
+/// switcher's three buttons send, the same rule `FilterOp`'s list follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartKind {
+    Bar,
+    Line,
+    Pie,
+}
+
+pub const CHART_KINDS: [ChartKind; 3] = [ChartKind::Bar, ChartKind::Line, ChartKind::Pie];
+
+impl ChartKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChartKind::Bar => "bar",
+            ChartKind::Line => "line",
+            ChartKind::Pie => "pie",
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<ChartKind> {
+        CHART_KINDS.iter().copied().find(|k| k.as_str() == s)
+    }
+
+    /// The index the chart body's three buttons send and `db-chart-kind`
+    /// receives — position in [`CHART_KINDS`], never a hand-picked number.
+    pub fn index(self) -> usize {
+        CHART_KINDS.iter().position(|k| *k == self).unwrap_or(0)
+    }
+
+    pub fn from_index(at: usize) -> ChartKind {
+        CHART_KINDS.get(at).copied().unwrap_or(ChartKind::Bar)
+    }
+
+    /// The button's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            ChartKind::Bar => "Bar",
+            ChartKind::Line => "Line",
+            ChartKind::Pie => "Pie",
+        }
+    }
+}
+
+// ─── D7: the chart's geometry (pure, like everything else in this file) ──────
+//
+// The chart is the third layout (after the form and the calendar's grid) whose
+// surface is a **constant** and whose data is **aggregates**: the plot is the
+// view's group list — the same handful of `(key, count)` rows one `GROUP BY`
+// over an option-bounded column produces for the board's columns and the
+// grouped table's headers — and not one object per record, ever. A chart of a
+// 10 000-row database realizes **zero rows** and draws `counts.len()` shapes;
+// the red line (「10 000 行不得全量 realize」) is met by construction, the way
+// the calendar's fold meets it.
+//
+// What is computed *here* (pure, once per refresh) and what the delegate does
+// with it:
+//
+// * **bar** — the delegate places `counts.len()` equal-width rectangles; the
+//   height of each is `frac * plot-height`, a multiply. No path needed.
+// * **line** — one polyline through the points, as a path in a fixed 100×100
+//   viewbox ([`chart_line_path`]). The `viewbox` scales it to the plot's real
+//   size, so Rust needs no pixel width and the delegate needs no arithmetic
+//   beyond placing the path and its dots (dots at the same fractions).
+// * **pie** — one filled path **per slice**, again in the 100×100 viewbox
+//   ([`chart_pie_paths`]). The arcs are cubic Béziers (the κ ≈ 0.5523
+//   approximation, one segment per ≤ 90° of arc) rather than SVG `A`
+//   commands: the numbers are machine-built here, where trig lives, and the
+//   delegate draws a string it cannot get wrong.
+//
+// The fractions come from the counts, and the counts come from SQL — nothing
+// in this section reads a row, and nothing in the delegate parses a string.
+
+/// The one polyline of a line chart, as a path in a 100×100 viewbox: point `i`
+/// sits at `x = (i + ½) · 100 / n` (centred in its slot, the way a bar is) and
+/// `y = 98 − frac · 96`, so `frac = 1.0` nearly touches the top and `0.0` the
+/// bottom, with a 2-unit margin each way. One point draws a bare move (the
+/// delegate's dot carries it); none draws nothing.
+pub fn chart_line_path(fracs: &[f64]) -> String {
+    if fracs.is_empty() {
+        return String::new();
+    }
+    let step = 100.0 / fracs.len() as f64;
+    let at = |i: usize| ((i as f64 + 0.5) * step, 98.0 - fracs[i] * 96.0);
+    let (x0, y0) = at(0);
+    let mut out = format!("M {x0:.2} {y0:.2}");
+    for i in 1..fracs.len() {
+        let (x, y) = at(i);
+        out.push_str(&format!(" L {x:.2} {y:.2}"));
+    }
+    out
+}
+
+/// The π/2 cubic-Bézier control distance (κ = 4/3 · (√2 − 1)): the constant
+/// that makes one cubic per quarter-circle the standard arc approximation.
+const ARC_KAPPA: f64 = 0.552_284_749_830_793_3;
+
+/// One pie slice as a filled path in a 100×100 viewbox: centre (50, 50),
+/// radius 47, starting at 12 o'clock and running clockwise in `fracs` order.
+/// Each slice is `M` at the centre, `L` to its arc's start, one cubic per
+/// ≤ 90° of arc, `Z` — the shape the delegate fills with the point's colour.
+///
+/// A slice with a zero fraction gets an empty string (nothing to fill; the
+/// label still draws). A **single** slice that spans the whole circle gets the
+/// special-cased full disk — four cubics and no centre line, because
+/// `M c L p … Z` of a 360° arc degenerates to nothing.
+pub fn chart_pie_paths(fracs: &[f64]) -> Vec<String> {
+    let total: f64 = fracs.iter().sum();
+    if fracs.is_empty() || total <= 0.0 {
+        return vec![String::new(); fracs.len()];
+    }
+    // A full disk: the one slice whose arc is the whole circle (a `total > 0`
+    // single-count chart — the degenerate pie is still a value, so it draws
+    // the disk rather than nothing). Four cubics of exactly 90° each, starting
+    // at the top and running clockwise.
+    if fracs.len() == 1 {
+        let rad = 47.0f64;
+        let k = ARC_KAPPA * rad;
+        let pt = |dx: f64, dy: f64| format!("{:.2} {:.2}", 50.0 + dx, 50.0 + dy);
+        return vec![format!(
+            "M {top} C {a} {b} {right} C {c} {d} {bottom} C {e} {f} {left} C {g} {h} {top} Z",
+            top = pt(0.0, -rad),
+            a = pt(k, -rad),
+            b = pt(rad, -k),
+            right = pt(rad, 0.0),
+            c = pt(rad, k),
+            d = pt(k, rad),
+            bottom = pt(0.0, rad),
+            e = pt(-k, rad),
+            f = pt(-rad, k),
+            left = pt(-rad, 0.0),
+            g = pt(-rad, -k),
+            h = pt(-k, -rad),
+        )];
+    }
+    let radius = 47.0;
+    let mut out = Vec::with_capacity(fracs.len());
+    let mut angle = -std::f64::consts::FRAC_PI_2; // 12 o'clock
+    for frac in fracs {
+        let sweep = frac / total * std::f64::consts::TAU;
+        if sweep <= f64::EPSILON {
+            out.push(String::new());
+            continue;
+        }
+        // The slice's edge, split into ≤ 90° segments so each cubic stays in
+        // the κ approximation's accuracy band.
+        let segments = ((sweep / (std::f64::consts::FRAC_PI_2)).ceil() as usize).max(1);
+        let step = sweep / segments as f64;
+        let point = |a: f64| (50.0 + radius * a.cos(), 50.0 + radius * a.sin());
+        let (sx, sy) = point(angle);
+        let mut path = format!("M 50 50 L {sx:.2} {sy:.2}");
+        let mut a = angle;
+        for _ in 0..segments {
+            let (x0, y0) = point(a);
+            let (x1, y1) = point(a + step);
+            // Control points: ±κ·r·tan(step/2) along the tangents at each end
+            // — the general form of the quarter-circle κ rule.
+            let t = ARC_KAPPA * (step / 2.0).tan() * radius;
+            let c1 = (x0 - t * a.sin(), y0 + t * a.cos());
+            let c2 = (x1 + t * (a + step).sin(), y1 - t * (a + step).cos());
+            path.push_str(&format!(
+                " C {:.2} {:.2} {:.2} {:.2} {x1:.2} {y1:.2}",
+                c1.0, c1.1, c2.0, c2.1
+            ));
+            a += step;
+        }
+        path.push_str(" Z");
+        out.push(path);
+        angle += sweep;
+    }
+    out
 }
 

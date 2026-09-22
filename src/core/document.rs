@@ -210,6 +210,11 @@ impl Document {
                         b.db_ref = *db;
                     }
                 }
+                Change::BlockSyncSet { id, source } => {
+                    if let Some(b) = self.block_mut(*id) {
+                        b.sync_ref = *source;
+                    }
+                }
                 Change::BlockAttachmentSet { id, attachment } => {
                     if let Some(b) = self.block_mut(*id) {
                         b.attachment = *attachment;
@@ -277,7 +282,7 @@ mod tests {
             columns: 0,
             lang: Lang::Plain,
             db_ref: None,
-        }
+            sync_ref: None,        }
     }
 
     use super::super::types::ColorKind;

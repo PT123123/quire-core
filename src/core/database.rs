@@ -374,8 +374,12 @@ pub enum PropertyKind {
     Formula,
     /// Computed, never stored (ADR-0062).
     Rollup,
-    /// Computed, never stored (ADR-0062) — and, per §三十九's 排期前提, a
-    /// pointer either at §四十's page mentions (Track 2) or at nothing.
+    /// The ids of the records this one points at (ADR-0088). **Stored**: what
+    /// the user picked is a fact, not a derivation, so it lives in
+    /// `db_value_items` like the other two list kinds and is the one of §三十九's
+    /// 「需计算」 three that `is_computed` does not answer for. Its `config`
+    /// carries the target database and, when it is two-way, the back-pointer
+    /// column (`core::database_relation`).
     Relation,
 }
 
@@ -441,8 +445,17 @@ impl PropertyKind {
 
     /// Whether this kind's value is a list, and therefore lives in
     /// `db_value_items` (ADR-0062) instead of in the three typed columns.
+    ///
+    /// `relation` is the third user of the list mechanism (ADR-0088): the ids a
+    /// user picked are a list — their order is the display order, and "is this
+    /// record related to that one" is the same index probe a filter makes on a
+    /// multi-select — so ADR-0084's candidate is the shape that landed, and no
+    /// new storage was needed for the feature.
     pub fn is_list(self) -> bool {
-        matches!(self, PropertyKind::MultiSelect | PropertyKind::Files)
+        matches!(
+            self,
+            PropertyKind::MultiSelect | PropertyKind::Files | PropertyKind::Relation
+        )
     }
 
     /// The one kind a database has exactly one of, at `ord = 0` (ADR-0061) —
@@ -453,14 +466,19 @@ impl PropertyKind {
     }
 
     /// Whether this kind stores nothing at all and is computed for the window
-    /// at projection time — `formula` / `rollup` / `relation` (ADR-0062). These
-    /// are the kinds this build has no engine for yet, so a cell of one of them
-    /// paints nothing.
+    /// at projection time — `formula` / `rollup` (ADR-0062). These are the
+    /// kinds whose cell a projection writes and no path stores.
+    ///
+    /// `relation` **left this set** when it was built (ADR-0088). ADR-0062 had
+    /// grouped it here on the prediction that a relation would be derived; it
+    /// turned out to be a *stored fact* — what the user picked — so it moved to
+    /// the list shape instead, which is the one thing ADR-0062's own note
+    /// allowed for ("relation 不存值" was about rollup-style computation, not
+    /// about the picked ids). A kind that stores nothing and a kind that stores
+    /// a list are two different questions, and `parse_one` is the caller that
+    /// has to be able to tell them apart.
     pub fn is_computed(self) -> bool {
-        matches!(
-            self,
-            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation
-        )
+        matches!(self, PropertyKind::Formula | PropertyKind::Rollup)
     }
 
     /// Whether this kind's value is derived from something the store already
@@ -516,10 +534,10 @@ impl PropertyKind {
         match self {
             PropertyKind::Number => ValueKind::Number,
             PropertyKind::Checkbox => ValueKind::Flag,
-            PropertyKind::MultiSelect | PropertyKind::Files => ValueKind::Items,
-            PropertyKind::Formula | PropertyKind::Rollup | PropertyKind::Relation => {
-                ValueKind::Computed
+            PropertyKind::MultiSelect | PropertyKind::Files | PropertyKind::Relation => {
+                ValueKind::Items
             }
+            PropertyKind::Formula | PropertyKind::Rollup => ValueKind::Computed,
             PropertyKind::CreatedTime | PropertyKind::LastEditedTime => ValueKind::Derived,
             _ => ValueKind::Text,
         }
@@ -1067,19 +1085,20 @@ mod tests {
     fn each_kind_names_the_column_or_table_its_value_lives_in() {
         assert_eq!(PropertyKind::Number.value_kind(), ValueKind::Number);
         assert_eq!(PropertyKind::Checkbox.value_kind(), ValueKind::Flag);
-        for kind in [PropertyKind::MultiSelect, PropertyKind::Files] {
+        for kind in [PropertyKind::MultiSelect, PropertyKind::Files, PropertyKind::Relation] {
             assert_eq!(kind.value_kind(), ValueKind::Items);
             assert!(kind.is_list());
         }
-        for kind in [
-            PropertyKind::Formula,
-            PropertyKind::Rollup,
-            PropertyKind::Relation,
-        ] {
+        for kind in [PropertyKind::Formula, PropertyKind::Rollup] {
             assert_eq!(kind.value_kind(), ValueKind::Computed);
             assert!(kind.is_computed());
             assert!(!kind.is_derived(), "computed and derived are two answers");
         }
+        // The one of §三十九's 「需计算」 three that is *not* computed (ADR-0088):
+        // a relation is a stored list of target ids, so a build that asked
+        // `is_computed` to mean "nothing is stored" must not be handed it.
+        assert!(!PropertyKind::Relation.is_computed());
+        assert_eq!(PropertyKind::Relation.value_kind(), ValueKind::Items);
         // D2's landing of §三十九's last two kinds (ADR-0068): they store no
         // cell either, and D1's placeholder ("a derived kind is text until D2
         // says otherwise") is exactly what this assertion replaces.

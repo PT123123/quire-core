@@ -203,8 +203,11 @@ pub fn val_of(kind: PropertyKind, value: &CellValue) -> Val {
             PropertyKind::Date | PropertyKind::CreatedTime | PropertyKind::LastEditedTime,
             CellValue::Text(iso),
         ) => Val::Date(iso.clone()),
-        (PropertyKind::Select | PropertyKind::Status | PropertyKind::MultiSelect
-            | PropertyKind::Files, _) => Val::Empty,
+        (PropertyKind::Select
+        | PropertyKind::Status
+        | PropertyKind::MultiSelect
+        | PropertyKind::Relation
+        | PropertyKind::Files, _) => Val::Empty,
         (_, CellValue::Text(text)) => Val::Str(text.clone()),
         // A kind that stores one shape and holds another is a mismatch the
         // write path's own parse rules should have prevented (ADR-0069); the
@@ -262,7 +265,7 @@ impl std::fmt::Display for FormulaError {
 /// rules (numeric for numbers, bytes for text and dates, same-type on both
 /// sides).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cmp {
+pub(crate) enum Cmp {
     Eq,
     Ne,
     Lt,
@@ -299,7 +302,7 @@ enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArithOp {
+pub(crate) enum ArithOp {
     Add,
     Sub,
     Mul,
@@ -307,7 +310,7 @@ enum ArithOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtremeOp {
+pub(crate) enum ExtremeOp {
     Min,
     Max,
 }
@@ -567,7 +570,7 @@ impl Program {
 /// `+ - * /` under the module header's table. `Empty` never reaches here (the
 /// caller short-circuits), and a zero divisor is an error rather than an
 /// infinity: a cell must paint a number or an `Error`, never `inf`.
-fn arith(op: ArithOp, left: Val, right: Val) -> Result<Val, FormulaError> {
+pub(crate) fn arith(op: ArithOp, left: Val, right: Val) -> Result<Val, FormulaError> {
     match (op, &left, &right) {
         (ArithOp::Add, Val::Str(a), Val::Str(b)) => {
             let mut joined = String::with_capacity(a.len() + b.len());
@@ -635,7 +638,7 @@ fn compare(op: Cmp, left: &Val, right: &Val) -> Result<Val, FormulaError> {
 }
 
 /// `min` / `max` over one type family: all numbers, or all text/date by bytes.
-fn extreme(op: ExtremeOp, left: &Val, right: &Val) -> Result<Val, FormulaError> {
+pub(crate) fn extreme(op: ExtremeOp, left: &Val, right: &Val) -> Result<Val, FormulaError> {
     let keep_left = match (left, right) {
         (Val::Num(a), Val::Num(b)) => match op {
             ExtremeOp::Min => a <= b,
@@ -672,7 +675,7 @@ fn extreme(op: ExtremeOp, left: &Val, right: &Val) -> Result<Val, FormulaError> 
 }
 
 impl ArithOp {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             ArithOp::Add => "+",
             ArithOp::Sub => "-",
@@ -683,7 +686,7 @@ impl ArithOp {
 }
 
 impl ExtremeOp {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             ExtremeOp::Min => "min",
             ExtremeOp::Max => "max",
@@ -693,7 +696,7 @@ impl ExtremeOp {
 
 impl Val {
     /// How an error message names this value's type.
-    fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Val::Empty => "an empty value",
             Val::Num(_) => "a number",

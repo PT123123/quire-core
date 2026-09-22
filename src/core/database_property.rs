@@ -360,7 +360,7 @@ fn plain_number(num: f64) -> String {
 /// | checkbox | yes/no/on/off/true/false/x/unchecked | anything else |
 /// | url / email / phone | **anything, verbatim** | nothing |
 /// | select / status | a name the column has an option for | a name it does not |
-/// | multi-select / files | [`parse_many`] | — |
+/// | multi-select / files / relation | [`parse_many`] | — |
 /// | computed / derived | nothing: these columns store no cell | every write |
 pub fn parse_one(kind: PropertyKind, config: &str, input: &str) -> Result<CellValue, InputError> {
     // The columns that store nothing refuse before anything else: "clear it"
@@ -431,17 +431,18 @@ pub fn parse_one(kind: PropertyKind, config: &str, input: &str) -> Result<CellVa
                 ))),
             }
         }
-        PropertyKind::MultiSelect | PropertyKind::Files => Err(refused(format!(
-            "{} takes a list, not one value",
-            kind.as_str()
-        ))),
+        PropertyKind::MultiSelect | PropertyKind::Files | PropertyKind::Relation => {
+            Err(refused(format!(
+                "{} takes a list, not one value",
+                kind.as_str()
+            )))
+        }
         // Handled above, and listed so that adding a kind cannot slip past this
         // match without a decision.
         PropertyKind::CreatedTime
         | PropertyKind::LastEditedTime
         | PropertyKind::Formula
-        | PropertyKind::Rollup
-        | PropertyKind::Relation => Err(refused(format!(
+        | PropertyKind::Rollup => Err(refused(format!(
             "{} stores no cell (ADR-0039: it is derived)",
             kind.as_str()
         ))),
@@ -495,6 +496,27 @@ pub fn parse_many(
                     .unwrap_or(false);
                 if !canonical {
                     return Err(refused(format!("\"{text}\" is not an attachment id")));
+                }
+                ids.push(text.to_string());
+            }
+            Ok(CellValue::Items(ids))
+        }
+        // A relation's list is **record ids**, in the same canonical-digits
+        // shape a files cell's attachment ids take (ADR-0088): the id a cell
+        // stores is the id the record has, spelled the one way `to_string`
+        // spells it. That is what makes the painted fallback for a dead target
+        // a number a reader can compare against a row, rather than a string a
+        // writer could have spelled two ways.
+        PropertyKind::Relation => {
+            let mut ids = Vec::with_capacity(inputs.len());
+            for id in inputs {
+                let text = id.trim();
+                let canonical = text
+                    .parse::<u64>()
+                    .map(|id| id > 0 && id.to_string() == text)
+                    .unwrap_or(false);
+                if !canonical {
+                    return Err(refused(format!("\"{text}\" is not a record id")));
                 }
                 ids.push(text.to_string());
             }
@@ -669,6 +691,15 @@ pub fn paint(
         (PropertyKind::Number, CellValue::Number(num)) => {
             NumberFormat::from_config(config).paint(*num)
         }
+        // A relation cell holds *ids*, and an id is not a name. Turning them
+        // into the live titles is the projection's job
+        // (`core::database_relation::paint_targets`, which needs a store this
+        // function deliberately has none of), and in practice the projection
+        // has already run by the time a cell is drawn. This arm is what a
+        // caller reading `RowView` directly sees, and the ids are more honest
+        // than a blank: a blank would read as "this row relates to nothing",
+        // which is a different fact from "these are the targets, unnamed".
+        (PropertyKind::Relation, CellValue::Items(ids)) => ids.join(", "),
         (
             PropertyKind::Date | PropertyKind::CreatedTime | PropertyKind::LastEditedTime,
             CellValue::Text(stored),
@@ -1606,13 +1637,39 @@ mod tests {
             PropertyKind::LastEditedTime,
             PropertyKind::Formula,
             PropertyKind::Rollup,
-            PropertyKind::Relation,
         ] {
             let err = parse_one(kind, "", "anything").unwrap_err();
             assert!(err.message().contains(kind.as_str()), "{kind:?} said {err}");
             // "Clear it" is not a write either: the derivation would put it
             // straight back, and a row nothing reads is a row that lies.
             assert!(parse_one(kind, "", "").is_err(), "{kind:?}");
+        }
+    }
+
+    /// A relation is the one kind that moved out of the group above (ADR-0088):
+    /// it stores a *list* of target ids, so it refuses one value the way the
+    /// other two list kinds do — and an empty list is `Empty`, which is a
+    /// legitimate "nothing is related", not a refused write.
+    #[test]
+    fn a_relation_takes_a_list_of_record_ids_and_an_empty_list_is_no_value() {
+        assert_eq!(
+            parse_many(PropertyKind::Relation, "", &[]).unwrap(),
+            CellValue::Empty
+        );
+        assert_eq!(
+            parse_many(PropertyKind::Relation, "", &["12".into(), "13".into()]).unwrap(),
+            CellValue::Items(vec!["12".into(), "13".into()])
+        );
+        // The one door, each way round.
+        assert!(parse_one(PropertyKind::Relation, "", "12").is_err());
+        assert!(parse_many(PropertyKind::Relation, "", &["12".into()]).is_ok());
+        // Canonical digits only, exactly as a files cell demands of an
+        // attachment id: the stored string is the id's one spelling.
+        for bad in ["", " ", "007", "+3", "-1", "0", "twelve", "1.0"] {
+            assert!(
+                parse_many(PropertyKind::Relation, "", &[bad.to_string()]).is_err(),
+                "{bad:?} was accepted as a record id"
+            );
         }
     }
 

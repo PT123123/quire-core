@@ -10,3 +10,4 @@ pub mod logging;
 pub mod persistence;
 pub mod search_service;
 pub mod settings_store;
+pub mod sync;

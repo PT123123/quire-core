@@ -222,6 +222,42 @@ impl SqliteRepository {
         .map_err(sql)
     }
 
+    /// **Every** record row one database holds, in listing order — the whole
+    /// table, not a window. Deliberately not the shape a view reads (ADR-0067
+    /// keeps records out of memory and a window is how one row is painted):
+    /// this exists for the callers that must carry the *store* somewhere else
+    /// whole — the sync snapshot today — and it is one query, not a point read
+    /// per row.
+    ///
+    /// Order is the database's own listing order (`ord, id`, the tie-break
+    /// every window uses), so a caller that writes these rows back in order
+    /// reproduces the listing without a second sort.
+    pub fn records_of(&self, db: DatabaseId) -> Result<Vec<Record>, StorageError> {
+        let conn = self.database().conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, page, ord FROM db_records
+                  WHERE db = ?1
+                  ORDER BY ord, id",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![id(db.as_u64())], |r| {
+                Ok(Record {
+                    id: RecordId(r.get::<_, i64>(0)? as u64),
+                    db,
+                    page: r.get::<_, Option<i64>>(1)?.map(|p| PageId(p as u64)),
+                    ord: OrderKey(ord_from_db(r.get::<_, i64>(2)?)),
+                })
+            })
+            .map_err(sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql)?);
+        }
+        Ok(out)
+    }
+
     /// How many rows the database has — the number the window is computed from,
     /// and the only thing a 10 000-row database costs before anyone scrolls.
     /// (D4's filters narrow this; the count and the window stay the same pair.)

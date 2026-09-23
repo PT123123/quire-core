@@ -17,6 +17,10 @@ description = "Quire's document and database model, the SQLite store behind it, 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The sync snapshot's wire format (services::sync). Pure Rust, no system deps:
+# the Android `.so` links both without a TLS/OpenSSL story.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Integration tests, one target each, keeping the names `cargo test --test …`
 # has used since the app's M3.

@@ -2212,6 +2212,20 @@ mod database_layer {
         ];
         let req = RowRequest::new(db.id, PropertyId(1), &columns);
         assert_eq!(reopened.record_count(db.id).unwrap(), 3);
+        // The whole-table read `services::sync` carries a database with: every
+        // row, in the listing order every window uses, in one query.
+        let all = reopened.records_of(db.id).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.id).collect::<Vec<_>>(),
+            records.to_vec(),
+            "every row, in listing order"
+        );
+        assert_eq!(
+            all.iter().filter(|r| r.page.is_some()).count(),
+            1,
+            "the page pointer travels with the row"
+        );
+        assert!(reopened.records_of(DatabaseId(99)).unwrap().is_empty());
         let rows = reopened.window_rows(&req, RowWindow { start: 0, end: 3 }).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].title, "Bare row");

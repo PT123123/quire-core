@@ -27,6 +27,10 @@ pub mod highlight;
 pub mod history;
 pub mod icon;
 pub mod math;
+// SPEC §四十一's second top-level area: notes and tasks, entities of their own
+// rather than blocks of a document — three tables, a change each, and no page
+// anywhere behind them.
+pub mod organizer;
 pub mod persistence;
 pub mod reference;
 pub mod template;

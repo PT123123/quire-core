@@ -13,6 +13,7 @@ use super::database::{
     CellValue, Database, DatabaseId, Property, PropertyId, PropertyKind, Record, RecordId, View,
     ViewId, ViewLayout,
 };
+use super::organizer::{ListId, Note, NoteId, Task, TaskId, TaskList};
 use super::types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, OrderKey, Page,
     PageFont, PageId, PersistedState,
@@ -236,6 +237,43 @@ pub enum Change {
     /// is the ordinary `CellSet` write, so nothing on the write path learns a
     /// new shape.
     DatabaseTemplateSet { id: DatabaseId, template: String },
+
+    // ─── SPEC §四十一 Notes & tasks (the organizer) ──────────────────────────
+    //
+    // Nine changes, **one per row**, and deliberately not one per field. The
+    // database layer above is field-level because it has to read and write
+    // single cells of a table SQLite windows over; the organizer is neither —
+    // its catalog is loaded whole, its merge compares *rows* (`PartialEq` on
+    // `Note` / `Task` / `TaskList`), and a snapshot therefore already rewrites a
+    // whole row for one edited field. Row-level changes make the four things
+    // that have to agree — the change stream, the store, the merge and the undo
+    // step — describe one event instead of four.
+    //
+    // Appended at the end of the enum like every section before them: a
+    // variant's position is nothing, its spelling is everything.
+    /// A new note (SPEC §四十一). `created` and `edited` travel inside the row:
+    /// this module has no clock, and the app that edits is the app that stamps.
+    NoteAdded(Note),
+    /// The note as it now stands. The whole row, so storage rewrites every
+    /// column and the merge has one thing to compare.
+    NoteUpdated(Note),
+    /// Storage deletes the note. `require_hit` applies: the app holds the whole
+    /// catalog, so a note that is not there is a desynchronized session rather
+    /// than a race.
+    NoteDeleted { id: NoteId },
+
+    TaskListAdded(TaskList),
+    TaskListUpdated(TaskList),
+    /// Storage deletes the list **and nothing else**. A list's tasks are not
+    /// cascaded away: the command that deletes one plans a `TaskUpdated` per
+    /// task moving into the inbox in the same batch, because "delete my list"
+    /// must not be a way to lose tasks, and an SQL cascade would decide that
+    /// question in the store instead of in an undoable step.
+    TaskListDeleted { id: ListId },
+
+    TaskAdded(Task),
+    TaskUpdated(Task),
+    TaskDeleted { id: TaskId },
 }
 
 /// Every attachment id a change list points at, read off the arm that carries

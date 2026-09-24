@@ -18,6 +18,7 @@ use super::backup::{self, OpenReport};
 use super::data_location;
 use super::database::{ord_from_db, ord_to_db, Database};
 use super::database_store;
+use super::organizer_store;
 use super::search_index::{self, Match, SearchRequest};
 
 pub struct SqliteRepository {
@@ -1088,5 +1089,25 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
         Change::DatabaseTemplateSet { id, template } => {
             database_store::set_database_template(tx, *id, template)
         }
+
+        // ─── SPEC §四十一 Notes & tasks (the organizer) ──────────────────────
+        // The SQL lives in `organizer_store`, one statement per arm, and the
+        // match stays here exhaustive: a new variant is a compile error and
+        // never a silently dropped write.
+        //
+        // Every `set_*` writes the whole row and insists the row was there
+        // (`require_hit`), unlike `AttachmentAdded`'s `INSERT OR REPLACE`: an
+        // attachment is replayed for the *same* id by an undone paste, while a
+        // note's add and its later updates are distinct changes, so an update
+        // that finds no row is a desynchronized session rather than a replay.
+        Change::NoteAdded(note) => organizer_store::insert_note(tx, note),
+        Change::NoteUpdated(note) => organizer_store::set_note(tx, note),
+        Change::NoteDeleted { id } => organizer_store::delete_note(tx, *id),
+        Change::TaskListAdded(list) => organizer_store::insert_task_list(tx, list),
+        Change::TaskListUpdated(list) => organizer_store::set_task_list(tx, list),
+        Change::TaskListDeleted { id } => organizer_store::delete_task_list(tx, *id),
+        Change::TaskAdded(task) => organizer_store::insert_task(tx, task),
+        Change::TaskUpdated(task) => organizer_store::set_task(tx, task),
+        Change::TaskDeleted { id } => organizer_store::delete_task(tx, *id),
     }
 }

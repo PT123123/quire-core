@@ -23,7 +23,13 @@ use crate::core::StorageError;
 /// column is a no-op instead of a duplicate-column error. The database steps
 /// are plain `CREATE TABLE`s and could not have taken that move. Track 1's
 /// original numbering survives in ADR-0046 and the SPEC prose, not here.
-pub const CURRENT_VERSION: i32 = 23;
+///
+/// Steps 24–26 are SPEC §四十一's (the organizer: notes, task lists, tasks) —
+/// the first three steps since v15 that a *new* area of the app needs, and
+/// plain `CREATE TABLE`s of their own for the reason v12 gives: one step per
+/// semantic unit, because a migration is the one thing here that cannot be
+/// undone, and a half-applied upgrade has to stay readable.
+pub const CURRENT_VERSION: i32 = 26;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -498,6 +504,101 @@ CREATE INDEX IF NOT EXISTS idx_blocks_page_ref ON blocks(page_ref);
     // by hand, when the app already has one pipeline that does all three.
     sql: "",
     backfill: Some(add_page_template_column),
+}, Migration {
+    version: 24,
+    label: "notes",
+    // SPEC §四十一 「笔记」: one row per note. `body` is plain text with its
+    // newlines kept — v1 renders no Markdown, so nothing here is a second
+    // content format. `tags` is one JSON array of strings, denormalized into the
+    // row that owns it (see `core::organizer`): a tag has no identity anyone
+    // references and is never the subject of a query, so a table of its own
+    // would buy a join nobody runs.
+    //
+    // `created` and `edited` are unix seconds written by the app layer — the
+    // store has no clock in this path (contrast `db_records.created`, where SQL's
+    // `strftime` stamps a record because the *row's own write* is the event
+    // ADR-0068 is about; here the instant travels in the `Change`, so that undo
+    // and sync reproduce the same row).
+    sql: r#"
+CREATE TABLE IF NOT EXISTS notes (
+    id      INTEGER PRIMARY KEY,
+    title   TEXT NOT NULL DEFAULT '',
+    body    TEXT NOT NULL DEFAULT '',
+    pinned  INTEGER NOT NULL DEFAULT 0,
+    tags    TEXT NOT NULL DEFAULT '',
+    created INTEGER NOT NULL,
+    edited  INTEGER NOT NULL
+);
+"#,
+    backfill: None,
+}, Migration {
+    version: 25,
+    label: "task lists",
+    // SPEC §四十一 「任务」's 清单, one row per list — and **no row for the inbox**:
+    // `ListId(0)` is a sentinel meaning "in no list", so `tasks.list = 0` needs
+    // neither a foreign key nor a guaranteed row (see `ListId::INBOX`). `color`
+    // holds a `ColorKind` spelling, the closed palette the document editor
+    // already stores, and `ord` is the chip order, an app invariant like every
+    // other `ord` in this file.
+    //
+    // No index: a user has a handful of lists, and the catalog is loaded whole,
+    // so there is no query to make one worth a B-tree every write pays for.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS task_lists (
+    id    INTEGER PRIMARY KEY,
+    name  TEXT NOT NULL DEFAULT '',
+    color TEXT NOT NULL DEFAULT '',
+    ord   INTEGER NOT NULL
+);
+"#,
+    backfill: None,
+}, Migration {
+    version: 26,
+    label: "tasks",
+    // SPEC §四十一 「任务」: one row per task. Two columns are JSON on purpose —
+    // `tags` (an array of strings) and `subtasks` (an array of
+    // `{id,title,done}`) — because both are read and written only with the row
+    // that owns them and neither is ever queried on its own; see
+    // `core::organizer` for the full argument and `storage::organizer_store` for
+    // the one place the two shapes meet.
+    //
+    // `list` carries **no foreign key**: `0` is the inbox sentinel and not a row,
+    // and deleting a list moves its tasks into the inbox by an ordinary
+    // `TaskUpdated` planned in the same batch rather than by a cascade — a
+    // cascade would decide "what happens to the tasks" in SQLite, where no undo
+    // can reach it.
+    //
+    // `due` is a nullable `YYYY-MM-DD` string (`core::date`'s one format) and
+    // not a timestamp: "due Friday" is what the user meant, and fixed-width ISO
+    // bytes sort chronologically, so no calendar is needed in Rust to order it.
+    //
+    // The three indexes are the three questions the app asks in SQL at all:
+    // "this list, in reading order", "the finished ones", "the ones with a
+    // deadline". Everything else the organizer shows — inbox, today, this week —
+    // is derived in memory from the catalog the load already carries.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY,
+    list         INTEGER NOT NULL DEFAULT 0,
+    title        TEXT NOT NULL DEFAULT '',
+    notes        TEXT NOT NULL DEFAULT '',
+    priority     TEXT NOT NULL DEFAULT 'none',
+    due          TEXT,
+    repeat       TEXT NOT NULL DEFAULT 'none',
+    done         INTEGER NOT NULL DEFAULT 0,
+    completed_at INTEGER,
+    tags         TEXT NOT NULL DEFAULT '',
+    subtasks     TEXT NOT NULL DEFAULT '',
+    created      INTEGER NOT NULL,
+    edited       INTEGER NOT NULL,
+    ord          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_list_ord ON tasks(list, ord);
+CREATE INDEX IF NOT EXISTS idx_tasks_done     ON tasks(done);
+CREATE INDEX IF NOT EXISTS idx_tasks_due      ON tasks(due);
+"#,
+    backfill: None,
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -822,7 +923,7 @@ pub fn ensure_current(conn: &mut Connection) -> Result<(), StorageError> {
 
 /// True when every table the current schema needs is present.
 pub fn check_schema(conn: &Connection) -> Result<(), StorageError> {
-    const TABLES: [&str; 15] = [
+    const TABLES: [&str; 18] = [
         "workspaces",
         "pages",
         "blocks",
@@ -840,6 +941,11 @@ pub fn check_schema(conn: &Connection) -> Result<(), StorageError> {
         "db_values",
         "db_value_items",
         "db_views",
+        // SPEC §四十一 (v24–v26), the organizer's three tables — the second
+        // area of the app to own rows of its own.
+        "notes",
+        "task_lists",
+        "tasks",
     ];
     for table in TABLES {
         let found: Option<String> = conn

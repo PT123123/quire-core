@@ -19,6 +19,11 @@ pub mod database_query;
 /// so this slice adds a file instead of editing one.
 pub mod database_store;
 pub mod migrations;
+/// The organizer's SQL (SPEC §四十一): `notes`, `task_lists`, `tasks` and the
+/// whole-catalog read. A module of its own and not arms inside `database_store`,
+/// which owns §三十九's tables only — the same one-file-per-area split the two
+/// stores already keep between themselves and `repository`.
+pub mod organizer_store;
 pub mod repository;
 pub mod search_index;
 pub mod versions;

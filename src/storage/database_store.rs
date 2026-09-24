@@ -950,8 +950,9 @@ impl SqliteRepository {
         })
     }
 
-    /// The highest id in one of the six database tables, or 0 for an empty one —
-    /// what the app's per-session id watermark is seeded from (ADR-0072).
+    /// The highest id in one of the id-allocating tables (nine of them: §三十九's
+    /// six and §四十一's three), or 0 for an empty one — what the app's
+    /// per-session id watermark is seeded from (ADR-0072).
     ///
     /// One question, asked once per table at startup, and a `MAX` over an
     /// integer primary key is the B-tree's own rightmost leaf: it reads no rows.
@@ -1069,16 +1070,23 @@ impl SqliteRepository {
     }
 }
 
-/// Which of the six tables an id is being asked about (ADR-0072's watermark).
+/// Which of the nine tables an id is being asked about (ADR-0072's watermark).
 /// An enum and not a `&str`, because the name is formatted into a statement and
-/// the *only* strings that may reach it are the six spelled here — a caller
+/// the *only* strings that may reach it are the nine spelled here — a caller
 /// cannot pass `db_records; DROP TABLE pages` if it cannot pass a string.
+///
+/// The three organizer tables joined the six database ones when SPEC §四十一
+/// landed: the app seeds one watermark per table it allocates ids for, and the
+/// question `max_id` answers is the same question whatever the table holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbTable {
     Databases,
     Properties,
     Records,
     Views,
+    Notes,
+    Tasks,
+    TaskLists,
 }
 
 impl DbTable {
@@ -1090,6 +1098,9 @@ impl DbTable {
             DbTable::Properties => "db_properties",
             DbTable::Records => "db_records",
             DbTable::Views => "db_views",
+            DbTable::Notes => "notes",
+            DbTable::Tasks => "tasks",
+            DbTable::TaskLists => "task_lists",
         }
     }
 }

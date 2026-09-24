@@ -10,6 +10,7 @@ use super::database::{
 };
 use super::document::{Document, Entry};
 use super::history::History;
+use super::organizer::{ListId, Note, NoteId, Task, TaskId, TaskList};
 use super::persistence::Change;
 use super::types::{
     Attachment, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey, Page,
@@ -407,6 +408,57 @@ pub enum Command {
         property: PropertyId,
         from: PropertyKind,
         to: PropertyKind,
+    },
+
+    // ─── SPEC §四十一 Notes & tasks (the organizer) ──────────────────────────
+    //
+    // Two properties hold for all nine, and they are what makes these commands
+    // different from every §三十九 one above:
+    //
+    // * **The plan does not look at the document.** §三十九's arms still name the
+    //   `Database` block they write through — `db_ref` is the one fact `plan`
+    //   can read there. These name no block and no page at all: the organizer's
+    //   catalog lives in the app, so every row travels *in* the command,
+    //   including the `before` a revert needs. `Command::InsertImage` set the
+    //   precedent for the same reason (it carries the attachment id).
+    // * **Rows, not fields.** One command is one row write, which is one
+    //   `Change` and one Ctrl+Z — a task's priority, its subtasks and its due
+    //   date are not three undo steps, because the merge and the store compare
+    //   whole rows anyway.
+    /// A new note. The id, both instants and the body all ride in the row:
+    /// nothing here is allocated or stamped by the plan, which has no clock and
+    /// no `notes` table (the app holds the watermark, ADR-0072's rule).
+    CreateNote { note: Note },
+    /// The row as it stood and as it now stands. The `id` travels beside them
+    /// and must agree with both: the two could disagree only in a caller that
+    /// built the command by hand, and the write it would produce — a row stored
+    /// under an id the revert does not name — is the half-state
+    /// `AddDatabaseProperty` refuses for the same reason.
+    UpdateNote { id: NoteId, before: Note, after: Note },
+    /// The **whole** note, not its id: the undo has to write the title, the
+    /// body and the pin back, and a revert built from the id alone would invent
+    /// them. The shape `DeleteDatabaseRecord` takes, one entity over.
+    DeleteNote { note: Note },
+    CreateTask { task: Task },
+    UpdateTask { id: TaskId, before: Task, after: Task },
+    DeleteTask { task: Task },
+    CreateTaskList { list: TaskList },
+    UpdateTaskList { id: ListId, before: TaskList, after: TaskList },
+    /// Delete a list — and the tasks it held, which move into the inbox in the
+    /// **same batch**. `moved` is one `(before, after)` pair per task whose
+    /// `list` changes to [`ListId::INBOX`], resolved by the caller (it holds the
+    /// catalog; `plan` holds no list of tasks).
+    ///
+    /// A separate command rather than a plain `DeleteTaskList { list }` plus a
+    /// loop of `UpdateTask`s in `exec_all`, because the two halves of "the list
+    /// is gone and its tasks are in the inbox" have to be one undo step: an undo
+    /// that restored the list's name and colour but left its tasks in the inbox
+    /// would be a list the user still has to refill by hand, which is the
+    /// outcome a delete-with-undo exists to prevent. This is `DeleteDatabaseRecord`'s
+    /// shape (values + record + page, one entry) applied to the organizer.
+    DeleteTaskList {
+        list: TaskList,
+        moved: Vec<(Task, Task)>,
     },
 }
 
@@ -2291,6 +2343,121 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             revert.reverse();
             Some(Entry { apply, revert })
         }
+
+        // ─── SPEC §四十一 Notes & tasks (the organizer) ──────────────────────
+        //
+        // `plan`'s short form: no document consulted, no page, no id allocated.
+        // The caller owns the catalog and hands over the rows, so each arm is
+        // "name the row forward, name its inverse back" and nothing else.
+        //
+        // Two rules are shared by the nine arms and stated once here. A row
+        // written with the value it already has is **not an undo step** — the
+        // rule `SetDatabaseCell` states, which matters here because every field
+        // of a task commits on blur (so a click into a title and out of it again
+        // is a real, frequent no-op). And an update whose two rows do not name
+        // the id the command names is refused rather than written: the two ids
+        // travel separately and could disagree, exactly as `AddDatabaseProperty`
+        // says of a property aimed at another database.
+        Command::CreateNote { note } => {
+            let id = note.id;
+            Some(Entry {
+                apply: vec![Change::NoteAdded(note)],
+                revert: vec![Change::NoteDeleted { id }],
+            })
+        }
+
+        Command::UpdateNote { id, before, after } => {
+            if before == after || before.id != id || after.id != id {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::NoteUpdated(after)],
+                revert: vec![Change::NoteUpdated(before)],
+            })
+        }
+
+        Command::DeleteNote { note } => {
+            let id = note.id;
+            Some(Entry {
+                apply: vec![Change::NoteDeleted { id }],
+                revert: vec![Change::NoteAdded(note)],
+            })
+        }
+
+        Command::CreateTask { task } => {
+            let id = task.id;
+            Some(Entry {
+                apply: vec![Change::TaskAdded(task)],
+                revert: vec![Change::TaskDeleted { id }],
+            })
+        }
+
+        Command::UpdateTask { id, before, after } => {
+            if before == after || before.id != id || after.id != id {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::TaskUpdated(after)],
+                revert: vec![Change::TaskUpdated(before)],
+            })
+        }
+
+        Command::DeleteTask { task } => {
+            let id = task.id;
+            Some(Entry {
+                apply: vec![Change::TaskDeleted { id }],
+                revert: vec![Change::TaskAdded(task)],
+            })
+        }
+
+        Command::CreateTaskList { list } => {
+            // Row 0 is the inbox sentinel, and a *row* at that id is what would
+            // turn the inbox into a list somebody could rename and delete — the
+            // one write that breaks `tasks_in(ListId::INBOX)` for every task.
+            if list.id.is_inbox() {
+                return None;
+            }
+            let id = list.id;
+            Some(Entry {
+                apply: vec![Change::TaskListAdded(list)],
+                revert: vec![Change::TaskListDeleted { id }],
+            })
+        }
+
+        Command::UpdateTaskList { id, before, after } => {
+            if before == after || before.id != id || after.id != id {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::TaskListUpdated(after)],
+                revert: vec![Change::TaskListUpdated(before)],
+            })
+        }
+
+        Command::DeleteTaskList { list, moved } => {
+            if list.id.is_inbox() {
+                return None; // the inbox has no row to delete, only a meaning
+            }
+            let id = list.id;
+            // The tasks move first and the list dies last, so no instant of the
+            // batch shows a task in a list that is already gone; the revert is
+            // the mirror image, the list coming back before the tasks name it.
+            // Not a cascade in storage, on purpose: a task must never be lost to
+            // "I deleted my list", and a cascade could not be undone without the
+            // rows it dropped (see `Change::TaskListDeleted`).
+            let mut apply: Vec<Change> = moved
+                .iter()
+                .map(|(_, after)| Change::TaskUpdated(after.clone()))
+                .collect();
+            apply.push(Change::TaskListDeleted { id });
+            let mut revert: Vec<Change> = vec![Change::TaskListAdded(list)];
+            revert.extend(
+                moved
+                    .iter()
+                    .map(|(before, _)| Change::TaskUpdated(before.clone())),
+            );
+            Some(Entry { apply, revert })
+        }
     }
 }
 
@@ -2349,6 +2516,7 @@ pub fn redo(doc: &mut Document, hist: &mut History, page: PageId) -> Option<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::organizer::{Priority, Repeat, Subtask};
     use crate::core::AttachmentId;
     use crate::core::document::Document;
     
@@ -4189,6 +4357,315 @@ mod tests {
             )
             .is_some(),
             "control: the same forest lands on a top-level anchor"
+        );
+    }
+
+    // ─── SPEC §四十一 Notes & tasks ──────────────────────────────────────────
+
+    fn note(id: u64) -> Note {
+        Note {
+            id: NoteId(id),
+            title: format!("Note {id}"),
+            body: "line one\nline two".into(),
+            pinned: false,
+            tags: vec!["idea".into()],
+            created: 1_000,
+            edited: 2_000,
+        }
+    }
+
+    fn task(id: u64, list: ListId) -> Task {
+        Task {
+            id: TaskId(id),
+            list,
+            title: format!("Task {id}"),
+            notes: String::new(),
+            priority: Priority::None,
+            due: None,
+            repeat: Repeat::None,
+            done: false,
+            completed_at: None,
+            tags: Vec::new(),
+            subtasks: Vec::new(),
+            created: 10,
+            edited: 20,
+            ord: OrderKey::FIRST,
+        }
+    }
+
+    fn list(id: u64) -> TaskList {
+        TaskList {
+            id: ListId(id),
+            name: format!("List {id}"),
+            color: ColorKind::Blue,
+            ord: OrderKey::FIRST,
+        }
+    }
+
+    /// The organizer's whole shape in one test: a create is one `Entry` whose
+    /// revert is the delete, undo replays that revert, redo replays the apply —
+    /// and every one of them leaves the *document* exactly as it was, which is
+    /// what lets the area reuse the editor's `exec` / `undo` / `redo` without a
+    /// second history mechanism.
+    #[test]
+    fn an_organizer_change_is_one_step_and_never_touches_the_document() {
+        let (mut doc, mut hist, page, _ids) = setup();
+        let before = doc.page_blocks(page).to_vec();
+
+        let new = note(3);
+        let apply = exec(&mut doc, &mut hist, page, Command::CreateNote { note: new.clone() }).unwrap();
+        assert_eq!(apply, vec![Change::NoteAdded(new.clone())]);
+        assert_eq!(doc.page_blocks(page), before.as_slice(), "no block was written");
+
+        // undo: the same entry, read backwards
+        let revert = undo(&mut doc, &mut hist, page).unwrap();
+        assert_eq!(revert, vec![Change::NoteDeleted { id: NoteId(3) }]);
+        assert_eq!(doc.page_blocks(page), before.as_slice());
+        let again = redo(&mut doc, &mut hist, page).unwrap();
+        assert_eq!(again, vec![Change::NoteAdded(new)]);
+
+        // ... and the same three lines for a task and for a list
+        let t = task(4, ListId::INBOX);
+        assert_eq!(
+            exec(&mut doc, &mut hist, page, Command::CreateTask { task: t.clone() }).unwrap(),
+            vec![Change::TaskAdded(t.clone())]
+        );
+        assert_eq!(undo(&mut doc, &mut hist, page).unwrap(), vec![Change::TaskDeleted { id: TaskId(4) }]);
+        assert_eq!(redo(&mut doc, &mut hist, page).unwrap(), vec![Change::TaskAdded(t)]);
+
+        let l = list(5);
+        assert_eq!(
+            exec(&mut doc, &mut hist, page, Command::CreateTaskList { list: l.clone() }).unwrap(),
+            vec![Change::TaskListAdded(l.clone())]
+        );
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::TaskListDeleted { id: ListId(5) }]
+        );
+        assert_eq!(redo(&mut doc, &mut hist, page).unwrap(), vec![Change::TaskListAdded(l)]);
+
+        assert_eq!(doc.page_blocks(page), before.as_slice());
+    }
+
+    /// An edit is one `Entry` carrying the whole row in both directions: the
+    /// revert is the row as it stood, so a Ctrl+Z restores the priority and the
+    /// checklist together, and the two `Entry` lists are exact mirrors.
+    #[test]
+    fn an_updated_row_reverts_to_the_whole_row_it_replaced() {
+        let (mut doc, mut hist, page, _ids) = setup();
+        let before = task(7, ListId::INBOX);
+        let mut after = before.clone();
+        after.title = "renamed".into();
+        after.priority = Priority::High;
+        after.done = true;
+        after.completed_at = Some(9_000);
+        after.subtasks.push(Subtask {
+            id: 70,
+            title: "step".into(),
+            done: false,
+        });
+
+        let apply = exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::UpdateTask {
+                id: TaskId(7),
+                before: before.clone(),
+                after: after.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(apply, vec![Change::TaskUpdated(after.clone())]);
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::TaskUpdated(before.clone())]
+        );
+        assert_eq!(
+            redo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::TaskUpdated(after)]
+        );
+
+        // The same shape for a note and for a list.
+        let n0 = note(8);
+        let mut n1 = n0.clone();
+        n1.pinned = true;
+        assert_eq!(
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::UpdateNote { id: NoteId(8), before: n0.clone(), after: n1.clone() }
+            )
+            .unwrap(),
+            vec![Change::NoteUpdated(n1)]
+        );
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::NoteUpdated(n0)]
+        );
+
+        let l0 = list(9);
+        let mut l1 = l0.clone();
+        l1.color = ColorKind::Red;
+        exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::UpdateTaskList { id: ListId(9), before: l0.clone(), after: l1.clone() },
+        )
+        .unwrap();
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::TaskListUpdated(l0)]
+        );
+    }
+
+    /// A write with the value it already has is not an undo step (the rule
+    /// `SetDatabaseCell` states), and an update whose rows disagree with the id
+    /// it names is refused rather than stored under the wrong one. A delete
+    /// carries the whole row, so its undo can restore it.
+    #[test]
+    fn an_organizer_no_op_plans_nothing_and_a_delete_carries_its_row() {
+        let (mut doc, _hist, page, _ids) = setup();
+
+        let t = task(7, ListId::INBOX);
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::UpdateTask { id: TaskId(7), before: t.clone(), after: t.clone() }
+            )
+            .is_none(),
+            "an untouched row is not an undo step"
+        );
+        let mut renamed = t.clone();
+        renamed.title = "other".into();
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::UpdateTask { id: TaskId(8), before: t.clone(), after: renamed.clone() }
+            )
+            .is_none(),
+            "the id and the rows have to name the same task"
+        );
+        let n = note(3);
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::UpdateNote { id: NoteId(3), before: n.clone(), after: n.clone() }
+            )
+            .is_none()
+        );
+        let l = list(5);
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::UpdateTaskList { id: ListId(5), before: l.clone(), after: l.clone() }
+            )
+            .is_none()
+        );
+
+        // A delete's revert is the row itself, in all three shapes.
+        let entry = plan(&mut doc, page, Command::DeleteNote { note: n.clone() }).unwrap();
+        assert_eq!(entry.apply, vec![Change::NoteDeleted { id: NoteId(3) }]);
+        assert_eq!(entry.revert, vec![Change::NoteAdded(n)]);
+        let entry = plan(&mut doc, page, Command::DeleteTask { task: t.clone() }).unwrap();
+        assert_eq!(entry.apply, vec![Change::TaskDeleted { id: TaskId(7) }]);
+        assert_eq!(entry.revert, vec![Change::TaskAdded(t)]);
+    }
+
+    /// **The reason `DeleteTaskList` is one command.** Deleting a list moves its
+    /// tasks into the inbox in the same batch, so one Ctrl+Z brings back the
+    /// list *and* its tasks: the apply is "every task, then the list", the
+    /// revert is the mirror image, and no instant between them has a task
+    /// pointing at a list that is already gone.
+    #[test]
+    fn deleting_a_list_moves_its_tasks_into_the_inbox_in_the_same_step() {
+        let (mut doc, mut hist, page, _ids) = setup();
+        let doomed = list(5);
+        let a = task(10, ListId(5));
+        let b = task(11, ListId(5));
+        let inbox_a = Task {
+            list: ListId::INBOX,
+            ..a.clone()
+        };
+        let inbox_b = Task {
+            list: ListId::INBOX,
+            ..b.clone()
+        };
+        let moved = vec![(a.clone(), inbox_a.clone()), (b.clone(), inbox_b.clone())];
+
+        let apply = exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::DeleteTaskList { list: doomed.clone(), moved: moved.clone() },
+        )
+        .unwrap();
+        assert_eq!(
+            apply,
+            vec![
+                Change::TaskUpdated(inbox_a),
+                Change::TaskUpdated(inbox_b),
+                Change::TaskListDeleted { id: ListId(5) },
+            ],
+            "the tasks move first and the list dies last"
+        );
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![
+                Change::TaskListAdded(doomed.clone()),
+                Change::TaskUpdated(a),
+                Change::TaskUpdated(b),
+            ],
+            "the list comes back before the tasks name it"
+        );
+        assert_eq!(
+            redo(&mut doc, &mut hist, page).unwrap().len(),
+            3,
+            "and the redo is the whole delete again"
+        );
+
+        // A list with nothing in it is a plain row delete.
+        let empty = exec(
+            &mut doc,
+            &mut hist,
+            page,
+            Command::DeleteTaskList { list: list(6), moved: Vec::new() },
+        )
+        .unwrap();
+        assert_eq!(empty, vec![Change::TaskListDeleted { id: ListId(6) }]);
+    }
+
+    /// The inbox is a sentinel and not a row (`ListId::INBOX`), so the two list
+    /// commands that could write one at id 0 refuse: creating a list there would
+    /// make the sentinel a list somebody could rename, and deleting it would ask
+    /// storage for a row that was never written.
+    #[test]
+    fn the_inbox_is_not_a_list_any_command_may_create_or_delete() {
+        let (mut doc, _hist, page, _ids) = setup();
+        assert!(plan(&mut doc, page, Command::CreateTaskList { list: list(0) }).is_none());
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::DeleteTaskList { list: list(0), moved: Vec::new() }
+            )
+            .is_none()
+        );
+        // Control: the same two commands on a stored id are planned.
+        assert!(plan(&mut doc, page, Command::CreateTaskList { list: list(4) }).is_some());
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::DeleteTaskList { list: list(4), moved: Vec::new() }
+            )
+            .is_some()
         );
     }
 }

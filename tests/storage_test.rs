@@ -8,10 +8,13 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use quire_core::core::organizer::{
+    ListId, Note, NoteId, OrganizerCatalog, Priority, Repeat, Subtask, Task, TaskId, TaskList,
+};
 use quire_core::core::persistence::{Change, Repository, StorageError};
 use quire_core::core::types::{
-    Attachment, AttachmentId, Block, BlockId, BlockKind, Lang, OrderKey, Page, PageFont, PageId,
-    PersistedState,
+    Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, OrderKey, Page, PageFont,
+    PageId, PersistedState,
 };
 use quire_core::storage::backup;
 use quire_core::storage::migrations;
@@ -56,6 +59,61 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
         lang: Lang::Plain,
         db_ref: None,
         sync_ref: None,    }
+}
+
+/// SPEC §四十一's three fixtures. Every field carries a non-default value on
+/// purpose: a round trip that silently drops one (a pin, a tag, a subtask's
+/// `done`) has to show up as an inequality and not as two equal rows that were
+/// never compared in the first place.
+fn organizer_note(id: u64) -> Note {
+    Note {
+        id: NoteId(id),
+        title: format!("Note {id}"),
+        body: "line one\nline two 中文".into(),
+        pinned: id % 2 == 1,
+        tags: vec!["idea".into(), "重要".into()],
+        created: 1_700_000_000 + id as i64,
+        edited: 1_700_000_900 + id as i64,
+    }
+}
+
+fn organizer_list(id: u64) -> TaskList {
+    TaskList {
+        id: ListId(id),
+        name: format!("List {id}"),
+        color: ColorKind::Blue,
+        ord: OrderKey(OrderKey::FIRST.0 + id * 0x100),
+    }
+}
+
+fn organizer_task(id: u64, list: ListId) -> Task {
+    Task {
+        id: TaskId(id),
+        list,
+        title: format!("Task {id}"),
+        notes: "under the title".into(),
+        priority: Priority::High,
+        due: Some("2026-09-24".into()),
+        repeat: Repeat::Weekdays,
+        done: false,
+        completed_at: None,
+        tags: vec!["work".into()],
+        subtasks: vec![
+            Subtask {
+                id: id * 10,
+                title: "first".into(),
+                done: true,
+            },
+            Subtask {
+                id: id * 10 + 1,
+                title: "second".into(),
+                done: false,
+            },
+        ],
+        created: 1_700_000_000 + id as i64,
+        edited: 1_700_000_900 + id as i64,
+        ord: OrderKey(OrderKey::FIRST.0 + id * 0x100),
+    }
 }
 
 fn sample_state() -> PersistedState {
@@ -1250,6 +1308,114 @@ fn the_v14_step_adds_the_template_flag_to_a_v13_database() {
     // A template has no parent and lands in no one's children list; the load
     // path must not invent a slot for it, or the tree walk shows the body.
     assert_eq!(state.pages.iter().find(|p| p.id == PageId(2)).unwrap().parent, None);
+}
+
+/// SPEC §四十一's three steps, one after another, against a real v23 file: the
+/// tables are the ones a v23 library does not have, and everything it *did* have
+/// is left exactly as it was. The control in the middle is the point — without
+/// it, "the step added the tables" would be a claim about a schema that might
+/// have had them all along.
+#[test]
+fn the_v24_to_v26_steps_add_the_organizer_tables_to_a_v23_database() {
+    let dir = tempfile();
+    let path = dir.join("organizer.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE tasks;
+             DROP TABLE task_lists;
+             DROP TABLE notes;
+             PRAGMA user_version = 23;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded, font, layout, icon,
+                                cover, locked, template)
+             VALUES (1, 'Written before the area', NULL, 1, 0, 1, 'serif', 1, '', NULL, 1, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 23);
+        for table in ["notes", "task_lists", "tasks"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "the rolled-back schema has no {table}");
+        }
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        migrations::check_schema(&conn).unwrap();
+
+        // Each table has the columns the store writes, not merely a name: a
+        // `CREATE TABLE` with a field missing is a schema that opens and then
+        // fails on the first write, which is the one thing this check exists to
+        // catch before it can happen.
+        for (table, column) in [
+            ("notes", "pinned"),
+            ("notes", "tags"),
+            ("task_lists", "color"),
+            ("tasks", "subtasks"),
+            ("tasks", "completed_at"),
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{table} has no {column} column");
+        }
+        for index in ["idx_tasks_list_ord", "idx_tasks_done", "idx_tasks_due"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "the tasks table has no {index}");
+        }
+
+        // The page the older build wrote is untouched, down to its look.
+        let (title, font, expanded): (String, String, i64) = conn
+            .query_row(
+                "SELECT title, font, expanded FROM pages WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((title.as_str(), font.as_str(), expanded), ("Written before the area", "serif", 1));
+        // Idempotent, like every step before them.
+        migrations::ensure_current(&mut conn).unwrap();
+    }
+
+    // The upgraded file is one the repository opens and writes the new rows
+    // through — a table exists to be used, not to satisfy a check.
+    let repo = SqliteRepository::open(&path).unwrap();
+    repo.apply(&[
+        Change::NoteAdded(organizer_note(1)),
+        Change::TaskListAdded(organizer_list(4)),
+        Change::TaskAdded(organizer_task(7, ListId::INBOX)),
+    ])
+    .unwrap();
+    let catalog = repo.load_organizer().unwrap();
+    assert_eq!(catalog.notes.len(), 1);
+    assert_eq!(catalog.lists.len(), 1);
+    assert_eq!(catalog.tasks.len(), 1);
+    assert_eq!(repo.load().unwrap().pages.len(), 1, "and the document is still there");
 }
 
 #[test]
@@ -2890,5 +3056,210 @@ mod database_property_layer {
             None,
             "the row whose page the state dropped is gone (ADR-0066)"
         );
+    }
+}
+
+/// SPEC §四十一's rows through the real store: the three tables, the two JSON
+/// columns inside them, and the three claims the design makes that only a
+/// *file* can settle — that a row survives a reopen whole, that the inbox
+/// sentinel needs no row behind it, and that the bulk replace path leaves the
+/// organizer alone.
+mod organizer_layer {
+    use super::*;
+    use quire_core::storage::database_store::DbTable;
+
+    /// Two of everything, in the order the load hands them back: `notes` by id,
+    /// `lists` by `ord`, `tasks` by `(list, ord)`.
+    fn fixture() -> OrganizerCatalog {
+        OrganizerCatalog {
+            notes: vec![organizer_note(1), organizer_note(2)],
+            lists: vec![organizer_list(4), organizer_list(5)],
+            tasks: vec![
+                organizer_task(7, ListId::INBOX),
+                organizer_task(8, ListId(4)),
+                organizer_task(9, ListId(5)),
+            ],
+        }
+    }
+
+    fn seed(catalog: &OrganizerCatalog) -> Vec<Change> {
+        let mut changes: Vec<Change> =
+            catalog.notes.iter().cloned().map(Change::NoteAdded).collect();
+        changes.extend(catalog.lists.iter().cloned().map(Change::TaskListAdded));
+        changes.extend(catalog.tasks.iter().cloned().map(Change::TaskAdded));
+        changes
+    }
+
+    #[test]
+    fn every_organizer_row_round_trips_through_the_file() {
+        let dir = tempfile();
+        let path = dir.join("organizer.db");
+        let expected = fixture();
+        {
+            let repo = SqliteRepository::open(&path).unwrap();
+            repo.apply(&seed(&expected)).unwrap();
+            assert_eq!(repo.load_organizer().unwrap(), expected);
+        }
+
+        // The rows are the file's and not the session's: a second open reads
+        // every column back, the two JSON ones included.
+        let repo = SqliteRepository::open(&path).unwrap();
+        let loaded = repo.load_organizer().unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded.notes[0].tags,
+            vec!["idea".to_string(), "重要".to_string()],
+            "the tag array is a JSON column and comes back as the array it was"
+        );
+        assert_eq!(loaded.tasks[0].subtasks.len(), 2);
+        assert_eq!(loaded.tasks[0].subtasks[0].title, "first");
+        assert!(loaded.tasks[0].subtasks[0].done);
+        assert!(!loaded.tasks[0].subtasks[1].done);
+        assert_eq!(loaded.tasks[0].due.as_deref(), Some("2026-09-24"));
+        assert_eq!(loaded.tasks[0].priority, Priority::High);
+        assert_eq!(loaded.tasks[0].repeat, Repeat::Weekdays);
+        assert_eq!(loaded.lists[0].color, ColorKind::Blue);
+        assert!(loaded.notes[0].pinned && !loaded.notes[1].pinned);
+        // The inbox is a task's `list` and not a row: `task_lists` holds exactly
+        // the two stored lists, and the inbox task is one of the three tasks.
+        assert_eq!(loaded.lists.len(), 2);
+        assert!(loaded.task(TaskId(7)).unwrap().in_inbox());
+        assert_eq!(loaded.tasks_in(ListId::INBOX).count(), 1);
+    }
+
+    /// An update rewrites **every** column of the row, which is what lets the
+    /// inbox move be an ordinary write: `TaskUpdated` is what `DeleteTaskList`
+    /// plans for each task it rescues, so the row has to be able to change its
+    /// list without a statement of its own.
+    #[test]
+    fn an_update_rewrites_the_whole_row_and_can_move_a_task_between_lists() {
+        let repo = SqliteRepository::in_memory().unwrap();
+        repo.apply(&[
+            Change::NoteAdded(organizer_note(1)),
+            Change::TaskListAdded(organizer_list(4)),
+            Change::TaskAdded(organizer_task(7, ListId(4))),
+        ])
+        .unwrap();
+
+        let mut moved = organizer_task(7, ListId::INBOX);
+        moved.title = "moved to the inbox".into();
+        moved.due = None;
+        moved.completed_at = Some(1_700_001_000);
+        moved.done = true;
+        moved.subtasks.truncate(1);
+        moved.tags.clear();
+        let mut note = organizer_note(1);
+        note.pinned = false;
+        note.body = String::new();
+        note.tags = Vec::new();
+        repo.apply(&[
+            Change::TaskUpdated(moved.clone()),
+            Change::NoteUpdated(note.clone()),
+        ])
+        .unwrap();
+
+        let catalog = repo.load_organizer().unwrap();
+        assert_eq!(catalog.task(TaskId(7)), Some(&moved));
+        assert_eq!(catalog.note(NoteId(1)), Some(&note));
+        assert_eq!(catalog.tasks_in(ListId::INBOX).count(), 1);
+        assert_eq!(
+            catalog.tasks_in(ListId(4)).count(),
+            0,
+            "the row moved, it was not copied"
+        );
+        // A cleared deadline is an absent one, not an empty string.
+        assert_eq!(catalog.task(TaskId(7)).unwrap().due, None);
+    }
+
+    /// The store's one rule for a write that names nothing: fail loudly and take
+    /// the batch with it. A silently dropped change would desynchronize the app's
+    /// in-memory catalog from the file, which is the state this whole design
+    /// exists to make unrepresentable.
+    #[test]
+    fn a_write_against_a_row_that_is_not_there_fails_loudly_and_takes_its_batch_with_it() {
+        let repo = SqliteRepository::in_memory().unwrap();
+        for change in [
+            Change::NoteUpdated(organizer_note(1)),
+            Change::NoteDeleted { id: NoteId(1) },
+            Change::TaskListUpdated(organizer_list(4)),
+            Change::TaskListDeleted { id: ListId(4) },
+            Change::TaskUpdated(organizer_task(7, ListId::INBOX)),
+            Change::TaskDeleted { id: TaskId(7) },
+        ] {
+            let what = format!("{change:?}");
+            assert!(
+                repo.apply(&[change]).is_err(),
+                "{what} wrote a row that was never there"
+            );
+        }
+        assert_eq!(repo.load_organizer().unwrap(), OrganizerCatalog::default());
+
+        // Half a batch is not half a write: the note it added first goes back.
+        assert!(repo
+            .apply(&[
+                Change::NoteAdded(organizer_note(1)),
+                Change::NoteUpdated(organizer_note(2)),
+            ])
+            .is_err());
+        assert_eq!(repo.load_organizer().unwrap(), OrganizerCatalog::default());
+
+        // control: the same two changes against a row that exists land.
+        repo.apply(&[
+            Change::NoteAdded(organizer_note(1)),
+            Change::NoteUpdated(organizer_note(1)),
+        ])
+        .unwrap();
+        assert_eq!(repo.load_organizer().unwrap().notes.len(), 1);
+    }
+
+    /// The organizer is **not** part of the state `replace_all` replaces. It
+    /// references no page, so nothing cascades into it, and unlike the database
+    /// layer it needs no snapshot-and-restore dance around the bulk delete —
+    /// there is deliberately no code doing that, and this is the assertion that
+    /// keeps it that way.
+    #[test]
+    fn the_organizer_survives_a_bulk_replace_it_is_not_part_of() {
+        let repo = SqliteRepository::in_memory().unwrap();
+        let seeded = fixture();
+        repo.apply(&seed(&seeded)).unwrap();
+        repo.apply(&[Change::PageCreated(page(1, "One", None, OrderKey::FIRST.0))])
+            .unwrap();
+
+        let kept = PersistedState {
+            pages: vec![page(2, "Two", None, OrderKey::FIRST.0)],
+            blocks: vec![],
+            meta: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        repo.replace_all(&kept).unwrap();
+
+        assert_eq!(repo.load_organizer().unwrap(), seeded);
+        let state = repo.load().unwrap();
+        assert_eq!(state.pages.len(), 1);
+        assert_eq!(state.pages[0].id, PageId(2));
+    }
+
+    /// What the app seeds its three watermarks from (ADR-0072): an empty table
+    /// answers 0, which is why a fresh session's first note id is 1 and the
+    /// sentinel 0 is never handed out as a real id.
+    #[test]
+    fn max_id_answers_for_the_organizer_tables_too() {
+        let repo = SqliteRepository::in_memory().unwrap();
+        assert_eq!(repo.max_id(DbTable::Notes).unwrap(), 0);
+        assert_eq!(repo.max_id(DbTable::Tasks).unwrap(), 0);
+        assert_eq!(repo.max_id(DbTable::TaskLists).unwrap(), 0);
+
+        repo.apply(&[
+            Change::NoteAdded(organizer_note(3)),
+            Change::TaskListAdded(organizer_list(6)),
+            Change::TaskAdded(organizer_task(9, ListId(6))),
+        ])
+        .unwrap();
+        assert_eq!(repo.max_id(DbTable::Notes).unwrap(), 3);
+        assert_eq!(repo.max_id(DbTable::TaskLists).unwrap(), 6);
+        assert_eq!(repo.max_id(DbTable::Tasks).unwrap(), 9);
+        // The three question nothing about the six, and vice versa.
+        assert_eq!(repo.max_id(DbTable::Databases).unwrap(), 0);
+        assert_eq!(repo.max_id(DbTable::Records).unwrap(), 0);
     }
 }

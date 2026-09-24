@@ -44,6 +44,6 @@ pub use persistence::{Change, Repository, StorageError};
 pub use reference::{page_of, page_uri, trigger_at, PAGE_SCHEME};
 pub use types::{
     Attachment, AttachmentId, Block, BlockId, BlockKind, ColorKind, Lang, Mark, MarkKind, OrderKey,
-    Page, PageFont, PageId, PersistedState,
+    Page, PageFont, PageId, PersistedState, ORGANIZER_STACK,
 };
 

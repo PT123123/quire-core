@@ -39,6 +39,23 @@ id_newtype!(
     "Stable identifier of an attachment (SPEC §三十七 批次 A)."
 );
 
+/// The undo stack the organizer's area uses (SPEC §四十一).
+///
+/// `History` is a map keyed by `PageId` (`core::history`) — one stack per page,
+/// because a document's Ctrl+Z must not reach another document's edits. The
+/// organizer is not a page and has no page, so its steps need a key that no page
+/// can ever be, and this is it: page ids are allocated by the workspace from
+/// `max + 1` over the ids of a `HashMap<i32, Page>`, so anything above
+/// `i32::MAX` is unreachable by construction.
+///
+/// With this key the area gets the property §四十一 asks for with **no new
+/// mechanism at all**: a Ctrl+Z inside the organizer walks the organizer's own
+/// entries, one in the editor walks the open page's, and neither list can
+/// contain the other's steps. `History::referenced_attachments` walks every
+/// stack looking for attachment ids to protect, and an organizer entry holds
+/// none — so the sentinel costs that sweep nothing.
+pub const ORGANIZER_STACK: PageId = PageId(u64::MAX);
+
 /// Sibling position. Smaller sorts first; unique among siblings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OrderKey(pub u64);

@@ -13,13 +13,27 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::organizer as org;
 use crate::core::types::{
     Attachment, Block, BlockId, ColorKind, Lang, Mark, MarkKind, OrderKey, Page, PageFont, PageId,
 };
 use crate::core::{database as db, database::DatabaseCatalog};
 
 /// The snapshot protocol this build speaks.
-pub const SNAPSHOT_VERSION: u32 = 1;
+///
+/// **1 → 2** when SPEC §四十一's organizer landed, and the reason is not
+/// housekeeping: the version gate is an exact equality, and a v2 peer's
+/// `notes` / `tasks` / `lists` sent to a v1 peer would be *silently dropped* by
+/// serde — the old side would answer a merged snapshot with none of them in it,
+/// and the new side reads a missing id in a merged snapshot as **a delete**
+/// (that is how the two-way protocol lands removals). A user's brand-new notes
+/// would therefore be deleted by the first sync with an un-updated device.
+///
+/// So the bump makes the two builds refuse each other at `from_json` instead:
+/// loud, immediate, and fixable by updating the other end. The cost is real and
+/// is the reason this is an ADR rather than a footnote — both ends must be
+/// updated together, and a v1 peer can no longer sync at all.
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
@@ -35,6 +49,15 @@ pub struct SyncSnapshot {
     pub blocks: Vec<SBlock>,
     pub attachments: Vec<SAttachment>,
     pub databases: Vec<SDatabase>,
+    /// SPEC §四十一's three collections. **No `#[serde(default)]` on them**, on
+    /// purpose: a payload that does not carry them is not a payload with an
+    /// empty organizer, it is a payload this build cannot honestly merge — and
+    /// the deletion detection above would turn "absent" into "deleted". The
+    /// version gate is what keeps that from arriving; this is the second lock
+    /// on the same door.
+    pub notes: Vec<SNote>,
+    pub tasks: Vec<STask>,
+    pub lists: Vec<STaskList>,
 }
 
 impl Default for SyncSnapshot {
@@ -47,6 +70,9 @@ impl Default for SyncSnapshot {
             blocks: Vec::new(),
             attachments: Vec::new(),
             databases: Vec::new(),
+            notes: Vec::new(),
+            tasks: Vec::new(),
+            lists: Vec::new(),
         }
     }
 }
@@ -70,7 +96,13 @@ impl SyncSnapshot {
 
     /// The number of carried rows, for logs.
     pub fn row_count(&self) -> usize {
-        self.pages.len() + self.blocks.len() + self.attachments.len() + self.databases.len()
+        self.pages.len()
+            + self.blocks.len()
+            + self.attachments.len()
+            + self.databases.len()
+            + self.notes.len()
+            + self.tasks.len()
+            + self.lists.len()
     }
 }
 
@@ -184,6 +216,64 @@ pub struct SDatabase {
     pub views: Vec<SView>,
     pub records: Vec<SRecord>,
     pub values: Vec<SValue>,
+}
+
+/// SPEC §四十一's three rows on the wire. Flat, like every other row here: the
+/// organizer has no nesting (a task's subtasks are part of the task the way its
+/// tags are, not rows of a collection the merge compares one by one), so its
+/// three collections sit beside `pages` and `blocks` rather than inside a
+/// wrapper. The enums travel as the strings the columns hold — the same
+/// `as_str` / `try_from_str` pair `kind` and `color` already use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SNote {
+    pub id: u64,
+    pub title: String,
+    pub body: String,
+    pub pinned: bool,
+    pub tags: Vec<String>,
+    /// Unix seconds. They travel because they are part of the row the merge
+    /// compares: a receiving device that dropped them would write a row that
+    /// differs from the sender's in two fields nobody edited, and every later
+    /// sync would read that as a change.
+    pub created: i64,
+    pub edited: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct STaskList {
+    pub id: u64,
+    pub name: String,
+    pub color: String,
+    pub ord: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SSubtask {
+    pub id: u64,
+    pub title: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct STask {
+    pub id: u64,
+    /// The list it belongs to, `0` being the inbox sentinel (`ListId::INBOX`) —
+    /// an id and not a row, exactly as the column stores it, so a task in the
+    /// inbox needs no list row to arrive with it.
+    pub list: u64,
+    pub title: String,
+    pub notes: String,
+    pub priority: String,
+    /// `YYYY-MM-DD`, or absent for no deadline.
+    pub due: Option<String>,
+    pub repeat: String,
+    pub done: bool,
+    pub completed_at: Option<i64>,
+    pub tags: Vec<String>,
+    pub subtasks: Vec<SSubtask>,
+    pub created: i64,
+    pub edited: i64,
+    pub ord: u64,
 }
 
 // ─── conversions: core rows ↔ wire rows ─────────────────────────────────────
@@ -418,6 +508,121 @@ impl SDatabase {
     }
 }
 
+impl From<&org::Note> for SNote {
+    fn from(n: &org::Note) -> Self {
+        SNote {
+            id: n.id.0,
+            title: n.title.clone(),
+            body: n.body.clone(),
+            pinned: n.pinned,
+            tags: n.tags.clone(),
+            created: n.created,
+            edited: n.edited,
+        }
+    }
+}
+
+impl SNote {
+    pub fn to_core(&self) -> org::Note {
+        org::Note {
+            id: org::NoteId(self.id),
+            title: self.title.clone(),
+            body: self.body.clone(),
+            pinned: self.pinned,
+            tags: self.tags.clone(),
+            created: self.created,
+            edited: self.edited,
+        }
+    }
+}
+
+impl From<&org::TaskList> for STaskList {
+    fn from(l: &org::TaskList) -> Self {
+        STaskList {
+            id: l.id.0,
+            name: l.name.clone(),
+            color: l.color.as_str().to_string(),
+            ord: l.ord.0,
+        }
+    }
+}
+
+impl STaskList {
+    pub fn to_core(&self) -> org::TaskList {
+        org::TaskList {
+            id: org::ListId(self.id),
+            name: self.name.clone(),
+            color: ColorKind::try_from_str(&self.color).unwrap_or(ColorKind::Default),
+            ord: OrderKey(self.ord),
+        }
+    }
+}
+
+impl From<&org::Subtask> for SSubtask {
+    fn from(s: &org::Subtask) -> Self {
+        SSubtask {
+            id: s.id,
+            title: s.title.clone(),
+            done: s.done,
+        }
+    }
+}
+
+impl SSubtask {
+    pub fn to_core(&self) -> org::Subtask {
+        org::Subtask {
+            id: self.id,
+            title: self.title.clone(),
+            done: self.done,
+        }
+    }
+}
+
+impl From<&org::Task> for STask {
+    fn from(t: &org::Task) -> Self {
+        STask {
+            id: t.id.0,
+            list: t.list.0,
+            title: t.title.clone(),
+            notes: t.notes.clone(),
+            priority: t.priority.as_str().to_string(),
+            due: t.due.clone(),
+            repeat: t.repeat.as_str().to_string(),
+            done: t.done,
+            completed_at: t.completed_at,
+            tags: t.tags.clone(),
+            subtasks: t.subtasks.iter().map(Into::into).collect(),
+            created: t.created,
+            edited: t.edited,
+            ord: t.ord.0,
+        }
+    }
+}
+
+impl STask {
+    pub fn to_core(&self) -> org::Task {
+        org::Task {
+            id: org::TaskId(self.id),
+            // `0` is the inbox and stays `0`: the sentinel needs no lookup, and
+            // a task that arrives in the inbox must not be sent to whichever
+            // list happens to hold that id on this device.
+            list: org::ListId(self.list),
+            title: self.title.clone(),
+            notes: self.notes.clone(),
+            priority: org::Priority::from_stored(&self.priority),
+            due: self.due.clone().filter(|d| !d.is_empty()),
+            repeat: org::Repeat::from_stored(&self.repeat),
+            done: self.done,
+            completed_at: self.completed_at,
+            tags: self.tags.clone(),
+            subtasks: self.subtasks.iter().map(|s| s.to_core()).collect(),
+            created: self.created,
+            edited: self.edited,
+            ord: OrderKey(self.ord),
+        }
+    }
+}
+
 /// The catalog's schema half (entities, columns, views) as wire rows.
 pub fn catalog_schema(catalog: &DatabaseCatalog) -> Vec<SDatabase> {
     catalog
@@ -550,5 +755,100 @@ mod tests {
         bad.version = 99;
         assert!(SyncSnapshot::from_json(&bad.to_json()).is_err());
         assert!(SyncSnapshot::from_json("not json").is_err());
+        // The version right below this one is refused as well, which is the
+        // whole point of the bump: a v1 peer must not be half-understood.
+        let mut old = snap.clone();
+        old.version = 1;
+        let refusal = SyncSnapshot::from_json(&old.to_json()).unwrap_err();
+        assert!(refusal.contains("version 1"), "{refusal}");
+        assert!(refusal.contains("speaks 2"), "{refusal}");
+    }
+
+    /// The three organizer rows through the wire: every field, including the
+    /// two instants and the checklist, because a field that does not survive
+    /// this trip is a field the user loses on the other device (and, worse, one
+    /// the merge then reads as an edit nobody made).
+    #[test]
+    fn a_note_a_list_and_a_task_round_trip_through_their_wire_rows() {
+        let note = org::Note {
+            id: org::NoteId(3),
+            title: "Ideas".into(),
+            body: "one\ntwo 中文".into(),
+            pinned: true,
+            tags: vec!["idea".into(), "重要".into()],
+            created: 1_700_000_000,
+            edited: 1_700_000_900,
+        };
+        assert_eq!(SNote::from(&note).to_core(), note);
+
+        let list = org::TaskList {
+            id: org::ListId(5),
+            name: "Work".into(),
+            color: ColorKind::Blue,
+            ord: OrderKey(1 << 20),
+        };
+        assert_eq!(STaskList::from(&list).to_core(), list);
+
+        let task = org::Task {
+            id: org::TaskId(9),
+            list: org::ListId::INBOX,
+            title: "Ship it".into(),
+            notes: "under the title".into(),
+            priority: org::Priority::High,
+            due: Some("2026-09-24".into()),
+            repeat: org::Repeat::Weekdays,
+            done: true,
+            completed_at: Some(1_700_000_500),
+            tags: vec!["work".into()],
+            subtasks: vec![
+                org::Subtask {
+                    id: 90,
+                    title: "first".into(),
+                    done: true,
+                },
+                org::Subtask {
+                    id: 91,
+                    title: "second".into(),
+                    done: false,
+                },
+            ],
+            created: 1_700_000_000,
+            edited: 1_700_000_900,
+            ord: OrderKey(1 << 16),
+        };
+        assert_eq!(STask::from(&task).to_core(), task);
+        // The sentinel survives as itself rather than as "whichever list holds
+        // id 0 on the other device" — there is no such list anywhere.
+        assert_eq!(STask::from(&task).list, 0);
+        // An absent deadline is `None` on both sides of the trip, and a blank
+        // string folds to the same absence rather than becoming a second
+        // spelling of it.
+        let mut open = task.clone();
+        open.due = None;
+        assert_eq!(STask::from(&open).to_core().due, None);
+        let mut blank = STask::from(&open);
+        blank.due = Some(String::new());
+        assert_eq!(blank.to_core().due, None);
+    }
+
+    /// A payload that lost the organizer on the way is **not** a payload with an
+    /// empty organizer: it fails to parse instead. This is the second lock on
+    /// the door the version bump closes — the first is the version gate itself.
+    #[test]
+    fn a_payload_without_the_organizer_is_refused_rather_than_read_as_empty() {
+        let json = SyncSnapshot::default().to_json();
+        assert!(SyncSnapshot::from_json(&json).is_ok());
+        for field in ["notes", "tasks", "lists"] {
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value
+                .as_object_mut()
+                .expect("a snapshot is an object")
+                .remove(field);
+            let missing = value.to_string();
+            assert!(
+                SyncSnapshot::from_json(&missing).is_err(),
+                "a payload without {field} parsed as one with an empty organizer"
+            );
+        }
     }
 }

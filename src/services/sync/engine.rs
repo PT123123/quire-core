@@ -432,11 +432,17 @@ fn sync_with(peer: &PeerRecord, jobs: &Sender<Job>) {
         peer_id: peer.id.clone(),
         ok: true,
         message: format!(
-            "Synced with {name}: {pages} pages, {blocks} blocks, {dbs} databases in the merged workspace",
+            "Synced with {name}: {pages} pages, {blocks} blocks, {dbs} databases, \
+             {notes} notes, {tasks} tasks in the merged workspace",
             name = peer.name,
             pages = merged.pages.len(),
             blocks = merged.blocks.len(),
-            dbs = merged.databases.len()
+            dbs = merged.databases.len(),
+            // SPEC §四十一's rows are counted too: "0 notes" in a line that does
+            // not mention notes at all would be the reader's guess, and this log
+            // is the only place a user sees what actually moved.
+            notes = merged.notes.len(),
+            tasks = merged.tasks.len()
         ),
     });
 }

@@ -33,8 +33,18 @@
 // honest answer — two workspaces merged for the first time are one user
 // decision, not one algorithm — and the rows that only one side has still
 // flow.
+//
+// SPEC §四十一's organizer joins as **three more flat collections**
+// (`notes`, `tasks`, `lists`): its rows hang off no page and no block, and its
+// only cross-reference is a task's list, which is remapped with the other
+// pointers. A task whose list did not survive is a task in the inbox, because
+// `list = 0` is the inbox sentinel rather than a dangling id — the one place
+// the area's shape makes the merge simpler than the document's.
 
-use super::model::{SAttachment, SBlock, SDatabase, SPage, SProperty, SRecord, SValue, SView, SyncSnapshot};
+use super::model::{
+    SAttachment, SBlock, SDatabase, SNote, SPage, SProperty, SRecord, STask, STaskList, SValue,
+    SView, SyncSnapshot,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The id allocators the merge may draw on when it renumbers. The caller
@@ -48,6 +58,13 @@ pub struct MergeCtx<'a> {
     pub next_property: &'a mut dyn FnMut() -> u64,
     pub next_record: &'a mut dyn FnMut() -> u64,
     pub next_view: &'a mut dyn FnMut() -> u64,
+    /// SPEC §四十一's three. A renumbered subtask draws on the **task**
+    /// allocator, because a subtask's id is scoped to its task and the two are
+    /// never cross-referenced — the same argument `core::organizer` makes for
+    /// storing the checklist inside the task's row.
+    pub next_note: &'a mut dyn FnMut() -> u64,
+    pub next_task: &'a mut dyn FnMut() -> u64,
+    pub next_list: &'a mut dyn FnMut() -> u64,
 }
 
 #[derive(Debug, Default)]
@@ -247,6 +264,53 @@ pub fn merge(
     ));
     let mut renumber_blocks = unwrap_pairs(q_blocks);
 
+    // ── SPEC §四十一: the organizer's three collections ──
+    //
+    // Flat and independent of everything above — no page, no block, no
+    // database. The one cross-reference among the three is a task's list, and
+    // it is remapped with the other pointers below; `list = 0` is the inbox
+    // sentinel (`ListId::INBOX`), so a task whose list did *not* survive the
+    // merge (a list deleted on the other side) is still a task in the inbox
+    // rather than a row pointing at nothing.
+    let mut q_notes: Vec<(u64, SNote)> = Vec::new();
+    let (kept_notes, taken_notes) = split_origin(merge_flat(
+        &local.notes,
+        shadow.map(|s| s.notes.as_slice()),
+        &remote.notes,
+        |n| n.id,
+        "note",
+        peer,
+        &mut conflicts,
+        &mut q_notes,
+    ));
+    let mut renumber_notes = unwrap_pairs(q_notes);
+
+    let mut q_lists: Vec<(u64, STaskList)> = Vec::new();
+    let (kept_lists, taken_lists) = split_origin(merge_flat(
+        &local.lists,
+        shadow.map(|s| s.lists.as_slice()),
+        &remote.lists,
+        |l| l.id,
+        "list",
+        peer,
+        &mut conflicts,
+        &mut q_lists,
+    ));
+    let mut renumber_lists = unwrap_pairs(q_lists);
+
+    let mut q_tasks: Vec<(u64, STask)> = Vec::new();
+    let (kept_tasks, mut taken_tasks) = split_origin(merge_flat(
+        &local.tasks,
+        shadow.map(|s| s.tasks.as_slice()),
+        &remote.tasks,
+        |t| t.id,
+        "task",
+        peer,
+        &mut conflicts,
+        &mut q_tasks,
+    ));
+    let mut renumber_tasks = unwrap_pairs(q_tasks);
+
     // ── databases: the entity rows are compared as entities (id + name +
     // template) — their columns, views, records and cells travel flat below
     // and are grouped back onto whichever entity row wins. Comparing the
@@ -397,6 +461,11 @@ pub fn merge(
     let mut prop_map: HashMap<u64, u64> = HashMap::new();
     let mut record_map: HashMap<u64, u64> = HashMap::new();
     let mut view_map: HashMap<u64, u64> = HashMap::new();
+    // Which local list a renumbered remote list became — the organizer's only
+    // cross-reference (`STask.list`). A fresh id is allocated here rather than
+    // extrapolated, so the remap below cannot accidentally land on 0, which is
+    // the inbox and not a list.
+    let mut list_map: HashMap<u64, u64> = HashMap::new();
 
     for p in &mut renumber_pages {
         let new = (ctx.next_page)();
@@ -434,6 +503,21 @@ pub fn merge(
         view_map.insert(v.id, new);
         v.id = new;
     }
+    // The organizer's three, allocated the same way. Only the **list** needs a
+    // map: nothing references a note or a task (`STask.list` is the one pointer
+    // in the area, and a subtask's id is scoped to its own task), so a
+    // renumbered note or task is simply a row under a fresh id.
+    for n in &mut renumber_notes {
+        n.id = (ctx.next_note)();
+    }
+    for t in &mut renumber_tasks {
+        t.id = (ctx.next_task)();
+    }
+    for l in &mut renumber_lists {
+        let new = (ctx.next_list)();
+        list_map.insert(l.id, new);
+        l.id = new;
+    }
     for v in &mut renumber_values {
         v.record = *record_map.get(&v.record).unwrap_or(&v.record);
         v.property = *prop_map.get(&v.property).unwrap_or(&v.property);
@@ -465,6 +549,14 @@ pub fn merge(
     for v in taken_values.iter_mut().chain(renumber_values.iter_mut()) {
         v.record = *record_map.get(&v.record).unwrap_or(&v.record);
         v.property = *prop_map.get(&v.property).unwrap_or(&v.property);
+    }
+    // A task's list, the one pointer in the organizer. Remote rows only, for
+    // the same reason as every remap above: a local row's list id is this
+    // device's and the merge never moved it. `0` is not in the map (the inbox
+    // is not a row and cannot be renumbered), so a task in the inbox stays in
+    // the inbox.
+    for t in taken_tasks.iter_mut().chain(renumber_tasks.iter_mut()) {
+        t.list = *list_map.get(&t.list).unwrap_or(&t.list);
     }
 
     // ── assemble: rows grouped back into their database entries ──
@@ -519,6 +611,25 @@ pub fn merge(
         blocks,
         attachments,
         databases: all_dbs,
+        // SPEC §四十一: local rows first, then the remote ones that were taken,
+        // then the renumbered ones — the same order the collections above use,
+        // and none of it a constraint on the app (it reads the snapshot into its
+        // own catalog, which sorts itself).
+        notes: kept_notes
+            .into_iter()
+            .chain(taken_notes)
+            .chain(renumber_notes)
+            .collect(),
+        tasks: kept_tasks
+            .into_iter()
+            .chain(taken_tasks)
+            .chain(renumber_tasks)
+            .collect(),
+        lists: kept_lists
+            .into_iter()
+            .chain(taken_lists)
+            .chain(renumber_lists)
+            .collect(),
     };
     outcome.conflicts = conflicts;
     outcome
@@ -624,6 +735,7 @@ pub fn sort_blocks_parents_first(blocks: &mut [SBlock]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::sync::model::SSubtask;
 
     fn snap() -> SyncSnapshot {
         SyncSnapshot::default()
@@ -688,6 +800,9 @@ mod tests {
         let mut prop = { let c = c.clone(); move || alloc(&c) };
         let mut rec = { let c = c.clone(); move || alloc(&c) };
         let mut view = { let c = c.clone(); move || alloc(&c) };
+        let mut note = { let c = c.clone(); move || alloc(&c) };
+        let mut task = { let c = c.clone(); move || alloc(&c) };
+        let mut list = { let c = c.clone(); move || alloc(&c) };
         let mut ctx = MergeCtx {
             next_page: &mut page,
             next_block: &mut block,
@@ -696,8 +811,55 @@ mod tests {
             next_property: &mut prop,
             next_record: &mut rec,
             next_view: &mut view,
+            next_note: &mut note,
+            next_task: &mut task,
+            next_list: &mut list,
         };
         f(&mut ctx)
+    }
+
+    fn note(id: u64, title: &str) -> SNote {
+        SNote {
+            id,
+            title: title.into(),
+            body: format!("body of {title}"),
+            pinned: false,
+            tags: vec!["tag".into()],
+            created: 1_700_000_000 + id as i64,
+            edited: 1_700_000_900 + id as i64,
+        }
+    }
+
+    fn list(id: u64, name: &str) -> STaskList {
+        STaskList {
+            id,
+            name: name.into(),
+            color: "blue".into(),
+            ord: id,
+        }
+    }
+
+    fn task(id: u64, list: u64, title: &str) -> STask {
+        STask {
+            id,
+            list,
+            title: title.into(),
+            notes: String::new(),
+            priority: "medium".into(),
+            due: Some("2026-09-24".into()),
+            repeat: "weekly".into(),
+            done: false,
+            completed_at: None,
+            tags: vec!["work".into()],
+            subtasks: vec![SSubtask {
+                id: id * 10,
+                title: "step".into(),
+                done: false,
+            }],
+            created: 1_700_000_000 + id as i64,
+            edited: 1_700_000_900 + id as i64,
+            ord: id,
+        }
     }
 
     #[test]
@@ -893,5 +1055,123 @@ mod tests {
             out.merged.databases[0].values[0].text.as_deref(),
             Some("edited here")
         );
+    }
+
+    // ─── SPEC §四十一: the organizer's three collections ───────────────────
+
+    /// The organizer is three flat collections beside the pages and blocks: a
+    /// row only one side has flows across, a row both sides already agree on
+    /// stays put, and a task in the inbox needs no list row to arrive with it —
+    /// `0` is the sentinel, so the inbox costs the wire nothing.
+    #[test]
+    fn the_organizer_flows_flat_and_a_remote_only_row_is_taken() {
+        let mut local = snap();
+        local.notes.push(note(1, "mine"));
+        local.lists.push(list(2, "Mine"));
+        local.tasks.push(task(3, 2, "mine"));
+
+        let mut remote = snap();
+        remote.notes.push(note(1, "mine")); // converged
+        remote.notes.push(note(4, "theirs"));
+        remote.lists.push(list(2, "Mine"));
+        remote.lists.push(list(5, "Theirs"));
+        remote.tasks.push(task(3, 2, "mine"));
+        remote.tasks.push(task(6, 5, "theirs"));
+        remote.tasks.push(task(7, 0, "in the inbox"));
+
+        let out = with_ctx(1000, |ctx| merge(&local, None, &remote, "phone", ctx));
+        assert_eq!(out.merged.notes.len(), 2);
+        assert_eq!(out.merged.lists.len(), 2);
+        assert_eq!(out.merged.tasks.len(), 3);
+        assert!(out.merged.notes.iter().any(|n| n.title == "theirs"));
+        assert!(out.merged.lists.iter().any(|l| l.name == "Theirs"));
+        assert!(out
+            .merged
+            .tasks
+            .iter()
+            .any(|t| t.title == "in the inbox" && t.list == 0));
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+    }
+
+    /// One side moving a row lands, both sides moving it conflicts and keeps
+    /// this device's copy, and a remote delete over an untouched local row
+    /// lands — the three decisions `decide` makes, asked of the organizer's
+    /// rows exactly as they are asked of a page.
+    #[test]
+    fn an_organizer_edit_lands_from_one_side_and_conflicts_from_both() {
+        let mut base = snap();
+        base.notes.push(note(1, "shared"));
+        base.tasks.push(task(3, 0, "shared"));
+        let shadow = base.clone();
+
+        let mut remote = base.clone();
+        remote.notes[0].title = "renamed there".into();
+        remote.tasks[0].done = true;
+
+        // the remote moved, the local did not
+        let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &remote, "phone", ctx));
+        assert_eq!(out.merged.notes[0].title, "renamed there");
+        assert!(out.merged.tasks[0].done);
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+
+        // both moved: this device's copy wins and the user is told
+        let mut local = base.clone();
+        local.notes[0].title = "renamed here".into();
+        let out = with_ctx(0, |ctx| merge(&local, Some(&shadow), &remote, "phone", ctx));
+        assert_eq!(out.merged.notes[0].title, "renamed here");
+        assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+        assert!(out.conflicts[0].contains("note"), "{:?}", out.conflicts);
+
+        // a remote delete over an unchanged local copy lands
+        let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &snap(), "phone", ctx));
+        assert!(out.merged.notes.is_empty());
+        assert!(out.merged.tasks.is_empty());
+    }
+
+    /// The one pointer in the area. Two devices that each minted list 5 keep
+    /// both lists, and every task that arrived pointing at the remote one is
+    /// remapped onto the id it actually landed under — while the local list's
+    /// tasks stay where they were and the inbox stays the inbox.
+    #[test]
+    fn a_colliding_list_id_renumbers_and_the_tasks_that_named_it_follow() {
+        let mut local = snap();
+        local.lists.push(list(5, "local list"));
+        local.tasks.push(task(20, 5, "points at the local list"));
+
+        let mut remote = snap();
+        remote.lists.push(list(5, "remote list"));
+        remote.tasks.push(task(21, 5, "points at the remote list"));
+        remote.tasks.push(task(22, 0, "in the inbox"));
+
+        let out = with_ctx(1000, |ctx| merge(&local, Some(&snap()), &remote, "phone", ctx));
+        assert!(
+            out.merged.lists.iter().any(|l| l.id == 5 && l.name == "local list"),
+            "the local list keeps its id"
+        );
+        let twin = out
+            .merged
+            .lists
+            .iter()
+            .find(|l| l.id != 5)
+            .expect("the colliding remote list was renumbered rather than lost");
+        assert_eq!(twin.name, "remote list");
+
+        let mine = out.merged.tasks.iter().find(|t| t.id == 20).unwrap();
+        assert_eq!(mine.list, 5, "a local task's list is this device's and did not move");
+        let theirs = out
+            .merged
+            .tasks
+            .iter()
+            .find(|t| t.title == "points at the remote list")
+            .unwrap();
+        assert_eq!(theirs.list, twin.id, "it followed the list it arrived with");
+        let inbox = out
+            .merged
+            .tasks
+            .iter()
+            .find(|t| t.title == "in the inbox")
+            .unwrap();
+        assert_eq!(inbox.list, 0, "the sentinel is not a list and cannot be remapped");
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
     }
 }

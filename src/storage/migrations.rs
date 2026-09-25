@@ -29,7 +29,12 @@ use crate::core::StorageError;
 /// plain `CREATE TABLE`s of their own for the reason v12 gives: one step per
 /// semantic unit, because a migration is the one thing here that cannot be
 /// undone, and a half-applied upgrade has to stay readable.
-pub const CURRENT_VERSION: i32 = 26;
+///
+/// Step 27 is the organizer's 引用 (`notes.ref_note`): the first column added to a
+/// v24 table, and it goes through `add_note_columns` — the same
+/// `pragma_table_info` guard `add_page_columns` keeps — rather than editing v24,
+/// because v24 has already run in libraries that exist.
+pub const CURRENT_VERSION: i32 = 27;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -599,6 +604,22 @@ CREATE INDEX IF NOT EXISTS idx_tasks_done     ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_tasks_due      ON tasks(due);
 "#,
     backfill: None,
+}, Migration {
+    version: 27,
+    label: "note references",
+    // SPEC §四十一's 引用: a note that comments on another note names it here.
+    // The column is added by `add_note_columns`, not by editing v24, because v24
+    // has already run in libraries that exist — the whole reason the migration is
+    // a step of its own.
+    //
+    // **No foreign key, and a dangling id is allowed.** Deleting the note a
+    // comment answers must not delete the comment, and it must not fail either:
+    // the read side folds a ref that names nothing to "an ordinary note", the same
+    // rule `blocks.page_ref` keeps. `ON DELETE SET NULL` is deliberately *not*
+    // used for the same reason a cascade is not used for `tasks.list` — a rule
+    // enforced in SQLite is a rule no undo can reach.
+    sql: "",
+    backfill: Some(add_note_ref_note_column),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -620,6 +641,34 @@ fn add_page_columns(conn: &mut Connection, columns: &[(&str, &str)]) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Add each named column to `notes`, only when that column is missing — the
+/// `pages` rule above, for the organizer's one late column. `notes` arrived at
+/// v24 as a `CREATE TABLE`, so anything added to it now has to converge against a
+/// file that already has the table, which is what the guard is for.
+fn add_note_columns(conn: &mut Connection, columns: &[(&str, &str)]) -> Result<(), StorageError> {
+    for (name, ddl) in columns {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('notes') WHERE name = ?1",
+                [*name],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if present == 0 {
+            conn.execute(ddl, [])
+                .map_err(|e| StorageError::Sql(format!("add {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Migration 27 body. A nullable integer and not `DEFAULT 0`: a note that is not
+/// a reply has no ref at all, and `0` would name `NoteId(0)` — an id no note ever
+/// gets, but a distinction worth keeping in the column rather than in a comment.
+fn add_note_ref_note_column(conn: &mut Connection) -> Result<(), StorageError> {
+    add_note_columns(conn, &[("ref_note", "ALTER TABLE notes ADD COLUMN ref_note INTEGER")])
 }
 
 /// Migration 11 body.

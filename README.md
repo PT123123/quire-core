@@ -54,7 +54,11 @@ you are about to publish a figure.
 
 ## Where the design record lives
 
-The specification, the ADR chain and the per-slice reports are still in the
-desktop repository, because they describe the product and not only this crate:
+The specification and the product's ADR chain are still in the desktop
+repository, because they describe the product and not only this crate:
 `docs/SPEC.md` §三十九 and §四十, `docs/DECISIONS.md`, `docs/PERFORMANCE.md`.
 Copy them across if this repository starts making its own product decisions.
+
+It has started, for one thing: `docs/DECISIONS.md` here holds the decisions that
+are about the *shared model* rather than about a shell — so far ADR-0001, the
+note-to-note reference. `CHANGELOG.md` records the same changes as they land.

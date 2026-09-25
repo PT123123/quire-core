@@ -273,7 +273,7 @@ pub fn merge(
     // merge (a list deleted on the other side) is still a task in the inbox
     // rather than a row pointing at nothing.
     let mut q_notes: Vec<(u64, SNote)> = Vec::new();
-    let (kept_notes, taken_notes) = split_origin(merge_flat(
+    let (kept_notes, mut taken_notes) = split_origin(merge_flat(
         &local.notes,
         shadow.map(|s| s.notes.as_slice()),
         &remote.notes,
@@ -466,6 +466,11 @@ pub fn merge(
     // extrapolated, so the remap below cannot accidentally land on 0, which is
     // the inbox and not a list.
     let mut list_map: HashMap<u64, u64> = HashMap::new();
+    // A note's ref is the organizer's one *self*-reference (`SNote.ref_note`), so
+    // the renumbered notes need a map of their own — without it a comment that was
+    // renumbered would keep pointing at the id its parent used to have, which on
+    // this device may be a different note or no note at all.
+    let mut note_map: HashMap<u64, u64> = HashMap::new();
 
     for p in &mut renumber_pages {
         let new = (ctx.next_page)();
@@ -503,12 +508,14 @@ pub fn merge(
         view_map.insert(v.id, new);
         v.id = new;
     }
-    // The organizer's three, allocated the same way. Only the **list** needs a
-    // map: nothing references a note or a task (`STask.list` is the one pointer
-    // in the area, and a subtask's id is scoped to its own task), so a
-    // renumbered note or task is simply a row under a fresh id.
+    // The organizer's three, allocated the same way. The **list** and the **note**
+    // need a map: `STask.list` is the area's one pointer between rows, and
+    // `SNote.ref_note` is a note pointing at a note. A task's subtask ids are
+    // scoped to their own task, so a task is simply a row under a fresh id.
     for n in &mut renumber_notes {
-        n.id = (ctx.next_note)();
+        let new = (ctx.next_note)();
+        note_map.insert(n.id, new);
+        n.id = new;
     }
     for t in &mut renumber_tasks {
         t.id = (ctx.next_task)();
@@ -557,6 +564,16 @@ pub fn merge(
     // the inbox.
     for t in taken_tasks.iter_mut().chain(renumber_tasks.iter_mut()) {
         t.list = *list_map.get(&t.list).unwrap_or(&t.list);
+    }
+    // A comment's parent, on remote-origin rows only for the same reason. The
+    // `unwrap_or` is load-bearing and is the `page_ref` rule exactly: a ref to a
+    // note that **did not survive** the merge is left alone rather than cleared,
+    // so a comment whose parent is not here stays a comment — and if the parent
+    // arrives in a later sync the ref is already right. `note_map` holds only the
+    // rows this merge renumbered; an id that is not in it points at a note that is
+    // already on this device under that same id.
+    for n in taken_notes.iter_mut().chain(renumber_notes.iter_mut()) {
+        n.ref_note = n.ref_note.map(|v| *note_map.get(&v).unwrap_or(&v));
     }
 
     // ── assemble: rows grouped back into their database entries ──
@@ -827,7 +844,14 @@ mod tests {
             tags: vec!["tag".into()],
             created: 1_700_000_000 + id as i64,
             edited: 1_700_000_900 + id as i64,
+            ref_note: None,
         }
+    }
+
+    /// A reply: [`note`] with its ref set. Its own helper so a test that is about
+    /// the ref does not have to build the whole row to say so.
+    fn comment(id: u64, title: &str, parent: u64) -> SNote {
+        SNote { ref_note: Some(parent), ..note(id, title) }
     }
 
     fn list(id: u64, name: &str) -> STaskList {
@@ -1173,5 +1197,61 @@ mod tests {
             .unwrap();
         assert_eq!(inbox.list, 0, "the sentinel is not a list and cannot be remapped");
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+    }
+
+    /// The organizer's one *self*-reference: a note pointing at a note. When the
+    /// parent is renumbered the reply has to follow it, or the comment would end up
+    /// answering whatever this device happens to hold under the old id.
+    #[test]
+    fn a_comment_follows_its_renumbered_parent() {
+        let mut local = snap();
+        local.notes.push(note(5, "local parent"));
+
+        // Both sides minted note 5, and neither had it before: the local one keeps
+        // the id and the remote one is renumbered.
+        let mut remote = snap();
+        remote.notes.push(note(5, "remote parent"));
+        remote.notes.push(comment(6, "the reply", 5));
+
+        let out = with_ctx(1000, |ctx| merge(&local, Some(&snap()), &remote, "phone", ctx));
+
+        let parent = out
+            .merged
+            .notes
+            .iter()
+            .find(|n| n.title == "remote parent")
+            .expect("the colliding remote note was renumbered rather than lost");
+        assert_ne!(parent.id, 5, "the local note keeps its own id");
+        let reply = out
+            .merged
+            .notes
+            .iter()
+            .find(|n| n.title == "the reply")
+            .expect("the reply survived the merge");
+        assert_eq!(
+            reply.ref_note,
+            Some(parent.id),
+            "the comment's ref moved with the parent it answers"
+        );
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+    }
+
+    /// A reply whose parent is nowhere: the ref rides through **unchanged** rather
+    /// than being cleared. The comment stays a comment, and if the parent arrives
+    /// in a later sync the ref already points at it — the `page_ref` rule.
+    #[test]
+    fn a_ref_to_a_note_that_did_not_come_leaves_the_comment_a_comment() {
+        let mut remote = snap();
+        remote.notes.push(comment(9, "orphan reply", 404));
+
+        let out = with_ctx(1000, |ctx| merge(&snap(), None, &remote, "phone", ctx));
+
+        let reply = out
+            .merged
+            .notes
+            .iter()
+            .find(|n| n.id == 9)
+            .expect("the reply arrived");
+        assert_eq!(reply.ref_note, Some(404), "a dangling ref is kept, not scrubbed");
     }
 }

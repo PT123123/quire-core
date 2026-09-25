@@ -137,7 +137,10 @@ impl SqliteRepository {
 
 fn read_notes(conn: &Connection) -> Result<Vec<Note>, StorageError> {
     let mut stmt = conn
-        .prepare("SELECT id, title, body, pinned, tags, created, edited FROM notes ORDER BY id")
+        .prepare(
+            "SELECT id, title, body, pinned, tags, created, edited, ref_note
+               FROM notes ORDER BY id",
+        )
         .map_err(sql)?;
     let rows = stmt
         .query_map([], |r| {
@@ -149,12 +152,13 @@ fn read_notes(conn: &Connection) -> Result<Vec<Note>, StorageError> {
                 r.get::<_, String>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, Option<i64>>(7)?,
             ))
         })
         .map_err(sql)?;
     let mut out = Vec::new();
     for row in rows {
-        let (note, title, body, pinned, tags, created, edited) = row.map_err(sql)?;
+        let (note, title, body, pinned, tags, created, edited, ref_note) = row.map_err(sql)?;
         out.push(Note {
             id: NoteId(note as u64),
             title,
@@ -163,6 +167,10 @@ fn read_notes(conn: &Connection) -> Result<Vec<Note>, StorageError> {
             tags: tags_from_json(&tags),
             created,
             edited,
+            // Carried through exactly as stored, **including an id that names no
+            // note**: a dangling ref is a real state (the note it answered was
+            // deleted), and the store is not the layer that decides what it means.
+            ref_note: ref_note.map(|r| NoteId(r.max(0) as u64)),
         });
     }
     Ok(out)
@@ -285,8 +293,8 @@ fn read_tasks(conn: &Connection) -> Result<Vec<Task>, StorageError> {
 
 pub(crate) fn insert_note(tx: &Transaction, note: &Note) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO notes (id, title, body, pinned, tags, created, edited)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO notes (id, title, body, pinned, tags, created, edited, ref_note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             id(note.id.as_u64()),
             note.title,
@@ -295,6 +303,7 @@ pub(crate) fn insert_note(tx: &Transaction, note: &Note) -> Result<(), StorageEr
             tags_to_json(&note.tags),
             note.created,
             note.edited,
+            note.ref_note.map(|r| id(r.as_u64())),
         ],
     )
     .map_err(sql)?;
@@ -305,7 +314,7 @@ pub(crate) fn set_note(tx: &Transaction, note: &Note) -> Result<(), StorageError
     let n = tx
         .execute(
             "UPDATE notes SET title = ?2, body = ?3, pinned = ?4, tags = ?5, created = ?6,
-                              edited = ?7
+                              edited = ?7, ref_note = ?8
               WHERE id = ?1",
             params![
                 id(note.id.as_u64()),
@@ -315,6 +324,7 @@ pub(crate) fn set_note(tx: &Transaction, note: &Note) -> Result<(), StorageError
                 tags_to_json(&note.tags),
                 note.created,
                 note.edited,
+                note.ref_note.map(|r| id(r.as_u64())),
             ],
         )
         .map_err(sql)?;

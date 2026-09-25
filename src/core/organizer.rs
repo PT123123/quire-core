@@ -107,6 +107,16 @@ pub struct Note {
     pub created: i64,
     /// The last write's instant, restamped by whoever edits the row.
     pub edited: i64,
+    /// The note this one comments on, when it is a reply (SPEC §四十一's 引用).
+    /// `None` is an ordinary note.
+    ///
+    /// This is the organizer's first **self-reference**, and it deliberately keeps
+    /// the rules blocks already keep: there is no foreign key, and a *dangling* id
+    /// is tolerated rather than scrubbed. Deleting the note a comment answers must
+    /// not delete the comment — the comment is the user's writing — so a ref that
+    /// resolves to nothing simply paints as an ordinary note, exactly as a
+    /// dangling `Block::page_ref` does.
+    pub ref_note: Option<NoteId>,
 }
 
 /// One user's list of tasks (SPEC §四十一 「任务」's 清单). The inbox is *not*
@@ -365,6 +375,9 @@ mod tests {
             tags: vec!["idea".into()],
             created: 1_000,
             edited: 2_000,
+            // Even ids reply to the note before them, so a test can exercise a ref
+            // without a second helper.
+            ref_note: if id % 2 == 0 && id > 1 { Some(NoteId(id - 1)) } else { None },
         }
     }
 

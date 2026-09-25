@@ -4371,6 +4371,9 @@ mod tests {
             tags: vec!["idea".into()],
             created: 1_000,
             edited: 2_000,
+            // Note 2 replies to note 1, so the undo tests carry a ref through
+            // `CreateNote`/`DeleteNote` without a helper of their own.
+            ref_note: if id == 2 { Some(NoteId(1)) } else { None },
         }
     }
 

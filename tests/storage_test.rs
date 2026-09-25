@@ -74,6 +74,10 @@ fn organizer_note(id: u64) -> Note {
         tags: vec!["idea".into(), "重要".into()],
         created: 1_700_000_000 + id as i64,
         edited: 1_700_000_900 + id as i64,
+        // Non-default on the even ids, so the round trip exercises a stored ref as
+        // well as an absent one: a column the load forgot would read back as `None`
+        // against a `Some` row and fail the comparison.
+        ref_note: (id % 2 == 0).then(|| NoteId(id - 1)),
     }
 }
 
@@ -1365,6 +1369,9 @@ fn the_v24_to_v26_steps_add_the_organizer_tables_to_a_v23_database() {
         for (table, column) in [
             ("notes", "pinned"),
             ("notes", "tags"),
+            // Added by step 27 rather than by v24's `CREATE TABLE`, so this also
+            // covers the `ALTER` converging onto a table the same run made.
+            ("notes", "ref_note"),
             ("task_lists", "color"),
             ("tasks", "subtasks"),
             ("tasks", "completed_at"),
@@ -1416,6 +1423,57 @@ fn the_v24_to_v26_steps_add_the_organizer_tables_to_a_v23_database() {
     assert_eq!(catalog.lists.len(), 1);
     assert_eq!(catalog.tasks.len(), 1);
     assert_eq!(repo.load().unwrap().pages.len(), 1, "and the document is still there");
+}
+
+/// Step 27 adds the organizer's one *self*-reference to a file whose `notes` table
+/// already exists — which is the whole reason the step is an `ALTER` behind the
+/// `pragma_table_info` guard rather than an edit to v24.
+#[test]
+fn the_v27_step_adds_the_note_ref_to_a_v26_database() {
+    let dir = tempfile();
+    let path = dir.join("note-ref.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE notes DROP COLUMN ref_note;
+             PRAGMA user_version = 26;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (id, title, body, pinned, tags, created, edited)
+             VALUES (1, 'Old', 'written before the ref', 0, '', 1, 2)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(migrations::user_version(&conn).unwrap(), 26);
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('notes') WHERE name = 'ref_note'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0, "the rolled-back schema has no ref column");
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        // NULL and not 0: an ordinary note has no ref at all, and the row written
+        // before the step is still the row it was.
+        let ref_note: Option<i64> = conn
+            .query_row("SELECT ref_note FROM notes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ref_note, None);
+        // Idempotent, like every step before it: the guard makes a replay a no-op
+        // instead of a duplicate-column error.
+        migrations::ensure_current(&mut conn).unwrap();
+    }
 }
 
 #[test]

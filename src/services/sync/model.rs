@@ -237,6 +237,11 @@ pub struct SNote {
     /// sync would read that as a change.
     pub created: i64,
     pub edited: i64,
+    /// The note this one comments on, when it is a reply. On the wire as an
+    /// `Option`, and **a dangling id is allowed through**: a peer may hold the
+    /// comment without the note it answers, and `merge`'s renumber pass is what
+    /// keeps the id pointing at the right row when it can.
+    pub ref_note: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -518,6 +523,7 @@ impl From<&org::Note> for SNote {
             tags: n.tags.clone(),
             created: n.created,
             edited: n.edited,
+            ref_note: n.ref_note.map(|r| r.0),
         }
     }
 }
@@ -532,6 +538,7 @@ impl SNote {
             tags: self.tags.clone(),
             created: self.created,
             edited: self.edited,
+            ref_note: self.ref_note.map(org::NoteId),
         }
     }
 }
@@ -778,6 +785,9 @@ mod tests {
             tags: vec!["idea".into(), "重要".into()],
             created: 1_700_000_000,
             edited: 1_700_000_900,
+            // A reply, so the round trip covers the ref: a comment that lost it on
+            // the wire would land on the other device as an ordinary note.
+            ref_note: Some(org::NoteId(2)),
         };
         assert_eq!(SNote::from(&note).to_core(), note);
 

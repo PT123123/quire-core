@@ -68,6 +68,7 @@ fn block(id: u64, page_id: u64, parent: Option<u64>, ord: u64, text: &str) -> Bl
 fn organizer_note(id: u64) -> Note {
     Note {
         id: NoteId(id),
+        uuid: format!("{id:032x}"),
         title: format!("Note {id}"),
         body: "line one\nline two 中文".into(),
         pinned: id % 2 == 1,
@@ -93,6 +94,7 @@ fn organizer_list(id: u64) -> TaskList {
 fn organizer_task(id: u64, list: ListId) -> Task {
     Task {
         id: TaskId(id),
+        uuid: format!("{:032x}", 1_000 + id),
         list,
         title: format!("Task {id}"),
         notes: "under the title".into(),
@@ -1473,6 +1475,65 @@ fn the_v27_step_adds_the_note_ref_to_a_v26_database() {
         // Idempotent, like every step before it: the guard makes a replay a no-op
         // instead of a duplicate-column error.
         migrations::ensure_current(&mut conn).unwrap();
+    }
+}
+
+/// The 唯一 ID step: two columns added to two tables that already exist, and the
+/// backfill that gives the rows a library already holds a real identity — 32
+/// lowercase hex characters from `randomblob(16)`, never the empty string a bare
+/// `NOT NULL DEFAULT ''` would leave behind.
+#[test]
+fn the_v28_step_adds_and_backfills_the_organizer_uuids() {
+    let dir = tempfile();
+    let path = dir.join("organizer-uuid.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE notes DROP COLUMN uuid;
+             ALTER TABLE tasks DROP COLUMN uuid;
+             PRAGMA user_version = 27;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (id, title, body, pinned, tags, created, edited)
+             VALUES (1, 'Old', 'written before the uuid', 0, '', 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, list, title, notes, priority, repeat, done, tags, subtasks,
+                                created, edited, ord)
+             VALUES (1, 0, 'Old task', '', 'none', 'none', 0, '', '', 1, 2, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        for table in ["notes", "tasks"] {
+            let uuid: String = conn
+                .query_row(&format!("SELECT uuid FROM {table} WHERE id = 1"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(uuid.len(), 32, "{table}.uuid was not backfilled: {uuid:?}");
+            assert!(uuid.chars().all(|c| c.is_ascii_hexdigit()), "{table}.uuid = {uuid}");
+        }
+        // Idempotent, like every step before it — and the backfill's own
+        // `WHERE uuid = ''` is what makes that true of the *data* and not only of
+        // the DDL: a replay must not re-mint an identity the row already has.
+        let before: String = conn
+            .query_row("SELECT uuid FROM notes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        let after: String = conn
+            .query_row("SELECT uuid FROM notes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "a replay re-minted an identity");
     }
 }
 

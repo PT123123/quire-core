@@ -34,7 +34,12 @@ use crate::core::StorageError;
 /// v24 table, and it goes through `add_note_columns` — the same
 /// `pragma_table_info` guard `add_page_columns` keeps — rather than editing v24,
 /// because v24 has already run in libraries that exist.
-pub const CURRENT_VERSION: i32 = 27;
+///
+/// Step 28 is the organizer's 唯一 ID (`notes.uuid` / `tasks.uuid`): the same
+/// shape one step further on, on two tables at once, plus the one-time
+/// `randomblob` backfill that gives every row that predates it an identity (see
+/// `add_organizer_uuid_columns`).
+pub const CURRENT_VERSION: i32 = 28;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -620,6 +625,25 @@ CREATE INDEX IF NOT EXISTS idx_tasks_due      ON tasks(due);
     // enforced in SQLite is a rule no undo can reach.
     sql: "",
     backfill: Some(add_note_ref_note_column),
+}, Migration {
+    version: 28,
+    label: "organizer uuids",
+    // SPEC §四十一's 唯一 ID: one 32-character hex identifier per note and per
+    // task, and the thing the AI batch instructions address a row by (see
+    // `core::organizer::new_uuid`). `id` cannot serve — it is a per-device
+    // watermark a merge *renumbers* — so the identity a device hands to another
+    // one (or to an AI, and back) has to be a value of its own.
+    //
+    // A late column on two tables that already exist, added through the guard
+    // `notes.ref_note` introduced, and **backfilled in place**: `randomblob(16)`
+    // is SQLite's own CSPRNG, so every row that predates this migration gets a
+    // real 128-bit value without Rust owning an RNG, and no row is ever left
+    // without an identity. Two devices that both backfill the same synced row
+    // will disagree about its uuid; `services::sync::merge` is what collapses
+    // that to one answer (the smaller value wins), because a uuid both peers can
+    // see must not depend on which device first read the row.
+    sql: "",
+    backfill: Some(add_organizer_uuid_columns),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -664,11 +688,60 @@ fn add_note_columns(conn: &mut Connection, columns: &[(&str, &str)]) -> Result<(
     Ok(())
 }
 
+/// Add each named column to `tasks`, only when that column is missing — the
+/// `notes` rule above, for the organizer's second table. `tasks` arrived at v26
+/// as a `CREATE TABLE`, so anything added to it now has to converge against a
+/// file that already has the table.
+fn add_task_columns(conn: &mut Connection, columns: &[(&str, &str)]) -> Result<(), StorageError> {
+    for (name, ddl) in columns {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+                [*name],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if present == 0 {
+            conn.execute(ddl, [])
+                .map_err(|e| StorageError::Sql(format!("add {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 /// Migration 27 body. A nullable integer and not `DEFAULT 0`: a note that is not
 /// a reply has no ref at all, and `0` would name `NoteId(0)` — an id no note ever
 /// gets, but a distinction worth keeping in the column rather than in a comment.
 fn add_note_ref_note_column(conn: &mut Connection) -> Result<(), StorageError> {
     add_note_columns(conn, &[("ref_note", "ALTER TABLE notes ADD COLUMN ref_note INTEGER")])
+}
+
+/// Migration 28 body: the two `uuid` columns, and the backfill that gives every
+/// row that predates them one.
+///
+/// `NOT NULL DEFAULT ''` rather than a nullable column, so the *store* has one
+/// shape to write and the "no identity yet" case is the empty string a reader
+/// can test — the guarded `ALTER` is what makes an old file converge instead of
+/// failing on a duplicate name. The two updates are the only place SQLite's
+/// `randomblob` is used, and they run once per library: after them no note and
+/// no task can reach `load_organizer` without a uuid.
+fn add_organizer_uuid_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    add_note_columns(
+        conn,
+        &[("uuid", "ALTER TABLE notes ADD COLUMN uuid TEXT NOT NULL DEFAULT ''")],
+    )?;
+    add_task_columns(
+        conn,
+        &[("uuid", "ALTER TABLE tasks ADD COLUMN uuid TEXT NOT NULL DEFAULT ''")],
+    )?;
+    for table in ["notes", "tasks"] {
+        conn.execute(
+            &format!("UPDATE {table} SET uuid = lower(hex(randomblob(16))) WHERE uuid = ''"),
+            [],
+        )
+        .map_err(|e| StorageError::Sql(format!("backfill {table}.uuid: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Migration 11 body.

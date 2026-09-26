@@ -227,6 +227,16 @@ pub struct SDatabase {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SNote {
     pub id: u64,
+    /// SPEC §四十一's 唯一 ID. **Defaulted on the wire**, and that is deliberate
+    /// rather than tidy: a peer at the rev before this column sends no `uuid`,
+    /// and a payload that failed to parse would take the whole sync down. An
+    /// absent one is the empty string, which `merge` fills and which the
+    /// clipboard falls back to `local:<id>` for — never a row with no name at
+    /// all. Keeping the snapshot version at 2 is the same call, for the reason
+    /// `SNAPSHOT_VERSION` states: an additive, defaulted field is not a reason
+    /// to lock an older device out of syncing.
+    #[serde(default)]
+    pub uuid: String,
     pub title: String,
     pub body: String,
     pub pinned: bool,
@@ -262,6 +272,9 @@ pub struct SSubtask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct STask {
     pub id: u64,
+    /// The task's 唯一 ID; see [`SNote::uuid`] for why it is defaulted.
+    #[serde(default)]
+    pub uuid: String,
     /// The list it belongs to, `0` being the inbox sentinel (`ListId::INBOX`) —
     /// an id and not a row, exactly as the column stores it, so a task in the
     /// inbox needs no list row to arrive with it.
@@ -517,6 +530,7 @@ impl From<&org::Note> for SNote {
     fn from(n: &org::Note) -> Self {
         SNote {
             id: n.id.0,
+            uuid: n.uuid.clone(),
             title: n.title.clone(),
             body: n.body.clone(),
             pinned: n.pinned,
@@ -532,6 +546,7 @@ impl SNote {
     pub fn to_core(&self) -> org::Note {
         org::Note {
             id: org::NoteId(self.id),
+            uuid: self.uuid.clone(),
             title: self.title.clone(),
             body: self.body.clone(),
             pinned: self.pinned,
@@ -589,6 +604,7 @@ impl From<&org::Task> for STask {
     fn from(t: &org::Task) -> Self {
         STask {
             id: t.id.0,
+            uuid: t.uuid.clone(),
             list: t.list.0,
             title: t.title.clone(),
             notes: t.notes.clone(),
@@ -610,6 +626,7 @@ impl STask {
     pub fn to_core(&self) -> org::Task {
         org::Task {
             id: org::TaskId(self.id),
+            uuid: self.uuid.clone(),
             // `0` is the inbox and stays `0`: the sentinel needs no lookup, and
             // a task that arrives in the inbox must not be sent to whichever
             // list happens to hold that id on this device.
@@ -779,6 +796,7 @@ mod tests {
     fn a_note_a_list_and_a_task_round_trip_through_their_wire_rows() {
         let note = org::Note {
             id: org::NoteId(3),
+            uuid: "0000000000000000000000000000000a".into(),
             title: "Ideas".into(),
             body: "one\ntwo 中文".into(),
             pinned: true,
@@ -801,6 +819,7 @@ mod tests {
 
         let task = org::Task {
             id: org::TaskId(9),
+            uuid: "0000000000000000000000000000000b".into(),
             list: org::ListId::INBOX,
             title: "Ship it".into(),
             notes: "under the title".into(),

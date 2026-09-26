@@ -87,11 +87,56 @@ impl ListId {
     }
 }
 
+/// A fresh 唯一 ID (SPEC §四十一): 32 lowercase hex characters.
+///
+/// Minted from the OS-seeded `RandomState` rather than from a clock, and that
+/// is the whole point of the column. Two devices that sync with each other mint
+/// rows in the same millisecond routinely, so a millisecond stamp is *the*
+/// collision this identifier exists to make impossible; `RandomState`'s keys
+/// come from the OS entropy pool, and two fresh ones (a running nonce and the
+/// wall clock mixed in) are a 128-bit value no peer repeats.
+///
+/// No `uuid` crate is pulled in for it — the same call `services::sync` makes
+/// for its device id, and the reason this lives in `core` with no dependency
+/// of its own. A uuid is not a fact about the file the way a colour or a date
+/// is; it only has to be unique, and this is the smallest way to be sure.
+pub fn new_uuid() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut out = String::with_capacity(32);
+    // Two hashers, so the value is 128 bits and not 64 — `Hasher::finish`
+    // answers with one `u64`, and a 64-bit identity has a birthday it can
+    // reach.
+    for part in 0..2u64 {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.write_u64(nonce);
+        hasher.write_u64(part);
+        out.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    out
+}
+
 /// One note (SPEC §四十一 「笔记」): a title, a body, and nothing else the
 /// document editor would need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub id: NoteId,
+    /// SPEC §四十一's 唯一 ID: minted once by [`new_uuid`], and what the AI
+    /// batch instructions (`app::org_commands`) address a note by — not `id`,
+    /// which is a per-device watermark a merge may *renumber*
+    /// (`services::sync::merge`), and therefore not a name a device can hand to
+    /// another one.
+    pub uuid: String,
     pub title: String,
     /// The body as plain text with its newlines kept. v1 deliberately renders
     /// no Markdown: a note that stored *and* rendered a second content format
@@ -287,6 +332,10 @@ impl Repeat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub id: TaskId,
+    /// The task's 唯一 ID, minted by [`new_uuid`] like a note's — see
+    /// [`Note::uuid`]. Subtasks have none: a subtask is addressed through its
+    /// task and its scoped integer id, never on its own.
+    pub uuid: String,
     /// The list it belongs to, or [`ListId::INBOX`] for the inbox. No foreign
     /// key: the inbox is a sentinel (see [`ListId::INBOX`]), and a task whose
     /// list is gone is a state the "delete a list" command *plans* — it moves
@@ -369,6 +418,10 @@ mod tests {
     fn note(id: u64) -> Note {
         Note {
             id: NoteId(id),
+            // Deterministic in a test, and shaped like the real thing: 32 hex
+            // characters, so a comparison that accidentally includes the uuid
+            // still compares two equal strings where it should.
+            uuid: format!("{id:032x}"),
             title: format!("Note {id}"),
             body: "one\ntwo".into(),
             pinned: id % 2 == 0,
@@ -384,6 +437,7 @@ mod tests {
     fn task(id: u64, list: ListId) -> Task {
         Task {
             id: TaskId(id),
+            uuid: format!("{:032x}", 1_000 + id),
             list,
             title: format!("Task {id}"),
             notes: String::new(),
@@ -522,5 +576,19 @@ mod tests {
         let mut other = a.clone();
         other.list = ListId(2);
         assert_ne!(a, other);
+    }
+
+    #[test]
+    fn a_uuid_is_thirty_two_hex_characters_and_never_repeats() {
+        let a = new_uuid();
+        assert_eq!(a.len(), 32, "the column is 32 characters wide");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a} is not hex");
+        assert_ne!(a, new_uuid());
+        // The mint loop runs faster than the clock, so the nonce is what
+        // separates two of them: a thousand in a row must all be distinct.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(seen.insert(new_uuid()), "a uuid repeated");
+        }
     }
 }

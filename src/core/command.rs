@@ -4365,6 +4365,7 @@ mod tests {
     fn note(id: u64) -> Note {
         Note {
             id: NoteId(id),
+            uuid: format!("{id:032x}"),
             title: format!("Note {id}"),
             body: "line one\nline two".into(),
             pinned: false,
@@ -4380,6 +4381,7 @@ mod tests {
     fn task(id: u64, list: ListId) -> Task {
         Task {
             id: TaskId(id),
+            uuid: format!("{:032x}", 1_000 + id),
             list,
             title: format!("Task {id}"),
             notes: String::new(),

@@ -9,6 +9,63 @@ rather than the product's. `README.md` says where the chain used to live: the
 desktop repository, because it described the product. A decision about the shared
 model — one the shells consume rather than make — belongs here.
 
+## ADR-0002 · A note and a task each carry a 唯一 ID, and a merge cannot disagree about it
+
+Decision: `org::Note` and `org::Task` each gain `uuid: String` — 32 lowercase hex
+characters (`core::organizer::new_uuid`), minted once when the row is created and
+never re-minted. It is stored in a `uuid` column on each table (migration **28**, an
+`ALTER` behind the same `pragma_table_info` guard `notes.ref_note` introduced) and
+travels as `SNote.uuid` / `STask.uuid`. `merge` **normalises it before the three-way
+decision**, by the row's own id: a blank adopts the other side's value; two real
+values for one row are two independent backfills and the smaller wins; a row neither
+side named is minted on arrival.
+
+Why: the shells hand a note or a task to an AI and take a batch of instructions back,
+and each instruction has to name exactly one row. The only identity this crate had was
+`id`, and `id` is deliberately **not** stable across devices: it is a per-device
+`max + 1` watermark, and `merge` *renumbers* a colliding id rather than dropping a row.
+An instruction that named a row by `id` would therefore name a different row — or none
+— on another device, and the failure would be silent and destructive (an edit or a
+delete landing on the wrong note). A uuid is the smallest value that cannot do that.
+
+Why not a millisecond stamp: the two ends of a sync are typically one person's phone
+and laptop, minting rows in the same millisecond routinely. A clock-derived id is not
+"less unique", it is *the* collision this column exists to prevent, and it would fail
+exactly when a user first syncs two devices that already hold content. `RandomState`'s
+OS-seeded hasher — two of them, over a running nonce and the wall clock — is 128 bits,
+per-process unpredictable, and free of any RNG dependency; it is the same call
+`services::sync` already makes for its device id.
+
+Why an additive wire field instead of a snapshot version bump: the field is
+`#[serde(default)]`, so a peer at the previous rev parses our snapshot (ignoring the
+uuid) and its own parses here with the uuid blank. A bump would lock that peer out —
+the cost accepted for a *new collection*, and not one an added attribute should pay.
+
+Consequences:
+
+- **The identity of a row is now an attribute, so the merge has to treat it as one.**
+  Left in the ordinary field-by-field comparison, a uuid that only one side carried
+  would read as "both edited the row" (a logged conflict) or, with no shadow, as two
+  devices that minted one id for different rows — a *renumber*, which duplicates the
+  row. The normalisation pass is what stops the identity from changing what the
+  three-way merge decides about the row itself.
+- **Two devices can backfill the same row differently**, because migration 28's
+  `randomblob` runs locally on each. "The smaller value wins" is what collapses that to
+  one answer both peers agree on, instead of each preferring its own and trading the
+  row on every sync. It is a rule about a value no user can observe, so it costs
+  nothing to be arbitrary — only to be *deterministic*.
+- `new_uuid` lives in `core`, so neither shell owns an RNG and both mint the same
+  shape. A shell that creates a row must mint one; nothing else changes, because every
+  organizer command already carries the whole row, so an edit, an undo and a redo
+  replay the identity for free.
+- A peer that never sends one is still addressable: a shell should name a row by its
+  `uuid` when that is non-empty and by `local:<id>` when it is not, and an instruction
+  that carries an `id` is accepted as well as one that carries a `uuid`.
+- Cross-shell follow-ups, recorded here so they are not lost: the desktop shell's
+  `docs/SPEC.md` §四十一 and its ADR chain live in the desktop repository and should
+  gain the 唯一 ID paragraph and a decision of their own when that shell bumps its
+  pinned `rev`.
+
 ## ADR-0001 · A note may reference a note, with no foreign key and a tolerated dangling id
 
 Decision: `org::Note` gains `ref_note: Option<NoteId>` — the note this one comments

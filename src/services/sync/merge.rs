@@ -65,6 +65,11 @@ pub struct MergeCtx<'a> {
     pub next_note: &'a mut dyn FnMut() -> u64,
     pub next_task: &'a mut dyn FnMut() -> u64,
     pub next_list: &'a mut dyn FnMut() -> u64,
+    /// Mints a 唯一 ID for an organizer row whose `uuid` arrived blank — a peer
+    /// at the rev before the column, or a row neither side had backfilled. A
+    /// closure and not an RNG owned here, for the reason every `next_*` is one:
+    /// the caller's session owns the identities it mints.
+    pub new_uuid: &'a mut dyn FnMut() -> String,
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +93,52 @@ enum Pick {
     Renumber,
     /// both sides edited; local wins and the user is told
     Conflict,
+}
+
+/// Collapse SPEC §四十一's 唯一 ID across the two sides of a merge, by the row's
+/// own id — the three cases `merge`'s caller documents. `uuid_of`/`uuid_mut` are
+/// two views of one field, which is what lets the same pass read every uuid it
+/// has to choose from and then write the answer back.
+fn adopt_uuids<T, K: Clone + Eq + std::hash::Hash>(
+    local: &mut [T],
+    remote: &mut [T],
+    id_of: impl Fn(&T) -> K,
+    uuid_of: impl for<'a> Fn(&'a T) -> &'a str,
+    uuid_mut: impl for<'a> Fn(&'a mut T) -> &'a mut String,
+    new_uuid: &mut dyn FnMut() -> String,
+) {
+    let mut chosen: HashMap<K, String> = HashMap::new();
+    for r in local.iter() {
+        keep_uuid(&mut chosen, id_of(r), uuid_of(r));
+    }
+    for r in remote.iter() {
+        keep_uuid(&mut chosen, id_of(r), uuid_of(r));
+    }
+    for r in local.iter_mut() {
+        let id = id_of(r);
+        let uuid = chosen.entry(id.clone()).or_insert_with(&mut *new_uuid).clone();
+        *uuid_mut(r) = uuid;
+    }
+    for r in remote.iter_mut() {
+        let id = id_of(r);
+        let uuid = chosen.entry(id.clone()).or_insert_with(&mut *new_uuid).clone();
+        *uuid_mut(r) = uuid;
+    }
+}
+
+/// Record one candidate uuid for `id`: a blank one has nothing to say, and of
+/// two real ones the **smaller** wins — deterministically, so both peers keep
+/// the same one rather than each preferring its own.
+fn keep_uuid<K: Eq + std::hash::Hash>(chosen: &mut HashMap<K, String>, id: K, uuid: &str) {
+    if uuid.is_empty() {
+        return;
+    }
+    match chosen.get(&id) {
+        Some(existing) if existing.as_str() <= uuid => {}
+        _ => {
+            chosen.insert(id, uuid.to_string());
+        }
+    }
 }
 
 fn id_index<T, K: Copy + Eq + std::hash::Hash>(
@@ -272,11 +323,48 @@ pub fn merge(
     // sentinel (`ListId::INBOX`), so a task whose list did *not* survive the
     // merge (a list deleted on the other side) is still a task in the inbox
     // rather than a row pointing at nothing.
+    // ── SPEC §四十一's 唯一 ID: normalise before the three-way decision ──
+    //
+    // A uuid is an attribute of a *row*, and two peers cannot honestly disagree
+    // about it — the row is the same row. Left in place, though, a uuid only one
+    // side carries would read to `decide` as a whole-row difference: "both edited
+    // it" at best, and on a first sync (no shadow) as two devices that minted one
+    // id for different rows — a *renumber*, which duplicates the row instead of
+    // merging it. So the identity is collapsed across the two sides here, by the
+    // row's own id, before any comparison runs:
+    //
+    //   * one side blank, one not → the known value wins, on both sides;
+    //   * both set and different  → two independent backfills of one row; the
+    //                               smaller value wins, so the two peers *agree*
+    //                               on the survivor instead of trading it;
+    //   * both blank             → minted here, once, so a v2 peer's row arrives
+    //                               with an identity rather than without one.
+    let mut notes_local = local.notes.clone();
+    let mut notes_remote = remote.notes.clone();
+    adopt_uuids(
+        &mut notes_local,
+        &mut notes_remote,
+        |n| n.id,
+        |n| n.uuid.as_str(),
+        |n| &mut n.uuid,
+        ctx.new_uuid,
+    );
+    let mut tasks_local = local.tasks.clone();
+    let mut tasks_remote = remote.tasks.clone();
+    adopt_uuids(
+        &mut tasks_local,
+        &mut tasks_remote,
+        |t| t.id,
+        |t| t.uuid.as_str(),
+        |t| &mut t.uuid,
+        ctx.new_uuid,
+    );
+
     let mut q_notes: Vec<(u64, SNote)> = Vec::new();
     let (kept_notes, mut taken_notes) = split_origin(merge_flat(
-        &local.notes,
+        &notes_local,
         shadow.map(|s| s.notes.as_slice()),
-        &remote.notes,
+        &notes_remote,
         |n| n.id,
         "note",
         peer,
@@ -300,9 +388,9 @@ pub fn merge(
 
     let mut q_tasks: Vec<(u64, STask)> = Vec::new();
     let (kept_tasks, mut taken_tasks) = split_origin(merge_flat(
-        &local.tasks,
+        &tasks_local,
         shadow.map(|s| s.tasks.as_slice()),
-        &remote.tasks,
+        &tasks_remote,
         |t| t.id,
         "task",
         peer,
@@ -820,6 +908,14 @@ mod tests {
         let mut note = { let c = c.clone(); move || alloc(&c) };
         let mut task = { let c = c.clone(); move || alloc(&c) };
         let mut list = { let c = c.clone(); move || alloc(&c) };
+        // A test uuid is deterministic and shaped like a real one, so a merge
+        // that mints for a blank row is still reproducible run to run.
+        let seq = std::cell::Cell::new(0u64);
+        let mut uuid = move || {
+            let next = seq.get() + 1;
+            seq.set(next);
+            format!("{next:032x}")
+        };
         let mut ctx = MergeCtx {
             next_page: &mut page,
             next_block: &mut block,
@@ -831,6 +927,7 @@ mod tests {
             next_note: &mut note,
             next_task: &mut task,
             next_list: &mut list,
+            new_uuid: &mut uuid,
         };
         f(&mut ctx)
     }
@@ -838,6 +935,7 @@ mod tests {
     fn note(id: u64, title: &str) -> SNote {
         SNote {
             id,
+            uuid: format!("{id:032x}"),
             title: title.into(),
             body: format!("body of {title}"),
             pinned: false,
@@ -866,6 +964,7 @@ mod tests {
     fn task(id: u64, list: u64, title: &str) -> STask {
         STask {
             id,
+            uuid: format!("{:032x}", 1_000 + id),
             list,
             title: title.into(),
             notes: String::new(),
@@ -1115,6 +1214,45 @@ mod tests {
             .iter()
             .any(|t| t.title == "in the inbox" && t.list == 0));
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+    }
+
+    /// SPEC §四十一's 唯一 ID is an attribute of the *row*, not a fact two peers
+    /// can disagree about — so the merge collapses it **before** the three-way
+    /// decision. Left alone, a uuid only one side carried would read as a
+    /// whole-row difference: a logged conflict, or with no shadow a "both minted
+    /// this id" *renumber*, which duplicates the row instead of merging it.
+    #[test]
+    fn a_uuid_is_collapsed_across_the_two_sides_before_the_decision() {
+        let mut local = snap();
+        local.notes.push(note(1, "written before the column"));
+        local.notes[0].uuid = String::new();
+        // A row only this device has, and nobody ever named: it must leave the
+        // merge with an identity rather than with the empty string.
+        local.notes.push(note(4, "only here, never named"));
+        local.notes[1].uuid = String::new();
+        // Both ends backfilled this one independently, to different values.
+        local.tasks.push(task(3, 0, "backfilled twice"));
+        local.tasks[0].uuid = "c".repeat(32);
+
+        let mut remote = snap();
+        remote.notes.push(note(1, "written before the column"));
+        remote.notes[0].uuid = "b".repeat(32);
+        remote.tasks.push(task(3, 0, "backfilled twice"));
+        remote.tasks[0].uuid = "a".repeat(32);
+
+        let out = with_ctx(1000, |ctx| merge(&local, None, &remote, "phone", ctx));
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+        assert_eq!(out.merged.notes.len(), 2, "a renumber duplicated the shared note");
+        assert_eq!(out.merged.tasks.len(), 1, "a renumber duplicated the shared task");
+        // Blank adopts the known value, on both sides.
+        assert_eq!(out.merged.notes[0].uuid, "b".repeat(32));
+        // Two real values for one row: the smaller wins, so both peers agree on
+        // the survivor instead of trading the row back and forth.
+        assert_eq!(out.merged.tasks[0].uuid, "a".repeat(32));
+        // And a row neither side had named is minted here, 32 hex characters.
+        let minted = &out.merged.notes[1].uuid;
+        assert_eq!(minted.len(), 32, "{minted:?}");
+        assert!(minted.chars().all(|c| c.is_ascii_hexdigit()), "{minted:?}");
     }
 
     /// One side moving a row lands, both sides moving it conflicts and keeps

@@ -943,6 +943,7 @@ mod tests {
             created: 1_700_000_000 + id as i64,
             edited: 1_700_000_900 + id as i64,
             ref_note: None,
+            deleted_at: None,
         }
     }
 
@@ -982,6 +983,7 @@ mod tests {
             created: 1_700_000_000 + id as i64,
             edited: 1_700_000_900 + id as i64,
             ord: id,
+            deleted_at: None,
         }
     }
 
@@ -1288,6 +1290,44 @@ mod tests {
         let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &snap(), "phone", ctx));
         assert!(out.merged.notes.is_empty());
         assert!(out.merged.tasks.is_empty());
+    }
+
+    /// 回收站 (SPEC §四十一): the tombstone is part of the row, so it merges like
+    /// any other field — which is the whole reason it is a column and not a second
+    /// table. A note binned on the phone arrives binned here; the same note binned
+    /// on **both** sides is two peers agreeing rather than a conflict; and a remote
+    /// edit of a row this device binned is a conflict, settled the way every other
+    /// one is — this device's copy stands and the user is told.
+    #[test]
+    fn a_tombstone_travels_with_the_row_it_belongs_to() {
+        let mut base = snap();
+        base.notes.push(note(1, "shared"));
+        let shadow = base.clone();
+
+        let mut binned = base.clone();
+        binned.notes[0].deleted_at = Some(1_700_001_000);
+        let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &binned, "phone", ctx));
+        assert_eq!(
+            out.merged.notes[0].deleted_at,
+            Some(1_700_001_000),
+            "the remote bin landed"
+        );
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+
+        // Both sides binned it: the same row twice is agreement, not a conflict.
+        let out = with_ctx(0, |ctx| merge(&binned, Some(&shadow), &binned, "phone", ctx));
+        assert_eq!(out.merged.notes[0].deleted_at, Some(1_700_001_000));
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+
+        // The phone edited the row while this device binned it: a conflict, and
+        // the local copy — the one the user is looking at — is what stands.
+        let mut edited = base.clone();
+        edited.notes[0].title = "renamed there".into();
+        let out = with_ctx(0, |ctx| merge(&binned, Some(&shadow), &edited, "phone", ctx));
+        assert_eq!(out.merged.notes[0].deleted_at, Some(1_700_001_000));
+        assert_eq!(out.merged.notes[0].title, "shared", "the local copy stands");
+        assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+        assert!(out.conflicts[0].contains("note"), "{:?}", out.conflicts);
     }
 
     /// The one pointer in the area. Two devices that each minted list 5 keep

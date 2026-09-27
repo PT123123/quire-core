@@ -138,7 +138,7 @@ impl SqliteRepository {
 fn read_notes(conn: &Connection) -> Result<Vec<Note>, StorageError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, body, pinned, tags, created, edited, ref_note, uuid
+            "SELECT id, title, body, pinned, tags, created, edited, ref_note, uuid, deleted_at
                FROM notes ORDER BY id",
         )
         .map_err(sql)?;
@@ -154,12 +154,14 @@ fn read_notes(conn: &Connection) -> Result<Vec<Note>, StorageError> {
                 r.get::<_, i64>(6)?,
                 r.get::<_, Option<i64>>(7)?,
                 r.get::<_, String>(8)?,
+                r.get::<_, Option<i64>>(9)?,
             ))
         })
         .map_err(sql)?;
     let mut out = Vec::new();
     for row in rows {
-        let (note, title, body, pinned, tags, created, edited, ref_note, uuid) = row.map_err(sql)?;
+        let (note, title, body, pinned, tags, created, edited, ref_note, uuid, deleted_at) =
+            row.map_err(sql)?;
         out.push(Note {
             id: NoteId(note as u64),
             uuid,
@@ -173,6 +175,10 @@ fn read_notes(conn: &Connection) -> Result<Vec<Note>, StorageError> {
             // note**: a dangling ref is a real state (the note it answered was
             // deleted), and the store is not the layer that decides what it means.
             ref_note: ref_note.map(|r| NoteId(r.max(0) as u64)),
+            // A tombstone, read as stored: `NULL` is a live note, and the instant
+            // is what the bin sorts by. Nothing here decides what "trashed" means
+            // — the read hands back both halves and the projection picks.
+            deleted_at,
         });
     }
     Ok(out)
@@ -211,7 +217,7 @@ fn read_tasks(conn: &Connection) -> Result<Vec<Task>, StorageError> {
     let mut stmt = conn
         .prepare(
             "SELECT id, list, title, notes, priority, due, repeat, done, completed_at, tags,
-                    subtasks, created, edited, ord, uuid
+                    subtasks, created, edited, ord, uuid, deleted_at
                FROM tasks
               ORDER BY list, ord, id",
         )
@@ -234,6 +240,7 @@ fn read_tasks(conn: &Connection) -> Result<Vec<Task>, StorageError> {
                 r.get::<_, i64>(12)?,
                 r.get::<_, i64>(13)?,
                 r.get::<_, String>(14)?,
+                r.get::<_, Option<i64>>(15)?,
             ))
         })
         .map_err(sql)?;
@@ -255,6 +262,7 @@ fn read_tasks(conn: &Connection) -> Result<Vec<Task>, StorageError> {
             edited,
             ord,
             uuid,
+            deleted_at,
         ) = row.map_err(sql)?;
         out.push(Task {
             id: TaskId(task as u64),
@@ -278,6 +286,8 @@ fn read_tasks(conn: &Connection) -> Result<Vec<Task>, StorageError> {
             created,
             edited,
             ord: OrderKey(ord_from_db(ord)),
+            // The tombstone, as stored; see `read_notes`.
+            deleted_at,
         });
     }
     Ok(out)
@@ -298,8 +308,9 @@ fn read_tasks(conn: &Connection) -> Result<Vec<Task>, StorageError> {
 
 pub(crate) fn insert_note(tx: &Transaction, note: &Note) -> Result<(), StorageError> {
     tx.execute(
-        "INSERT INTO notes (id, title, body, pinned, tags, created, edited, ref_note, uuid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO notes (id, title, body, pinned, tags, created, edited, ref_note, uuid,
+                            deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             id(note.id.as_u64()),
             note.title,
@@ -310,6 +321,7 @@ pub(crate) fn insert_note(tx: &Transaction, note: &Note) -> Result<(), StorageEr
             note.edited,
             note.ref_note.map(|r| id(r.as_u64())),
             note.uuid,
+            note.deleted_at,
         ],
     )
     .map_err(sql)?;
@@ -320,7 +332,7 @@ pub(crate) fn set_note(tx: &Transaction, note: &Note) -> Result<(), StorageError
     let n = tx
         .execute(
             "UPDATE notes SET title = ?2, body = ?3, pinned = ?4, tags = ?5, created = ?6,
-                              edited = ?7, ref_note = ?8, uuid = ?9
+                              edited = ?7, ref_note = ?8, uuid = ?9, deleted_at = ?10
               WHERE id = ?1",
             params![
                 id(note.id.as_u64()),
@@ -332,6 +344,7 @@ pub(crate) fn set_note(tx: &Transaction, note: &Note) -> Result<(), StorageError
                 note.edited,
                 note.ref_note.map(|r| id(r.as_u64())),
                 note.uuid,
+                note.deleted_at,
             ],
         )
         .map_err(sql)?;
@@ -393,8 +406,8 @@ pub(crate) fn delete_task_list(tx: &Transaction, list: ListId) -> Result<(), Sto
 pub(crate) fn insert_task(tx: &Transaction, task: &Task) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO tasks (id, list, title, notes, priority, due, repeat, done, completed_at,
-                            tags, subtasks, created, edited, ord, uuid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                            tags, subtasks, created, edited, ord, uuid, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         task_params(task),
     )
     .map_err(sql)?;
@@ -406,7 +419,8 @@ pub(crate) fn set_task(tx: &Transaction, task: &Task) -> Result<(), StorageError
         .execute(
             "UPDATE tasks SET list = ?2, title = ?3, notes = ?4, priority = ?5, due = ?6,
                               repeat = ?7, done = ?8, completed_at = ?9, tags = ?10,
-                              subtasks = ?11, created = ?12, edited = ?13, ord = ?14, uuid = ?15
+                              subtasks = ?11, created = ?12, edited = ?13, ord = ?14, uuid = ?15,
+                              deleted_at = ?16
               WHERE id = ?1",
             task_params(task),
         )
@@ -421,11 +435,11 @@ pub(crate) fn delete_task(tx: &Transaction, task: TaskId) -> Result<(), StorageE
     require_hit(n, "TaskDeleted", task.as_u64())
 }
 
-/// One task as the fifteen binds both statements take, in the order `?1` =
-/// `id` … `?15` = `uuid` that the two column lists above spell. One builder
+/// One task as the sixteen binds both statements take, in the order `?1` = `id`
+/// … `?16` = `deleted_at` that the two column lists above spell. One builder
 /// instead of two copies so that an insert and an update can never disagree
 /// about which bind is which column.
-fn task_params(task: &Task) -> [Box<dyn rusqlite::ToSql>; 15] {
+fn task_params(task: &Task) -> [Box<dyn rusqlite::ToSql>; 16] {
     [
         Box::new(id(task.id.as_u64())),
         Box::new(id(task.list.as_u64())),
@@ -445,6 +459,8 @@ fn task_params(task: &Task) -> [Box<dyn rusqlite::ToSql>; 15] {
         Box::new(task.edited),
         Box::new(ord_to_db(task.ord.0)),
         Box::new(task.uuid.clone()),
+        // The tombstone: `NULL` is a live task, an instant is one in 回收站.
+        Box::new(task.deleted_at),
     ]
 }
 

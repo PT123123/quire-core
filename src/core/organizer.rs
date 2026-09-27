@@ -162,6 +162,29 @@ pub struct Note {
     /// resolves to nothing simply paints as an ordinary note, exactly as a
     /// dangling `Block::page_ref` does.
     pub ref_note: Option<NoteId>,
+    /// The instant this note was moved to 回收站, or `None` while it is live.
+    ///
+    /// **A tombstone on the row, not a second table.** "Delete" in the area is
+    /// reversible, so the row cannot leave the file: trashing it is an ordinary
+    /// `UpdateNote` that stamps this field, restoring it is one that clears it,
+    /// and *purging* is the one that really deletes (`DeleteNote`). That choice is
+    /// what keeps the change stream, the store, the merge and the undo step
+    /// unchanged — a `deleted` shadow table would have needed a fourth entity, a
+    /// second merge, and a rule for what a peer does with a row it finds in both.
+    ///
+    /// It is deliberately **not** a `bool`: a bin sorted by "when did this go in"
+    /// is what the display wants, and an instant costs nothing where a flag would
+    /// have to be paired with a second column to say the same thing.
+    pub deleted_at: Option<i64>,
+}
+
+impl Note {
+    /// Whether this note is in 回收站. One question, asked in one place: every
+    /// projection that draws a list filters on it, and the bin is the rows that
+    /// answer `true`.
+    pub fn is_trashed(&self) -> bool {
+        self.deleted_at.is_some()
+    }
 }
 
 /// One user's list of tasks (SPEC §四十一 「任务」's 清单). The inbox is *not*
@@ -364,12 +387,23 @@ pub struct Task {
     /// Where the task sits among its siblings — its list's reading order. A
     /// dense key like `pages.ord`, so reordering is one `UPDATE`.
     pub ord: OrderKey,
+    /// The instant this task was moved to 回收站, or `None` while it is live —
+    /// [`Note::deleted_at`]'s rule, one entity over. A trashed task is still a row
+    /// in `tasks`; it is `UpdateTask` that puts it there and clears it again, and
+    /// only a purge really deletes it.
+    pub deleted_at: Option<i64>,
 }
 
 impl Task {
     /// Whether this task is in the inbox rather than in a stored list.
     pub fn in_inbox(&self) -> bool {
         self.list.is_inbox()
+    }
+
+    /// Whether this task is in 回收站 — [`Note::is_trashed`]'s rule, one entity
+    /// over.
+    pub fn is_trashed(&self) -> bool {
+        self.deleted_at.is_some()
     }
 }
 
@@ -406,8 +440,44 @@ impl OrganizerCatalog {
     /// The tasks of one list, in no particular order — `list` being
     /// [`ListId::INBOX`] answers with the inbox's tasks, which is the same
     /// question asked of the same field.
+    ///
+    /// **Every** task of that list, tombstones included: the callers are writes
+    /// (a list's delete moves the rows it holds, a new row's `ord` is measured
+    /// against them), and a write that could not see a trashed row would step on
+    /// it. The drawing paths ask [`Self::live_tasks`] instead.
     pub fn tasks_in(&self, list: ListId) -> impl Iterator<Item = &Task> {
         self.tasks.iter().filter(move |t| t.list == list)
+    }
+
+    // ─── 回收站 (soft delete) ─────────────────────────────────────────────────
+    //
+    // One collection per kind carries both the live rows and the tombstones
+    // (`Note::deleted_at`), because that is what keeps the file, the merge and the
+    // snapshot honest: a row dropped from the vector would look like a *deletion*
+    // to the next merge, which is the one answer "delete" must not give. So the
+    // load hands back every row, and a projection asks one of these two questions
+    // to say which half it is drawing.
+
+    /// The notes that are not in 回收站: what every list, tag column and count
+    /// draws.
+    pub fn live_notes(&self) -> impl Iterator<Item = &Note> {
+        self.notes.iter().filter(|n| !n.is_trashed())
+    }
+
+    /// The notes in 回收站, in no particular order — the bin sorts by when they
+    /// went in, and that is a display decision.
+    pub fn trashed_notes(&self) -> impl Iterator<Item = &Note> {
+        self.notes.iter().filter(|n| n.is_trashed())
+    }
+
+    /// The tasks that are not in 回收站.
+    pub fn live_tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|t| !t.is_trashed())
+    }
+
+    /// The tasks in 回收站.
+    pub fn trashed_tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|t| t.is_trashed())
     }
 }
 
@@ -431,6 +501,7 @@ mod tests {
             // Even ids reply to the note before them, so a test can exercise a ref
             // without a second helper.
             ref_note: if id % 2 == 0 && id > 1 { Some(NoteId(id - 1)) } else { None },
+            deleted_at: None,
         }
     }
 
@@ -462,6 +533,7 @@ mod tests {
             created: 10,
             edited: 20,
             ord: OrderKey::FIRST,
+            deleted_at: None,
         }
     }
 
@@ -551,6 +623,46 @@ mod tests {
             vec![TaskId(10)]
         );
         assert_eq!(catalog.tasks_in(ListId(9)).count(), 0);
+    }
+
+    /// 回收站 (SPEC §四十一): a tombstone does not remove a row, it moves it to the
+    /// other half of the catalog. The two halves are the two questions the app
+    /// asks, and `tasks_in` — the write-side question — keeps seeing both.
+    #[test]
+    fn a_tombstone_splits_the_catalog_without_dropping_a_row() {
+        let mut catalog = OrganizerCatalog::default();
+        let mut binned_note = note(2);
+        binned_note.deleted_at = Some(1_700_001_000);
+        let mut binned_task = task(20, ListId::INBOX);
+        binned_task.deleted_at = Some(1_700_001_000);
+        catalog.notes = vec![note(1), binned_note];
+        catalog.tasks = vec![task(10, ListId::INBOX), binned_task];
+
+        assert_eq!(catalog.notes.len(), 2, "the row is still there to restore");
+        assert_eq!(catalog.tasks.len(), 2);
+        assert_eq!(
+            catalog.live_notes().map(|n| n.id).collect::<Vec<_>>(),
+            vec![NoteId(1)]
+        );
+        assert_eq!(
+            catalog.trashed_notes().map(|n| n.id).collect::<Vec<_>>(),
+            vec![NoteId(2)]
+        );
+        assert_eq!(
+            catalog.live_tasks().map(|t| t.id).collect::<Vec<_>>(),
+            vec![TaskId(10)]
+        );
+        assert_eq!(
+            catalog.trashed_tasks().map(|t| t.id).collect::<Vec<_>>(),
+            vec![TaskId(20)]
+        );
+        assert_eq!(catalog.note(NoteId(2)).map(Note::is_trashed), Some(true));
+        assert_eq!(catalog.task(TaskId(20)).map(Task::is_trashed), Some(true));
+        // `tasks_in` is the write-side question and keeps both halves: deleting a
+        // list moves the rows it holds, and stepping over a binned one would leave
+        // it naming a list that is gone.
+        assert_eq!(catalog.tasks_in(ListId::INBOX).count(), 2);
+        assert_eq!(catalog.tasks_in(ListId::INBOX).filter(|t| !t.is_trashed()).count(), 1);
     }
 
     /// The row a change carries is compared as a row: two tasks that differ in

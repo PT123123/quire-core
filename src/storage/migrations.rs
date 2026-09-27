@@ -39,7 +39,12 @@ use crate::core::StorageError;
 /// shape one step further on, on two tables at once, plus the one-time
 /// `randomblob` backfill that gives every row that predates it an identity (see
 /// `add_organizer_uuid_columns`).
-pub const CURRENT_VERSION: i32 = 28;
+///
+/// Step 29 is the organizer's 回收站 (`notes.deleted_at` / `tasks.deleted_at`):
+/// the same late-column shape once more, on the two tables that hold rows a user
+/// deletes by hand. Nullable with no default, because `NULL` is the live row and
+/// the instant is what the bin sorts by — see `Note::deleted_at`.
+pub const CURRENT_VERSION: i32 = 29;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -644,6 +649,20 @@ CREATE INDEX IF NOT EXISTS idx_tasks_due      ON tasks(due);
     // see must not depend on which device first read the row.
     sql: "",
     backfill: Some(add_organizer_uuid_columns),
+}, Migration {
+    version: 29,
+    label: "organizer trash",
+    // SPEC §四十一's 回收站: the two tombstones a soft delete stamps. The columns
+    // are added by `add_organizer_deleted_at_columns`, not by editing v24 / v26,
+    // because those have already run in libraries that exist — the same reason v27
+    // and v28 are steps of their own.
+    //
+    // Nullable and with no default: `NULL` is a live row and any integer is the
+    // instant it went into 回收站. A `NOT NULL DEFAULT 0` column would have spelled
+    // "not deleted" as a timestamp of 1970 — a value the bin would then have to
+    // special-case forever.
+    sql: "",
+    backfill: Some(add_organizer_deleted_at_columns),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -742,6 +761,24 @@ fn add_organizer_uuid_columns(conn: &mut Connection) -> Result<(), StorageError>
         .map_err(|e| StorageError::Sql(format!("backfill {table}.uuid: {e}")))?;
     }
     Ok(())
+}
+
+/// Migration 29 body: the two `deleted_at` columns (SPEC §四十一's 回收站).
+///
+/// Both go through the guarded `ALTER` helpers, so a library that already carries
+/// one — or was hand-edited to — converges instead of failing on a duplicate
+/// name. **No backfill on purpose**: a row that predates the column is a live
+/// row, which is exactly what `NULL` already says, and writing `0` into every
+/// existing row would put the whole library in the bin.
+fn add_organizer_deleted_at_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    add_note_columns(
+        conn,
+        &[("deleted_at", "ALTER TABLE notes ADD COLUMN deleted_at INTEGER")],
+    )?;
+    add_task_columns(
+        conn,
+        &[("deleted_at", "ALTER TABLE tasks ADD COLUMN deleted_at INTEGER")],
+    )
 }
 
 /// Migration 11 body.

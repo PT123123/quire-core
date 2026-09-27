@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### A delete is reversible: 回收站 as a tombstone (ADR-0003)
+
+- `org::Note` and `org::Task` each gain `deleted_at: Option<i64>` — the instant the
+  row went into 回收站, `None` while it is live. **A tombstone on the row, not a
+  second table**: trashing is an ordinary `UpdateNote` / `UpdateTask` that stamps
+  the field, restoring is one that clears it, and *purging* is the `DeleteNote` /
+  `DeleteTask` that already existed. The change stream, the store, the merge and the
+  undo step are therefore all exactly what they were, and a delete still costs the
+  one Ctrl+Z it always cost.
+- Migration **29** adds the two nullable columns behind the same
+  `pragma_table_info` guard, on the two tables whose rows a user deletes by hand.
+  **No backfill on purpose**: a row that predates the column is a live row, which is
+  what `NULL` already says, where a `DEFAULT 0` would have put a whole library in the
+  bin on the first launch after the upgrade. `CURRENT_VERSION` 28 → 29.
+- `OrganizerCatalog` keeps **both halves** — `notes` / `tasks` are unchanged — and
+  gains `live_notes` / `trashed_notes` / `live_tasks` / `trashed_tasks`. The drawing
+  paths ask the first of each pair; the write paths (`tasks_in`, and the list delete
+  that moves the rows it holds) deliberately keep seeing everything, because a write
+  that could not see a tombstone would step on it.
+- `SNote.deleted_at` / `STask.deleted_at` on the wire, `#[serde(default)]`, and read
+  back as "live" when absent — the same reading the column gives `NULL`.
+- **`SNAPSHOT_VERSION` 2 → 3.** Unlike the uuid next door — where the field was
+  additive and a defaulted value was honest — a tombstone a peer drops is not
+  *missing*, it is **wrong**: the merge would read the row as an ordinary remote edit
+  and resurrect what the user deleted. So the exact-equality gate closes again, and
+  the shell family is updated together.
+- Four tests: the catalog's two halves
+  (`a_tombstone_splits_the_catalog_without_dropping_a_row`), the one-step trash and
+  purge (`trashing_is_an_update_and_only_the_purge_is_a_delete`), the merge
+  (`a_tombstone_travels_with_the_row_it_belongs_to`), and the v29 step — which also
+  pins that the upgrade bins nothing.
+- This is the layer the shells' own notes kept naming ("a real 回收站 needs soft
+  delete in `quire-core` — a column, the store, the merge"); the two bins' screens
+  are the shells' slices and land on this rev.
+
 ### A note can reference a note (ADR-0001)
 
 - `org::Note` gains `ref_note: Option<NoteId>`: the note this one comments on,

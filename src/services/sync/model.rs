@@ -33,7 +33,18 @@ use crate::core::{database as db, database::DatabaseCatalog};
 /// loud, immediate, and fixable by updating the other end. The cost is real and
 /// is the reason this is an ADR rather than a footnote — both ends must be
 /// updated together, and a v1 peer can no longer sync at all.
-pub const SNAPSHOT_VERSION: u32 = 2;
+///
+/// **2 → 3** when SPEC §四十一's 回收站 landed, and the reason is the same shape,
+/// one step subtler. `deleted_at` is a defaulted field, so a v2 peer *parses* a v3
+/// row happily — and then answers with the tombstone dropped, because serde
+/// swallows what it does not know. The merge would read a row whose tombstone had
+/// vanished as an ordinary remote edit and **resurrect** what the user deleted.
+/// The uuid's shrug ("an additive, defaulted field is not a reason to lock a
+/// device out") does not transfer: a uuid nobody set is *no identity*, while a
+/// tombstone nobody set is *undeleted* — one is a missing value and the other is
+/// a wrong one. So the gate closes again, and this shell family is updated
+/// together.
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
@@ -252,6 +263,13 @@ pub struct SNote {
     /// comment without the note it answers, and `merge`'s renumber pass is what
     /// keeps the id pointing at the right row when it can.
     pub ref_note: Option<u64>,
+    /// The instant this note went into 回收站, or absent while it is live
+    /// (`Note::deleted_at`). Defaulted on the wire so a row this build writes
+    /// always parses, and read back as "live" when absent — exactly how the
+    /// column reads `NULL`. It is *not* the uuid's shrug that keeps the version
+    /// gate open here; see `SNAPSHOT_VERSION`.
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -292,6 +310,10 @@ pub struct STask {
     pub created: i64,
     pub edited: i64,
     pub ord: u64,
+    /// The instant this task went into 回收站, or absent while it is live —
+    /// [`SNote::deleted_at`]'s field, one entity over.
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
 }
 
 // ─── conversions: core rows ↔ wire rows ─────────────────────────────────────
@@ -538,6 +560,7 @@ impl From<&org::Note> for SNote {
             created: n.created,
             edited: n.edited,
             ref_note: n.ref_note.map(|r| r.0),
+            deleted_at: n.deleted_at,
         }
     }
 }
@@ -554,6 +577,9 @@ impl SNote {
             created: self.created,
             edited: self.edited,
             ref_note: self.ref_note.map(org::NoteId),
+            // Absent is live, which is what `NULL` says in the column too: a peer
+            // that never sent the field means a note that is not in the bin.
+            deleted_at: self.deleted_at,
         }
     }
 }
@@ -618,6 +644,7 @@ impl From<&org::Task> for STask {
             created: t.created,
             edited: t.edited,
             ord: t.ord.0,
+            deleted_at: t.deleted_at,
         }
     }
 }
@@ -643,6 +670,7 @@ impl STask {
             created: self.created,
             edited: self.edited,
             ord: OrderKey(self.ord),
+            deleted_at: self.deleted_at,
         }
     }
 }
@@ -779,13 +807,18 @@ mod tests {
         bad.version = 99;
         assert!(SyncSnapshot::from_json(&bad.to_json()).is_err());
         assert!(SyncSnapshot::from_json("not json").is_err());
-        // The version right below this one is refused as well, which is the
-        // whole point of the bump: a v1 peer must not be half-understood.
+        // The version right below this one is refused as well, which is the whole
+        // point of a bump: an older peer must not be half-understood. The number is
+        // written as `SNAPSHOT_VERSION - 1` rather than as a literal, so the next
+        // bump cannot leave this assertion testing a version nobody speaks.
         let mut old = snap.clone();
-        old.version = 1;
+        old.version = SNAPSHOT_VERSION - 1;
         let refusal = SyncSnapshot::from_json(&old.to_json()).unwrap_err();
-        assert!(refusal.contains("version 1"), "{refusal}");
-        assert!(refusal.contains("speaks 2"), "{refusal}");
+        assert!(
+            refusal.contains(&format!("version {}", SNAPSHOT_VERSION - 1)),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&format!("speaks {SNAPSHOT_VERSION}")), "{refusal}");
     }
 
     /// The three organizer rows through the wire: every field, including the
@@ -806,6 +839,9 @@ mod tests {
             // A reply, so the round trip covers the ref: a comment that lost it on
             // the wire would land on the other device as an ordinary note.
             ref_note: Some(org::NoteId(2)),
+            // In 回收站, so the trip covers the tombstone too — a note that lost it
+            // on the wire would arrive un-deleted.
+            deleted_at: Some(1_700_001_000),
         };
         assert_eq!(SNote::from(&note).to_core(), note);
 
@@ -844,6 +880,8 @@ mod tests {
             created: 1_700_000_000,
             edited: 1_700_000_900,
             ord: OrderKey(1 << 16),
+            // A tombstone as well, for the reason the note above carries one.
+            deleted_at: Some(1_700_001_000),
         };
         assert_eq!(STask::from(&task).to_core(), task);
         // The sentinel survives as itself rather than as "whichever list holds

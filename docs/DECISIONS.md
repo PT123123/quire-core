@@ -9,6 +9,52 @@ rather than the product's. `README.md` says where the chain used to live: the
 desktop repository, because it described the product. A decision about the shared
 model — one the shells consume rather than make — belongs here.
 
+## ADR-0003 · A delete is a tombstone on the row, and 回收站 is a view of one catalog
+
+Decision: `org::Note` and `org::Task` each gain `deleted_at: Option<i64>` — the
+instant the row went into 回收站, `None` while it is live. Trashing is an ordinary
+`UpdateNote` / `UpdateTask` that stamps it, restoring is one that clears it, and only
+a *purge* reaches `DeleteNote` / `DeleteTask`. Migration **29** adds the two nullable
+columns (the guarded `ALTER` shape, **no backfill**), the wire rows carry the field,
+`OrganizerCatalog` grows a `live_*` / `trashed_*` pair per kind, and
+`SNAPSHOT_VERSION` moves **2 → 3**.
+
+Why a column and not a `deleted` table: the row has to stay in the file. The whole
+protocol beneath this crate reads "present locally, absent remotely" as a
+**deletion** — that is how the two-way merge lands removals — so a row that left the
+vector the moment the user deleted it would arrive at the next sync as a row to
+remove *permanently*, and the bin would empty itself the first time two devices
+talked. A tombstone keeps the row where the merge can see it, and it costs nothing:
+the change stream already carries whole rows, so "delete" becomes the `Update` that
+was already there, with the same one-step undo.
+
+Why an instant and not a `bool`: the bin is read as *what went in, and when*, and one
+instant column answers both where a flag would need a second to say the same thing.
+
+Why the version bump, when the uuid next door did not take one: a uuid a peer cannot
+see is **absent**, and the merge's own normalisation mints one on arrival. A
+tombstone a peer cannot see is **wrong** — the row reads as live at that peer, its
+answer carries the row un-deleted, and the merge resolves that as an ordinary remote
+edit. The first sync after a delete would therefore un-delete it, silently. That is
+exactly the failure the exact-equality gate exists to refuse, so a v2 build and a v3
+build refuse each other loudly and the three repositories ship together.
+
+Consequences:
+
+- **No new `Change` variants and no new commands.** `NoteUpdated` / `TaskUpdated`
+  carry the whole row, so a trash and a restore are the rows they always were and the
+  undo stack keeps its one-step rule. `organizer_store` writes one more column on each
+  of two tables; `repository::apply_one` is untouched.
+- The **shells** filter their projections on the tombstone. That is why `live_notes` /
+  `live_tasks` live here rather than in an app layer: "which half of one collection"
+  is a question about the model that owns the collection.
+- `tasks_in` deliberately keeps **both** halves — its callers are writes, and a write
+  that could not see a tombstone would step on it.
+- **Still not here**: an automatic empty-the-bin policy, a per-device bin setting
+  (both are shells' business), and any *history* — a tombstone says when a row went
+  in, not what it used to be. A restore brings back the row's current content, which
+  is all a row ever holds.
+
 ## ADR-0002 · A note and a task each carry a 唯一 ID, and a merge cannot disagree about it
 
 Decision: `org::Note` and `org::Task` each gain `uuid: String` — 32 lowercase hex

@@ -79,6 +79,10 @@ fn organizer_note(id: u64) -> Note {
         // well as an absent one: a column the load forgot would read back as `None`
         // against a `Some` row and fail the comparison.
         ref_note: (id % 2 == 0).then(|| NoteId(id - 1)),
+        // A tombstone on the even ids too, for the same reason: `NULL` and a
+        // stored instant have to be told apart by the load, and a column that
+        // silently read back `None` would pass on a library with nothing in 回收站.
+        deleted_at: (id % 2 == 0).then_some(1_700_001_000 + id as i64),
     }
 }
 
@@ -119,6 +123,9 @@ fn organizer_task(id: u64, list: ListId) -> Task {
         created: 1_700_000_000 + id as i64,
         edited: 1_700_000_900 + id as i64,
         ord: OrderKey(OrderKey::FIRST.0 + id * 0x100),
+        // A tombstone on the third ids, so both halves of the column are covered
+        // here as they are on the notes above.
+        deleted_at: (id % 3 == 0).then_some(1_700_001_000 + id as i64),
     }
 }
 
@@ -1534,6 +1541,77 @@ fn the_v28_step_adds_and_backfills_the_organizer_uuids() {
             .query_row("SELECT uuid FROM notes WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(before, after, "a replay re-minted an identity");
+    }
+}
+
+/// The 回收站 step: two nullable tombstones added to the two tables whose rows a
+/// user deletes by hand — and, just as load-bearing, the **absence of a
+/// backfill**. A row that predates the column is a live row, which is exactly what
+/// `NULL` already says; writing `0` into every existing row would have put an
+/// entire library in the bin on the first launch after the upgrade.
+#[test]
+fn the_v29_step_adds_the_two_tombstones_and_bins_nothing() {
+    let dir = tempfile();
+    let path = dir.join("organizer-trash.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE notes DROP COLUMN deleted_at;
+             ALTER TABLE tasks DROP COLUMN deleted_at;
+             PRAGMA user_version = 28;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (id, title, body, pinned, tags, created, edited)
+             VALUES (1, 'Old', 'written before the bin', 0, '', 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, list, title, notes, priority, repeat, done, tags, subtasks,
+                                created, edited, ord)
+             VALUES (1, 0, 'Old task', '', 'none', 'none', 0, '', '', 1, 2, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        for table in ["notes", "tasks"] {
+            let present: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM pragma_table_info('{table}') WHERE name = 'deleted_at'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "the rolled-back schema has no tombstone on {table}");
+        }
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        // `NULL` on both rows: the upgrade bins nothing, and both halves of the
+        // column — a stored instant as well as an absent one — round-trip through
+        // the load (the fixture rows in `organizer_note` / `organizer_task` cover
+        // the other half).
+        for table in ["notes", "tasks"] {
+            let deleted_at: Option<i64> = conn
+                .query_row(
+                    &format!("SELECT deleted_at FROM {table} WHERE id = 1"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(deleted_at, None, "{table} came back trashed");
+        }
+        // Idempotent, like every step before it.
+        migrations::ensure_current(&mut conn).unwrap();
     }
 }
 

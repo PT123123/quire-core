@@ -4375,6 +4375,7 @@ mod tests {
             // Note 2 replies to note 1, so the undo tests carry a ref through
             // `CreateNote`/`DeleteNote` without a helper of their own.
             ref_note: if id == 2 { Some(NoteId(1)) } else { None },
+            deleted_at: None,
         }
     }
 
@@ -4395,6 +4396,7 @@ mod tests {
             created: 10,
             edited: 20,
             ord: OrderKey::FIRST,
+            deleted_at: None,
         }
     }
 
@@ -4523,6 +4525,72 @@ mod tests {
         assert_eq!(
             undo(&mut doc, &mut hist, page).unwrap(),
             vec![Change::TaskListUpdated(l0)]
+        );
+    }
+
+    /// 回收站 (SPEC §四十一): trashing a row is an ordinary `Update` that stamps
+    /// `deleted_at` and restoring is one that clears it, so both cost the one
+    /// Ctrl+Z a delete always cost — and only the purge is the `Delete`. The bin is
+    /// therefore a *projection* of the catalog and not a second store, which is what
+    /// keeps the change stream, the merge and the undo step exactly as they were.
+    #[test]
+    fn trashing_is_an_update_and_only_the_purge_is_a_delete() {
+        let (mut doc, mut hist, page, _ids) = setup();
+
+        let live = note(6);
+        exec(&mut doc, &mut hist, page, Command::CreateNote { note: live.clone() }).unwrap();
+
+        let mut binned = live.clone();
+        binned.deleted_at = Some(1_700_001_000);
+        assert_eq!(
+            exec(
+                &mut doc,
+                &mut hist,
+                page,
+                Command::UpdateNote {
+                    id: live.id,
+                    before: live.clone(),
+                    after: binned.clone(),
+                },
+            )
+            .unwrap(),
+            vec![Change::NoteUpdated(binned.clone())],
+            "the row is stamped, not removed"
+        );
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::NoteUpdated(live.clone())],
+            "one Ctrl+Z takes it back out of the bin"
+        );
+        assert_eq!(
+            redo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::NoteUpdated(binned.clone())]
+        );
+
+        // A row already in the bin is not a step when nothing moved…
+        assert!(
+            plan(
+                &mut doc,
+                page,
+                Command::UpdateNote {
+                    id: NoteId(6),
+                    before: binned.clone(),
+                    after: binned.clone(),
+                },
+            )
+            .is_none(),
+            "an untouched row is not an undo step, binned or not"
+        );
+        // …and the purge is the one that really removes it, still carrying the
+        // whole row so its undo can put it back where it was.
+        assert_eq!(
+            exec(&mut doc, &mut hist, page, Command::DeleteNote { note: binned.clone() }).unwrap(),
+            vec![Change::NoteDeleted { id: NoteId(6) }]
+        );
+        assert_eq!(
+            undo(&mut doc, &mut hist, page).unwrap(),
+            vec![Change::NoteAdded(binned)],
+            "an undone purge brings the row back still binned"
         );
     }
 

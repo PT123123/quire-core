@@ -149,8 +149,6 @@ pub enum Cmd {
     SyncWith(PeerRecord),
     /// Ask a discovered device to pair (a POST to its /sync/pair).
     PairWith(PeerRecord),
-    /// A device typed in by hand: ask it who it is and pair on the answer.
-    ProbeAdd { ip: String, port: u16 },
 }
 
 pub struct Engine {
@@ -225,7 +223,6 @@ impl Engine {
                     match cmd {
                         Cmd::SyncWith(peer) => sync_with(&peer, &jobs_worker),
                         Cmd::PairWith(peer) => pair_with(&me, &peer, &jobs_worker),
-                        Cmd::ProbeAdd { ip, port } => probe_add(&ip, port, &jobs_worker),
                     }
                 }
             })
@@ -271,35 +268,6 @@ fn pair_with(me: &DeviceInfo, peer: &PeerRecord, jobs: &Sender<Job>) {
                 message: format!("{}: {e}", peer.name),
             });
         }
-    }
-}
-
-/// A device typed in by hand: ask who it is, then pair on the answer. This is
-/// the door for a network where the UDP announcement cannot get through
-/// (Android without a multicast lock, or a router that filters broadcasts).
-fn probe_add(ip: &str, port: u16, jobs: &Sender<Job>) {
-    let fail = |msg: String| {
-        let _ = jobs.send(Job::SyncDone {
-            peer_id: ip.to_string(),
-            ok: false,
-            message: msg,
-        });
-    };
-    match transport::http_get(ip, port, "/sync/info", Duration::from_secs(4)) {
-        Ok((200, body)) => {
-            let text = String::from_utf8_lossy(&body).into_owned();
-            match DeviceInfo::from_json(&text) {
-                Ok(device) => {
-                    let _ = jobs.send(Job::Paired {
-                        device,
-                        ip: ip.to_string(),
-                    });
-                }
-                Err(e) => fail(format!("{ip}:{port}: {e}")),
-            }
-        }
-        Ok((status, _)) => fail(format!("{ip}:{port}: info answered {status}")),
-        Err(e) => fail(format!("{ip}:{port}: {e}")),
     }
 }
 

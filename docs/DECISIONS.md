@@ -9,6 +9,96 @@ rather than the product's. `README.md` says where the chain used to live: the
 desktop repository, because it described the product. A decision about the shared
 model — one the shells consume rather than make — belongs here.
 
+## ADR-0004 · Notes and tasks merge by their 唯一 ID, and the revision decides the loser
+
+Decision: `merge`'s **organizer half** stops using the id-keyed flat pass. `notes`
+and `tasks` are merged by their `uuid` — the 唯一 ID ADR-0002 minted — and when two
+copies of one row differ, the **revision** orders them: the newer copy stands, on
+both ends, in one round. The revision is a new `rev: String` on `org::Note` and
+`org::Task`, stored in a `rev` column on each table (migration **30**, backfilled
+in place from `edited` / `deleted_at`), carried as `SNote.rev` / `STask.rev`,
+stamped by the shells through a new `Command::stamp_rev` at the head of each
+shell's organizer funnel, and shaped `"{millis:013}-{device}"` by
+`core::organizer::rev`. Lists keep the id-keyed pass (a list carries no uuid), and
+`SNAPSHOT_VERSION` moves **3 → 4**.
+
+Why: two defects, both proven against the pinned rev, and both consequences of
+keying on an integer that was never an identity.
+
+- **Two rows sharing one uuid.** The old pass collapsed the uuid *by the row's
+  integer id*, before the pass that exists because the same integer may be two
+  different rows. Two devices that each held one note at id `1` came out of a
+  merge as two rows carrying **one** uuid, so a comment's `ref_note` — and the
+  clipboard's `local:<uuid>` — could point at the other device's note forever.
+  Keying on the uuid makes that state unreachable instead of papering over it, and
+  the renumber cascade the organizer used to need disappears with it.
+- **A conflict settled twice, the other way.** Each side answered "both edited it"
+  by keeping its own copy *and writing that copy into its own shadow*, so the next
+  round read the winner's row as a one-sided edit and converged on an argument
+  nobody won. A revision both ends can compare inverts that: the same two strings
+  pick the same winner wherever they are read, so the round that finds a conflict
+  is the round that settles it.
+
+Why the revision is a field of its own and not `edited`: the area deliberately does
+not move `edited` when a row is binned or restored (that is what keeps 详细信息's
+修改 line honest), so a bin and the restore that undoes it would carry the same
+stamp and no comparison could order them. It is deliberately **not** a counter
+either: the two ends of a sync are separate devices, and only a clock (plus the
+device, for a tie) orders two writes neither device saw the other make.
+
+Why the shadow stays: it is the only thing that can tell *a row this side never
+had* from *a row this side purged*. A bin travels as the row's own tombstone and
+needs no help (ADR-0003); a purge leaves no row to carry anything, and a stateless
+last-writer-wins merge — the reference app's, which has no purge — would read the
+absence as "never had it" and resurrect the row on the next round.
+
+Alternatives weighed and not taken:
+
+- **Keep the id-keyed pass and only fix the uuid collapse** (mint a fresh uuid for a
+  renumbered row, key the attachment skip-list on the uuid). Cheapest, and it
+  repairs both proven bugs — but it leaves the organizer merged by a watermark that
+  is not an identity, leaves the renumber cascade (and the `ref_note` /`list` remap
+  pass) in place, and leaves the conflict rule re-deciding itself. The verified
+  cost is the same class of bug one row over.
+- **Go stateless, as the reference app does** — drop the shadow for notes and tasks
+  and let the revision decide everything. Simpler, and it is what
+  `aw-sync-rust` does — but it cannot express a purge, and Quire's 回收站 has one
+  (`DeleteNote` / `DeleteTask` really delete). Keeping the shadow is what lets the
+  behavior stay "uuid + revision decides" *and* "a purge stays purged".
+- **Add a `uuid` to `pages`, `blocks`, `databases` too, and key everything on it.**
+  The same argument applies, but those collections are hard-deleted with no
+  tombstone, so they would need a purge story of their own first, and the cascade
+  has to keep working for them in the meantime. Out of scope for this decision.
+
+Consequences:
+
+- **The version gate closes.** Not a wire-shape change — `rev` is
+  `#[serde(default)]` — but a v3 peer keys its rows by `id` and *renumbers* what it
+  thinks collides, so it would answer this build's rows under ids this build never
+  wrote. Both shells move with this commit.
+- **Migration 30 backfills every existing row** from what it already carries
+  (`MAX(edited, deleted_at) * 1000`, empty device half), so no row reaches a merge
+  unstamped. A legacy row therefore loses to any row written by the new build,
+  which is the right answer: the new build's write is later in wall-clock time by
+  construction.
+- **A remote-only row is inserted under a fresh local id** rather than being
+  renumbered only when it collides. The two devices' integer ids no longer have to
+  agree about anything, and `merge` reports the `remote id → local id` map it used
+  so a comment's `ref_note` follows its parent to wherever it landed.
+- **`MergeOutcome::conflicts` now reports a *settled* row**, not an unresolved one:
+  the line says which copy stands and why. The shells' 冲突 lines were already the
+  place this surfaced.
+- **Every shell write must stamp.** `Command::stamp_rev` covers the row a command
+  creates or rewrites and deliberately leaves the `before` half alone, because the
+  revert writes it back — an undo that moved the revision forward would let the
+  peer take the undone value. Both shells call it at the head of the one funnel
+  every organizer write already passes through (`exec_org` / `exec_org_all`,
+  `Organizer::apply` / `apply_all`), so no call site has to remember.
+- **Still not here**: a `uuid` key for the document's own collections (see above),
+  and any per-row "who won" history beyond the log line — the losing copy is
+  logged, not archived, which is the reference app's `trash` minus the UI to read
+  it.
+
 ## ADR-0003 · A delete is a tombstone on the row, and 回收站 is a view of one catalog
 
 Decision: `org::Note` and `org::Task` each gain `deleted_at: Option<i64>` — the
@@ -111,6 +201,12 @@ Consequences:
   `docs/SPEC.md` §四十一 and its ADR chain live in the desktop repository and should
   gain the 唯一 ID paragraph and a decision of their own when that shell bumps its
   pinned `rev`.
+- **Superseded in part by ADR-0004**: the normalisation pass described above ran
+  *before* the three-way decision and keyed on the row's integer `id`, which is
+  exactly what let two rows that shared a uuid keep sharing it after a renumber.
+  ADR-0004 removed the pass: notes and tasks are now *keyed* by the uuid, so there
+  is nothing to normalise — and this ADR's own argument ("the identity of a row is
+  an attribute, so the merge has to treat it as one") is what that decision acts on.
 
 ## ADR-0001 · A note may reference a note, with no foreign key and a tolerated dangling id
 

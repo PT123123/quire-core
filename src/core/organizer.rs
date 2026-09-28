@@ -87,6 +87,26 @@ impl ListId {
     }
 }
 
+/// The pair a row's revision is compared by (SPEC §四十一's sync): the instant
+/// of the row's last write in milliseconds since the epoch, zero-padded to
+/// thirteen digits, and the id of the device that wrote it, joined by one `-`.
+///
+/// This is `aw-server-plus`'s **rev** — `(updated_at 毫秒, device_id)` compared
+/// as a string (`aw-sync-rust`'s `conflict::incoming_newer`) — and it is what
+/// lets two devices settle which of two copies of one row is newer without a
+/// third party: both ends see the same two strings, and the same comparison
+/// picks the same winner, so a conflict converges in one round instead of being
+/// argued again by the next (`quire-desktop`'s ROADMAP item 8).
+///
+/// The zero padding is load-bearing: thirteen digits is every millisecond from
+/// 1970 to the year 33658, so a plain string compare *is* a numeric compare.
+/// The device suffix breaks a tie the clock cannot — two devices writing in the
+/// same millisecond — and a single device can never tie with itself, because
+/// every write stamps a fresh instant.
+pub fn rev(millis: i64, device: &str) -> String {
+    format!("{millis:013}-{device}")
+}
+
 /// A fresh 唯一 ID (SPEC §四十一): 32 lowercase hex characters.
 ///
 /// Minted from the OS-seeded `RandomState` rather than from a clock, and that
@@ -176,6 +196,18 @@ pub struct Note {
     /// is what the display wants, and an instant costs nothing where a flag would
     /// have to be paired with a second column to say the same thing.
     pub deleted_at: Option<i64>,
+    /// The row's **revision** — [`rev`]'s `"{millis:013}-{device}"` — stamped by
+    /// the app layer on **every** write of the row, including the ones that only
+    /// move it in or out of 回收站.
+    ///
+    /// `edited` cannot serve as this: the area deliberately does not move it when
+    /// a row is binned or restored (`app::state`'s own rule), so a trash and the
+    /// restore that undoes it would carry the same stamp and a merge could not
+    /// order them. A field of its own is what makes the comparison total.
+    ///
+    /// A row written before the column existed is backfilled from `edited` by the
+    /// migration, so nothing reaches a merge unstamped.
+    pub rev: String,
 }
 
 impl Note {
@@ -392,6 +424,8 @@ pub struct Task {
     /// in `tasks`; it is `UpdateTask` that puts it there and clears it again, and
     /// only a purge really deletes it.
     pub deleted_at: Option<i64>,
+    /// The task's revision — [`Note::rev`]'s field, one entity over.
+    pub rev: String,
 }
 
 impl Task {
@@ -502,6 +536,7 @@ mod tests {
             // without a second helper.
             ref_note: if id % 2 == 0 && id > 1 { Some(NoteId(id - 1)) } else { None },
             deleted_at: None,
+            rev: rev(1_700_000_000_000 + id as i64, "test"),
         }
     }
 
@@ -534,6 +569,7 @@ mod tests {
             edited: 20,
             ord: OrderKey::FIRST,
             deleted_at: None,
+            rev: rev(1_700_000_000_000 + id as i64, "test"),
         }
     }
 

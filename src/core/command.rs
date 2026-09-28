@@ -462,6 +462,41 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// Stamp `rev` over the row(s) this command is about to write — the
+    /// organizer's sync revision, [`crate::core::organizer::rev`].
+    ///
+    /// A shell calls this in its organizer funnel on the way into [`exec`], so
+    /// **every** write of a note or a task carries the instant and the device
+    /// that made it and a peer can order two copies of one row without asking.
+    /// It covers the three writes that are not a plain edit as well: a bin, a
+    /// restore (both `UpdateNote`/`UpdateTask` that move `deleted_at` and
+    /// nothing else — which is exactly why the revision is a field of its own),
+    /// and the tasks a deleted list moves into the inbox.
+    ///
+    /// The **`before` half is deliberately left alone.** The revert writes it
+    /// back, and an undo that moved the revision forward would leave a reverted
+    /// row looking newer than the edit it undid — so the peer would take the
+    /// undone value rather than the undone-ness.
+    ///
+    /// A purge (`DeleteNote` / `DeleteTask`) has no row left to stamp, and a
+    /// list carries no revision (its merge is still the id-keyed one).
+    pub fn stamp_rev(&mut self, rev: &str) {
+        match self {
+            Command::CreateNote { note } => note.rev = rev.to_string(),
+            Command::UpdateNote { after, .. } => after.rev = rev.to_string(),
+            Command::CreateTask { task } => task.rev = rev.to_string(),
+            Command::UpdateTask { after, .. } => after.rev = rev.to_string(),
+            Command::DeleteTaskList { moved, .. } => {
+                for (_, after) in moved.iter_mut() {
+                    after.rev = rev.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The grid shape the "+", the slash menu and "Turn into" hand out. Three
 /// columns because the first row is the Markdown header row, and two rows give
 /// it something to head.
@@ -4376,6 +4411,7 @@ mod tests {
             // `CreateNote`/`DeleteNote` without a helper of their own.
             ref_note: if id == 2 { Some(NoteId(1)) } else { None },
             deleted_at: None,
+            rev: crate::core::organizer::rev(1_000_000 + id as i64, "desk"),
         }
     }
 
@@ -4397,6 +4433,7 @@ mod tests {
             edited: 20,
             ord: OrderKey::FIRST,
             deleted_at: None,
+            rev: crate::core::organizer::rev(20_000 + id as i64, "desk"),
         }
     }
 
@@ -4592,6 +4629,80 @@ mod tests {
             vec![Change::NoteAdded(binned)],
             "an undone purge brings the row back still binned"
         );
+    }
+
+    /// `stamp_rev` writes the revision over exactly the rows a command is about to
+    /// **create or rewrite**, and never over the `before` half of an update.
+    ///
+    /// Both halves matter. Every organizer write has to carry a fresh revision (the
+    /// merge arbitrates two copies of one row by it), and the revert has to carry
+    /// the *old* one — an undo that moved the revision forward would leave the row
+    /// looking newer than the edit it undid, and the peer would take the undone
+    /// value back.
+    #[test]
+    fn stamp_rev_covers_the_written_rows_and_never_the_before_half() {
+        let live = note(1);
+        let rev = crate::core::organizer::rev(1_800_000_000_000, "desk");
+
+        let mut create = Command::CreateNote { note: live.clone() };
+        create.stamp_rev(&rev);
+        let Command::CreateNote { note: stamped } = &create else {
+            unreachable!()
+        };
+        assert_eq!(stamped.rev, rev, "a created row is stamped");
+        assert_eq!(stamped.uuid, live.uuid, "and nothing else moved");
+
+        let mut update = Command::UpdateNote {
+            id: live.id,
+            before: live.clone(),
+            after: live.clone(),
+        };
+        update.stamp_rev(&rev);
+        let Command::UpdateNote { before, after, .. } = &update else {
+            unreachable!()
+        };
+        assert_eq!(after.rev, rev, "the row being written is stamped");
+        assert_eq!(before.rev, live.rev, "the row being replaced is left alone");
+
+        let mut task_update = Command::UpdateTask {
+            id: TaskId(1),
+            before: task(1, ListId::INBOX),
+            after: task(1, ListId::INBOX),
+        };
+        task_update.stamp_rev(&rev);
+        let Command::UpdateTask { before, after, .. } = &task_update else {
+            unreachable!()
+        };
+        assert_eq!(after.rev, rev);
+        assert_ne!(before.rev, rev);
+
+        // Deleting a list moves the tasks it held in the same batch: that is a write
+        // of each of those rows too, so it is stamped.
+        let listed = task(1, ListId(2));
+        let moved = crate::core::organizer::Task {
+            list: ListId::INBOX,
+            ..listed.clone()
+        };
+        let mut delete_list = Command::DeleteTaskList {
+            list: crate::core::organizer::TaskList {
+                id: ListId(2),
+                name: "Work".into(),
+                color: crate::core::types::ColorKind::Default,
+                ord: crate::core::OrderKey::FIRST,
+            },
+            moved: vec![(listed, moved)],
+        };
+        delete_list.stamp_rev(&rev);
+        let Command::DeleteTaskList { moved, .. } = &delete_list else {
+            unreachable!()
+        };
+        assert_eq!(moved[0].1.rev, rev, "the task the deleted list moved is stamped");
+        assert_ne!(moved[0].0.rev, rev, "and its own before-half is not");
+
+        // A purge has no row left to stamp, and a list carries no revision.
+        let mut purge = Command::DeleteNote { note: note(2) };
+        purge.stamp_rev(&rev);
+        assert!(matches!(purge, Command::DeleteNote { .. }));
     }
 
     /// A write with the value it already has is not an undo step (the rule

@@ -44,7 +44,17 @@ use crate::core::{database as db, database::DatabaseCatalog};
 /// tombstone nobody set is *undeleted* — one is a missing value and the other is
 /// a wrong one. So the gate closes again, and this shell family is updated
 /// together.
-pub const SNAPSHOT_VERSION: u32 = 3;
+///
+/// **3 → 4** when the organizer's merge changed its **key and its arbiter**: notes
+/// and tasks are merged by their 唯一 ID with a revision deciding the loser
+/// (`core::organizer::rev`), instead of by their integer `id` with a renumber on
+/// collision. That is not a wire-shape change — `uuid` and `rev` are both
+/// defaulted fields — but it is not safe to mix either, which is the test the
+/// version gate actually applies: a v3 peer keys its rows by `id` and *renumbers*
+/// the ones it thinks collide, so it would answer this build's rows under ids
+/// this build never wrote and duplicate rows the uuid was minted to keep singular.
+/// Silent divergence is worse than a refusal, so the gate closes a third time.
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
@@ -270,6 +280,15 @@ pub struct SNote {
     /// gate open here; see `SNAPSHOT_VERSION`.
     #[serde(default)]
     pub deleted_at: Option<i64>,
+    /// The row's **revision** — [`org::rev`]'s `"{millis:013}-{device}"` — which
+    /// is what the merge settles two copies of this row by.
+    ///
+    /// Defaulted on the wire for the shape's sake; a blank one is read as the
+    /// lowest possible revision, which is the same answer a row written before the
+    /// column means. Since `SNAPSHOT_VERSION` is now 4, this build never actually
+    /// *meets* a peer that omits it — the gate refuses first.
+    #[serde(default)]
+    pub rev: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,6 +333,9 @@ pub struct STask {
     /// [`SNote::deleted_at`]'s field, one entity over.
     #[serde(default)]
     pub deleted_at: Option<i64>,
+    /// The task's revision — [`SNote::rev`]'s field, one entity over.
+    #[serde(default)]
+    pub rev: String,
 }
 
 // ─── conversions: core rows ↔ wire rows ─────────────────────────────────────
@@ -561,6 +583,7 @@ impl From<&org::Note> for SNote {
             edited: n.edited,
             ref_note: n.ref_note.map(|r| r.0),
             deleted_at: n.deleted_at,
+            rev: n.rev.clone(),
         }
     }
 }
@@ -580,6 +603,7 @@ impl SNote {
             // Absent is live, which is what `NULL` says in the column too: a peer
             // that never sent the field means a note that is not in the bin.
             deleted_at: self.deleted_at,
+            rev: self.rev.clone(),
         }
     }
 }
@@ -645,6 +669,7 @@ impl From<&org::Task> for STask {
             edited: t.edited,
             ord: t.ord.0,
             deleted_at: t.deleted_at,
+            rev: t.rev.clone(),
         }
     }
 }
@@ -671,6 +696,7 @@ impl STask {
             edited: self.edited,
             ord: OrderKey(self.ord),
             deleted_at: self.deleted_at,
+            rev: self.rev.clone(),
         }
     }
 }
@@ -842,6 +868,10 @@ mod tests {
             // In 回收站, so the trip covers the tombstone too — a note that lost it
             // on the wire would arrive un-deleted.
             deleted_at: Some(1_700_001_000),
+            // The revision travels for the same reason and one more: the merge
+            // *compares* it, so a row that lost it on the wire would read as the
+            // oldest possible copy of itself and lose every arbitration.
+            rev: org::rev(1_700_001_000_000, "desk"),
         };
         assert_eq!(SNote::from(&note).to_core(), note);
 
@@ -882,6 +912,8 @@ mod tests {
             ord: OrderKey(1 << 16),
             // A tombstone as well, for the reason the note above carries one.
             deleted_at: Some(1_700_001_000),
+            // …and a revision, for the same reason.
+            rev: org::rev(1_700_001_000_000, "desk"),
         };
         assert_eq!(STask::from(&task).to_core(), task);
         // The sentinel survives as itself rather than as "whichever list holds

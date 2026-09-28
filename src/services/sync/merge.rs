@@ -1,11 +1,14 @@
-// The three-way merge (aw-server-plus's "uuid 逻辑键 + rev 仲裁" adapted to
-// Quire's integer ids and snapshot exchange).
+// The three-way merge, with **two keys**: the flat collections (pages, blocks,
+// databases, attachments, lists) are keyed by their integer id, and SPEC §四十一's
+// notes and tasks by their 唯一 ID — `aw-server-plus`'s "uuid 逻辑键 + rev 仲裁"
+// applied where the ids to do it with exist.
 //
 // Inputs: the local snapshot, the shadow (what the two peers last agreed on —
 // `app::state` persists one per peer), and the remote snapshot. Output: the
 // merged snapshot plus what the user should be told.
 //
-// Per row of every collection, over the union of the three key sets:
+// **The id-keyed half.** Per row of every flat collection, over the union of the
+// three key sets:
 //
 //   local == remote                      → converged; keep either
 //   shadow == local (remote moved)       → take remote (an edit or a delete)
@@ -28,22 +31,33 @@
 // (taken or renumbered) then has its cross-references walked through the
 // renumbering maps, so no pointer ever dangles on arrival.
 //
-// A first sync between two devices that both have content runs with no
-// shadow: every differing row is a conflict and stays local. That is the
-// honest answer — two workspaces merged for the first time are one user
-// decision, not one algorithm — and the rows that only one side has still
-// flow.
+// **The uuid-keyed half** (`merge_organizer`). A note and a task carry the 唯一 ID
+// the area mints *precisely because* an integer id cannot serve as one — it is a
+// per-device watermark — so they are merged by that id, and the id collision the
+// flat pass answers by renumbering simply cannot arise. Two copies of one row are
+// then ordered by the row's **revision** (`core::organizer::rev`: `(millis,
+// device)` compared as a string); the newer copy stands, and both peers compute
+// that answer from the same two strings — so a concurrent edit converges in one
+// round instead of being re-decided, silently and the other way, by the next.
+// The shadow keeps the one job the revision cannot do: it says whether a uuid
+// missing from one side is a row that side never had (a new row) or one it
+// **purged**.
 //
-// SPEC §四十一's organizer joins as **three more flat collections**
-// (`notes`, `tasks`, `lists`): its rows hang off no page and no block, and its
-// only cross-reference is a task's list, which is remapped with the other
-// pointers. A task whose list did not survive is a task in the inbox, because
-// `list = 0` is the inbox sentinel rather than a dangling id — the one place
-// the area's shape makes the merge simpler than the document's.
+// A first sync between two devices that both have content runs with no shadow.
+// The id-keyed half then reads every differing row as a conflict and keeps local:
+// the honest answer, because two workspaces merged for the first time are one
+// user decision, not one algorithm — and the rows that only one side has still
+// flow. The uuid-keyed half takes the newer copy of each row, which is the best
+// answer available without asking and the one `aw-server-plus` gives.
+//
+// Renumbering no longer touches the organizer at all: a note's parent
+// (`ref_note`) and a task's list are remapped through the maps the two passes
+// built, because a remote row's pointers are remote ids whatever key the row
+// itself was matched by.
 
 use super::model::{
-    SAttachment, SBlock, SDatabase, SNote, SPage, SProperty, SRecord, STask, STaskList, SValue,
-    SView, SyncSnapshot,
+    SAttachment, SBlock, SDatabase, SPage, SProperty, SRecord, STaskList, SValue, SView,
+    SyncSnapshot,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -58,15 +72,20 @@ pub struct MergeCtx<'a> {
     pub next_property: &'a mut dyn FnMut() -> u64,
     pub next_record: &'a mut dyn FnMut() -> u64,
     pub next_view: &'a mut dyn FnMut() -> u64,
-    /// SPEC §四十一's three. A renumbered subtask draws on the **task**
-    /// allocator, because a subtask's id is scoped to its task and the two are
-    /// never cross-referenced — the same argument `core::organizer` makes for
-    /// storing the checklist inside the task's row.
+    /// SPEC §四十一's three. Notes and tasks are the two the uuid-keyed pass may
+    /// have to **insert** — a remote row this device has never seen gets a fresh
+    /// local id here, so the two devices' integer ids never have to agree. A
+    /// renumbered subtask draws on the **task** allocator, because a subtask's id
+    /// is scoped to its task and the two are never cross-referenced — and a
+    /// subtask travels *inside* its task's row, so it is never allocated for
+    /// alone.
     pub next_note: &'a mut dyn FnMut() -> u64,
     pub next_task: &'a mut dyn FnMut() -> u64,
+    /// Lists keep the id-keyed pass (a list carries no uuid), so this is still the
+    /// renumber allocator the flat collections use.
     pub next_list: &'a mut dyn FnMut() -> u64,
-    /// Mints a 唯一 ID for an organizer row whose `uuid` arrived blank — a peer
-    /// at the rev before the column, or a row neither side had backfilled. A
+    /// Mints a 唯一 ID for an organizer row whose `uuid` arrived blank — a peer at
+    /// the rev before the column, or a row neither side had backfilled. A
     /// closure and not an RNG owned here, for the reason every `next_*` is one:
     /// the caller's session owns the identities it mints.
     pub new_uuid: &'a mut dyn FnMut() -> String,
@@ -95,49 +114,218 @@ enum Pick {
     Conflict,
 }
 
-/// Collapse SPEC §四十一's 唯一 ID across the two sides of a merge, by the row's
-/// own id — the three cases `merge`'s caller documents. `uuid_of`/`uuid_mut` are
-/// two views of one field, which is what lets the same pass read every uuid it
-/// has to choose from and then write the answer back.
-fn adopt_uuids<T, K: Clone + Eq + std::hash::Hash>(
-    local: &mut [T],
-    remote: &mut [T],
-    id_of: impl Fn(&T) -> K,
-    uuid_of: impl for<'a> Fn(&'a T) -> &'a str,
-    uuid_mut: impl for<'a> Fn(&'a mut T) -> &'a mut String,
-    new_uuid: &mut dyn FnMut() -> String,
-) {
-    let mut chosen: HashMap<K, String> = HashMap::new();
-    for r in local.iter() {
-        keep_uuid(&mut chosen, id_of(r), uuid_of(r));
-    }
-    for r in remote.iter() {
-        keep_uuid(&mut chosen, id_of(r), uuid_of(r));
-    }
-    for r in local.iter_mut() {
-        let id = id_of(r);
-        let uuid = chosen.entry(id.clone()).or_insert_with(&mut *new_uuid).clone();
-        *uuid_mut(r) = uuid;
-    }
-    for r in remote.iter_mut() {
-        let id = id_of(r);
-        let uuid = chosen.entry(id.clone()).or_insert_with(&mut *new_uuid).clone();
-        *uuid_mut(r) = uuid;
+/// Index one collection by the uuid it carries. Two rows that somehow share a
+/// uuid collapse to the last — a state `new_uuid` exists to make impossible, and
+/// one the pass below must not panic on if a hand-edited file holds it.
+fn uuid_index<T>(rows: &[T], uuid_of: impl for<'a> Fn(&'a T) -> &'a str) -> HashMap<String, usize> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| (uuid_of(r).to_string(), i))
+        .collect()
+}
+
+/// Whether both sides moved this row since the last sync — the question that
+/// decides whether a revision-arbitrated difference is worth a line in the log, or
+/// is simply the ordinary "one side edited it" the revision resolves in silence.
+fn both_moved<T: PartialEq>(shadow: Option<&T>, local: &T, remote: &T) -> bool {
+    match shadow {
+        Some(sv) => local != sv && remote != sv,
+        None => false,
     }
 }
 
-/// Record one candidate uuid for `id`: a blank one has nothing to say, and of
-/// two real ones the **smaller** wins — deterministically, so both peers keep
-/// the same one rather than each preferring its own.
-fn keep_uuid<K: Eq + std::hash::Hash>(chosen: &mut HashMap<K, String>, id: K, uuid: &str) {
-    if uuid.is_empty() {
-        return;
-    }
-    match chosen.get(&id) {
-        Some(existing) if existing.as_str() <= uuid => {}
-        _ => {
-            chosen.insert(id, uuid.to_string());
+/// The deterministic last resort when two revisions compare **equal**: order the
+/// two copies by their own serialized contents.
+///
+/// Reachable only for the two rows a v30 backfill stamped from `edited`, which
+/// carries no device half — so a tie means both were written in the same second on
+/// devices that predate the revision column. Both ends hold the same two rows, so
+/// both compute the same answer from them and the tie still converges; what it
+/// gives up is any claim about which write came *second*, which the clock never
+/// knew anyway.
+fn tie_break(local: &str, remote: &str) -> bool {
+    remote > local
+}
+
+/// Merge one of the organizer's two uuid-keyed collections (`notes`, `tasks`).
+///
+/// **Keyed by the 唯一 ID, not the row's integer id.** That is the whole
+/// difference from the flat pass above, and the reason this function exists: an
+/// integer id is a per-device `max + 1` watermark, two devices mint the same one
+/// for *different* rows routinely, and the flat pass answers that by renumbering —
+/// which is right for a page and wrong for a row whose identity is supposed to be
+/// stable, because a renumbered row may already be the same row under a second id.
+/// The uuid is minted to be unique (`core::organizer::new_uuid`), so keying on it
+/// makes that class of collision impossible rather than papered over.
+///
+/// **Arbitrated by the revision** — `(instant, device)` compared as a string, the
+/// newest copy wins. Both ends see the same two strings, so both pick the same
+/// winner; a conflict therefore converges in the round that finds it instead of
+/// being settled again, the other way, by the next.
+///
+/// The shadow still does the one job the revision cannot: for a uuid **missing**
+/// from one side it says whether that side never had the row (a new row to insert)
+/// or **purged** it (a removal to leave alone). A bin needs no such help — the
+/// tombstone is on the row and travels with it.
+///
+/// Returns each merged row tagged with where it came from (`true` = the remote copy
+/// was taken, so the caller still has to walk its cross-references through the id
+/// maps), plus the `remote id → local id` map those maps are built from.
+fn merge_organizer<T: Clone + PartialEq>(
+    local: &[T],
+    shadow: Option<&[T]>,
+    remote: &[T],
+    id_of: impl Fn(&T) -> u64,
+    uuid_of: impl for<'a> Fn(&'a T) -> &'a str,
+    rev_of: impl for<'a> Fn(&'a T) -> &'a str,
+    set_uuid: impl for<'a> Fn(&'a mut T, String),
+    set_id: impl Fn(&mut T, u64),
+    content: impl Fn(&T) -> String,
+    what: &str,
+    peer: &str,
+    conflicts: &mut Vec<String>,
+    new_uuid: &mut dyn FnMut() -> String,
+    next_id: &mut dyn FnMut() -> u64,
+) -> (Vec<(bool, T)>, HashMap<u64, u64>) {
+    // Identity first, so every row below has a key to be matched by. A blank uuid
+    // is *no identity* rather than an empty one — the state a row written before
+    // the column (or by a hand-edited file) arrives in — and it is named here for
+    // the same reason the old pass named it: a row must not reach this device's
+    // file without a name, and a peer's row without one must not be dropped.
+    let mut local: Vec<T> = local.to_vec();
+    let mut remote: Vec<T> = remote.to_vec();
+    for r in local.iter_mut() {
+        if uuid_of(r).is_empty() {
+            let fresh = new_uuid();
+            set_uuid(r, fresh);
         }
+    }
+    for r in remote.iter_mut() {
+        if uuid_of(r).is_empty() {
+            let fresh = new_uuid();
+            set_uuid(r, fresh);
+        }
+    }
+    let shadow_rows: Vec<T> = shadow.map(<[T]>::to_vec).unwrap_or_default();
+    let has_shadow = shadow.is_some();
+
+    let li = uuid_index(&local, &uuid_of);
+    let ri = uuid_index(&remote, &uuid_of);
+    let si = uuid_index(&shadow_rows, &uuid_of);
+
+    let mut keys: Vec<&String> = li.keys().chain(ri.keys()).collect();
+    keys.sort();
+    keys.dedup();
+
+    let mut out: Vec<(bool, T)> = Vec::new();
+    let mut id_map: HashMap<u64, u64> = HashMap::new();
+
+    for key in keys {
+        let l = li.get(key).map(|&i| local[i].clone());
+        let r = ri.get(key).map(|&i| remote[i].clone());
+        // Three-valued: `None` = no shadow at all (a first sync), `Some(None)` = a
+        // shadow exists but never held this uuid, `Some(Some(row))` = the copy the
+        // two sides last agreed on.
+        let s: Option<Option<T>> = if has_shadow {
+            Some(si.get(key).map(|&i| shadow_rows[i].clone()))
+        } else {
+            None
+        };
+
+        match (&l, &r) {
+            (Some(lv), Some(rv)) => match lv == rv {
+                true => out.push((false, lv.clone())),
+                false => {
+                    let take_remote = match rev_of(rv).cmp(rev_of(lv)) {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Equal => tie_break(&content(lv), &content(rv)),
+                    };
+                    let settled = both_moved(s.as_ref().and_then(|sv| sv.as_ref()), lv, rv);
+                    if take_remote {
+                        // The row already exists here under this device's id, so it
+                        // is *rewritten* rather than deleted and re-inserted — the
+                        // id stays put and only the content moves.
+                        let mut taken = rv.clone();
+                        let here = id_of(lv);
+                        set_id(&mut taken, here);
+                        id_map.insert(id_of(rv), here);
+                        if settled {
+                            conflicts.push(changed_on_both(what, key, peer, true));
+                        }
+                        out.push((true, taken));
+                    } else {
+                        id_map.insert(id_of(rv), id_of(lv));
+                        if settled {
+                            conflicts.push(changed_on_both(what, key, peer, false));
+                        }
+                        out.push((false, lv.clone()));
+                    }
+                }
+            },
+            // Only this side has it. The shadow says which of the two reasons.
+            (Some(lv), None) => match &s {
+                // Untouched here, gone there: the peer purged it. Stay purged.
+                Some(Some(sv)) if sv == lv => {}
+                // Edited here, purged there: a purge is not an operation this
+                // protocol carries, so this device's copy — the row the user still
+                // has — stands, and the disagreement is said out loud.
+                Some(Some(_)) => {
+                    conflicts.push(format!(
+                        "{what} {}: 对端彻底删除，本机改过 — 保留本机的这一份",
+                        short(key)
+                    ));
+                    out.push((false, lv.clone()));
+                }
+                // No shadow, or a shadow that never held it: a row made here since
+                // the last sync. It simply travels.
+                _ => out.push((false, lv.clone())),
+            },
+            // Only the peer has it, mirrored.
+            (None, Some(rv)) => match &s {
+                // Untouched there, gone here: this device purged it. Stay purged.
+                Some(Some(sv)) if sv == rv => {}
+                // Purged here, edited there: the purge stands, and it is said.
+                Some(Some(_)) => {
+                    conflicts.push(format!(
+                        "{what} {}: 本机彻底删除，对端改过 — 保持删除",
+                        short(key)
+                    ));
+                }
+                // A row this device has never seen: insert it under a fresh local
+                // id, so the two devices' watermarks never have to agree.
+                _ => {
+                    let mut fresh = rv.clone();
+                    let new_id = next_id();
+                    set_id(&mut fresh, new_id);
+                    id_map.insert(id_of(rv), new_id);
+                    out.push((true, fresh));
+                }
+            },
+            (None, None) => {}
+        }
+    }
+
+    (out, id_map)
+}
+
+/// The first eight characters of a uuid, for a log line a person reads.
+fn short(uuid: &str) -> &str {
+    let end = uuid.len().min(8);
+    &uuid[..end]
+}
+
+/// One line for a row both sides moved. The revision decided it, and the line says
+/// which copy stands — because the two devices' pages now agree and nothing else
+/// on the 同步 page could explain why the other one's edit is not the one shown.
+fn changed_on_both(what: &str, uuid: &str, peer: &str, took_remote: bool) -> String {
+    if took_remote {
+        format!(
+            "{what} {}: 两边都改过 — 取了 {peer} 更新的一份",
+            short(uuid)
+        )
+    } else {
+        format!("{what} {}: 两边都改过 — 保留本机更新的一份", short(uuid))
     }
 }
 
@@ -317,61 +505,29 @@ pub fn merge(
 
     // ── SPEC §四十一: the organizer's three collections ──
     //
-    // Flat and independent of everything above — no page, no block, no
-    // database. The one cross-reference among the three is a task's list, and
-    // it is remapped with the other pointers below; `list = 0` is the inbox
-    // sentinel (`ListId::INBOX`), so a task whose list did *not* survive the
-    // merge (a list deleted on the other side) is still a task in the inbox
-    // rather than a row pointing at nothing.
-    // ── SPEC §四十一's 唯一 ID: normalise before the three-way decision ──
-    //
-    // A uuid is an attribute of a *row*, and two peers cannot honestly disagree
-    // about it — the row is the same row. Left in place, though, a uuid only one
-    // side carries would read to `decide` as a whole-row difference: "both edited
-    // it" at best, and on a first sync (no shadow) as two devices that minted one
-    // id for different rows — a *renumber*, which duplicates the row instead of
-    // merging it. So the identity is collapsed across the two sides here, by the
-    // row's own id, before any comparison runs:
-    //
-    //   * one side blank, one not → the known value wins, on both sides;
-    //   * both set and different  → two independent backfills of one row; the
-    //                               smaller value wins, so the two peers *agree*
-    //                               on the survivor instead of trading it;
-    //   * both blank             → minted here, once, so a v2 peer's row arrives
-    //                               with an identity rather than without one.
-    let mut notes_local = local.notes.clone();
-    let mut notes_remote = remote.notes.clone();
-    adopt_uuids(
-        &mut notes_local,
-        &mut notes_remote,
+    // Flat and independent of everything above — no page, no block, no database.
+    // Notes and tasks go through the **uuid-keyed** pass (`merge_organizer`), which
+    // is SPEC §四十一's 唯一 ID doing the job it was minted for; lists keep the
+    // id-keyed pass above, because a list carries no uuid of its own. The two
+    // pointers among the three are walked below, once both passes have run: a
+    // task's list through the lists' renumbering map, a comment's parent through
+    // the notes' `remote id → local id` map.
+    let (mut note_rows, note_map) = merge_organizer(
+        &local.notes,
+        shadow.map(|s| s.notes.as_slice()),
+        &remote.notes,
         |n| n.id,
         |n| n.uuid.as_str(),
-        |n| &mut n.uuid,
-        ctx.new_uuid,
-    );
-    let mut tasks_local = local.tasks.clone();
-    let mut tasks_remote = remote.tasks.clone();
-    adopt_uuids(
-        &mut tasks_local,
-        &mut tasks_remote,
-        |t| t.id,
-        |t| t.uuid.as_str(),
-        |t| &mut t.uuid,
-        ctx.new_uuid,
-    );
-
-    let mut q_notes: Vec<(u64, SNote)> = Vec::new();
-    let (kept_notes, mut taken_notes) = split_origin(merge_flat(
-        &notes_local,
-        shadow.map(|s| s.notes.as_slice()),
-        &notes_remote,
-        |n| n.id,
+        |n| n.rev.as_str(),
+        |n, v| n.uuid = v,
+        |n, v| n.id = v,
+        |n| serde_json::to_string(n).unwrap_or_default(),
         "note",
         peer,
         &mut conflicts,
-        &mut q_notes,
-    ));
-    let mut renumber_notes = unwrap_pairs(q_notes);
+        &mut *ctx.new_uuid,
+        &mut *ctx.next_note,
+    );
 
     let mut q_lists: Vec<(u64, STaskList)> = Vec::new();
     let (kept_lists, taken_lists) = split_origin(merge_flat(
@@ -386,18 +542,22 @@ pub fn merge(
     ));
     let mut renumber_lists = unwrap_pairs(q_lists);
 
-    let mut q_tasks: Vec<(u64, STask)> = Vec::new();
-    let (kept_tasks, mut taken_tasks) = split_origin(merge_flat(
-        &tasks_local,
+    let (mut task_rows, _task_map) = merge_organizer(
+        &local.tasks,
         shadow.map(|s| s.tasks.as_slice()),
-        &tasks_remote,
+        &remote.tasks,
         |t| t.id,
+        |t| t.uuid.as_str(),
+        |t| t.rev.as_str(),
+        |t, v| t.uuid = v,
+        |t, v| t.id = v,
+        |t| serde_json::to_string(t).unwrap_or_default(),
         "task",
         peer,
         &mut conflicts,
-        &mut q_tasks,
-    ));
-    let mut renumber_tasks = unwrap_pairs(q_tasks);
+        &mut *ctx.new_uuid,
+        &mut *ctx.next_task,
+    );
 
     // ── databases: the entity rows are compared as entities (id + name +
     // template) — their columns, views, records and cells travel flat below
@@ -549,16 +709,11 @@ pub fn merge(
     let mut prop_map: HashMap<u64, u64> = HashMap::new();
     let mut record_map: HashMap<u64, u64> = HashMap::new();
     let mut view_map: HashMap<u64, u64> = HashMap::new();
-    // Which local list a renumbered remote list became — the organizer's only
+    // Which local list a renumbered remote list became — the organizer's one
     // cross-reference (`STask.list`). A fresh id is allocated here rather than
     // extrapolated, so the remap below cannot accidentally land on 0, which is
     // the inbox and not a list.
     let mut list_map: HashMap<u64, u64> = HashMap::new();
-    // A note's ref is the organizer's one *self*-reference (`SNote.ref_note`), so
-    // the renumbered notes need a map of their own — without it a comment that was
-    // renumbered would keep pointing at the id its parent used to have, which on
-    // this device may be a different note or no note at all.
-    let mut note_map: HashMap<u64, u64> = HashMap::new();
 
     for p in &mut renumber_pages {
         let new = (ctx.next_page)();
@@ -596,18 +751,10 @@ pub fn merge(
         view_map.insert(v.id, new);
         v.id = new;
     }
-    // The organizer's three, allocated the same way. The **list** and the **note**
-    // need a map: `STask.list` is the area's one pointer between rows, and
-    // `SNote.ref_note` is a note pointing at a note. A task's subtask ids are
-    // scoped to their own task, so a task is simply a row under a fresh id.
-    for n in &mut renumber_notes {
-        let new = (ctx.next_note)();
-        note_map.insert(n.id, new);
-        n.id = new;
-    }
-    for t in &mut renumber_tasks {
-        t.id = (ctx.next_task)();
-    }
+    // The organizer's lists, allocated like every flat collection above. Notes and
+    // tasks never reach this loop: the uuid-keyed pass already gave a fresh id to
+    // each row it had to insert, and left the rows it matched under this device's
+    // own id.
     for l in &mut renumber_lists {
         let new = (ctx.next_list)();
         list_map.insert(l.id, new);
@@ -645,23 +792,27 @@ pub fn merge(
         v.record = *record_map.get(&v.record).unwrap_or(&v.record);
         v.property = *prop_map.get(&v.property).unwrap_or(&v.property);
     }
-    // A task's list, the one pointer in the organizer. Remote rows only, for
-    // the same reason as every remap above: a local row's list id is this
-    // device's and the merge never moved it. `0` is not in the map (the inbox
-    // is not a row and cannot be renumbered), so a task in the inbox stays in
-    // the inbox.
-    for t in taken_tasks.iter_mut().chain(renumber_tasks.iter_mut()) {
-        t.list = *list_map.get(&t.list).unwrap_or(&t.list);
+    // A task's list, the one pointer in the organizer. Remote-origin rows only, for
+    // the same reason as every remap above: a local row's list id is this device's
+    // and the merge never moved it. `0` is not in the map (the inbox is not a row
+    // and cannot be renumbered), so a task in the inbox stays in the inbox.
+    for (from_remote, t) in task_rows.iter_mut() {
+        if *from_remote {
+            t.list = *list_map.get(&t.list).unwrap_or(&t.list);
+        }
     }
-    // A comment's parent, on remote-origin rows only for the same reason. The
+    // A comment's parent, on remote-origin notes only for the same reason. The
     // `unwrap_or` is load-bearing and is the `page_ref` rule exactly: a ref to a
-    // note that **did not survive** the merge is left alone rather than cleared,
-    // so a comment whose parent is not here stays a comment — and if the parent
-    // arrives in a later sync the ref is already right. `note_map` holds only the
-    // rows this merge renumbered; an id that is not in it points at a note that is
-    // already on this device under that same id.
-    for n in taken_notes.iter_mut().chain(renumber_notes.iter_mut()) {
-        n.ref_note = n.ref_note.map(|v| *note_map.get(&v).unwrap_or(&v));
+    // note that **did not survive** the merge is left alone rather than cleared, so
+    // a comment whose parent is not here stays a comment — and if the parent
+    // arrives in a later sync the ref is already right. What comes out of the
+    // uuid-keyed pass is a *remote id → local id* map for every remote note that
+    // landed (an inserted one under a fresh id, a rewritten one under this
+    // device's), which is the map a comment written on the other device needs.
+    for (from_remote, n) in note_rows.iter_mut() {
+        if *from_remote {
+            n.ref_note = n.ref_note.map(|v| *note_map.get(&v).unwrap_or(&v));
+        }
     }
 
     // ── assemble: rows grouped back into their database entries ──
@@ -716,20 +867,13 @@ pub fn merge(
         blocks,
         attachments,
         databases: all_dbs,
-        // SPEC §四十一: local rows first, then the remote ones that were taken,
-        // then the renumbered ones — the same order the collections above use,
-        // and none of it a constraint on the app (it reads the snapshot into its
-        // own catalog, which sorts itself).
-        notes: kept_notes
-            .into_iter()
-            .chain(taken_notes)
-            .chain(renumber_notes)
-            .collect(),
-        tasks: kept_tasks
-            .into_iter()
-            .chain(taken_tasks)
-            .chain(renumber_tasks)
-            .collect(),
+        // SPEC §四十一: the uuid-keyed pass answers its rows already tagged with
+        // origin, so the tag is dropped here; the order is local rows first, then
+        // the remote ones that were taken or inserted, and none of it a constraint
+        // on the app (it reads the snapshot into its own catalog, which sorts
+        // itself).
+        notes: note_rows.into_iter().map(|(_, row)| row).collect(),
+        tasks: task_rows.into_iter().map(|(_, row)| row).collect(),
         lists: kept_lists
             .into_iter()
             .chain(taken_lists)
@@ -840,7 +984,7 @@ pub fn sort_blocks_parents_first(blocks: &mut [SBlock]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::sync::model::SSubtask;
+    use crate::services::sync::model::{SNote, SSubtask, STask};
 
     fn snap() -> SyncSnapshot {
         SyncSnapshot::default()
@@ -944,6 +1088,7 @@ mod tests {
             edited: 1_700_000_900 + id as i64,
             ref_note: None,
             deleted_at: None,
+            rev: crate::core::organizer::rev(1_700_000_000_000 + id as i64, "phone"),
         }
     }
 
@@ -984,7 +1129,25 @@ mod tests {
             edited: 1_700_000_900 + id as i64,
             ord: id,
             deleted_at: None,
+            rev: crate::core::organizer::rev(1_700_000_000_000 + id as i64, "phone"),
         }
+    }
+
+    /// One **write** of a note, as the app layer makes one: the content moves *and*
+    /// the revision is restamped. A fixture that changed only the content would
+    /// describe a row no shell can produce — every organizer write goes through the
+    /// funnel that stamps it — and would leave the merge arbitrating a tie.
+    fn note_at(mut n: SNote, millis: i64, device: &str, edit: impl FnOnce(&mut SNote)) -> SNote {
+        edit(&mut n);
+        n.rev = crate::core::organizer::rev(millis, device);
+        n
+    }
+
+    /// [`note_at`], one entity over.
+    fn task_at(mut t: STask, millis: i64, device: &str, edit: impl FnOnce(&mut STask)) -> STask {
+        edit(&mut t);
+        t.rev = crate::core::organizer::rev(millis, device);
+        t
     }
 
     #[test]
@@ -1218,94 +1381,130 @@ mod tests {
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
     }
 
-    /// SPEC §四十一's 唯一 ID is an attribute of the *row*, not a fact two peers
-    /// can disagree about — so the merge collapses it **before** the three-way
-    /// decision. Left alone, a uuid only one side carried would read as a
-    /// whole-row difference: a logged conflict, or with no shadow a "both minted
-    /// this id" *renumber*, which duplicates the row instead of merging it.
+    /// SPEC §四十一's 唯一 ID is the merge's **key** for a note or a task, and that
+    /// is the whole of what separates the organizer's two collections from the flat
+    /// ones above: two devices that hand the same integer to *different* rows are
+    /// not a collision to be renumbered around — they are two rows — and two devices
+    /// that hold the **same** uuid hold the same row whatever integers they filed it
+    /// under.
+    ///
+    /// A blank uuid is no identity at all rather than an empty one, so it is minted
+    /// here: a row must not reach a peer without a name, and a peer's unnamed row
+    /// must not be dropped.
     #[test]
-    fn a_uuid_is_collapsed_across_the_two_sides_before_the_decision() {
+    fn the_uuid_is_the_key_not_the_integer_id() {
+        // Same uuid, different integers: one row, and it keeps this device's id.
         let mut local = snap();
-        local.notes.push(note(1, "written before the column"));
-        local.notes[0].uuid = String::new();
-        // A row only this device has, and nobody ever named: it must leave the
-        // merge with an identity rather than with the empty string.
-        local.notes.push(note(4, "only here, never named"));
-        local.notes[1].uuid = String::new();
-        // Both ends backfilled this one independently, to different values.
-        local.tasks.push(task(3, 0, "backfilled twice"));
-        local.tasks[0].uuid = "c".repeat(32);
+        local.notes.push(note(7, "one row, two integers"));
+        local.notes[0].uuid = "a".repeat(32);
 
         let mut remote = snap();
-        remote.notes.push(note(1, "written before the column"));
-        remote.notes[0].uuid = "b".repeat(32);
-        remote.tasks.push(task(3, 0, "backfilled twice"));
-        remote.tasks[0].uuid = "a".repeat(32);
+        remote.notes.push(note(9, "one row, two integers"));
+        remote.notes[0].uuid = "a".repeat(32);
 
         let out = with_ctx(1000, |ctx| merge(&local, None, &remote, "phone", ctx));
+        assert_eq!(out.merged.notes.len(), 1, "one uuid is one row");
+        assert_eq!(out.merged.notes[0].id, 7, "and it keeps this device's integer");
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
-        assert_eq!(out.merged.notes.len(), 2, "a renumber duplicated the shared note");
-        assert_eq!(out.merged.tasks.len(), 1, "a renumber duplicated the shared task");
-        // Blank adopts the known value, on both sides.
-        assert_eq!(out.merged.notes[0].uuid, "b".repeat(32));
-        // Two real values for one row: the smaller wins, so both peers agree on
-        // the survivor instead of trading the row back and forth.
-        assert_eq!(out.merged.tasks[0].uuid, "a".repeat(32));
-        // And a row neither side had named is minted here, 32 hex characters.
-        let minted = &out.merged.notes[1].uuid;
+
+        // Same integer, different uuids: two rows, and neither is renumbered — an
+        // integer is not an identity, so there is nothing to collide about.
+        let mut local = snap();
+        local.notes.push(note(3, "mine"));
+        local.notes[0].uuid = "b".repeat(32);
+        let mut remote = snap();
+        remote.notes.push(note(3, "theirs"));
+        remote.notes[0].uuid = "c".repeat(32);
+
+        let out = with_ctx(1000, |ctx| merge(&local, None, &remote, "phone", ctx));
+        assert_eq!(out.merged.notes.len(), 2, "same integer, different rows");
+        assert_eq!(out.merged.notes[0].id, 3, "the local row is untouched");
+        assert_ne!(out.merged.notes[1].id, 3, "the arrival got an integer of its own");
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+
+        // A blank uuid is named here, 32 hex characters, and never matched against
+        // another blank one.
+        let mut local = snap();
+        local.notes.push(note(1, "never named"));
+        local.notes[0].uuid = String::new();
+        let out = with_ctx(1000, |ctx| merge(&local, None, &snap(), "phone", ctx));
+        let minted = &out.merged.notes[0].uuid;
         assert_eq!(minted.len(), 32, "{minted:?}");
         assert!(minted.chars().all(|c| c.is_ascii_hexdigit()), "{minted:?}");
     }
 
-    /// One side moving a row lands, both sides moving it conflicts and keeps
-    /// this device's copy, and a remote delete over an untouched local row
-    /// lands — the three decisions `decide` makes, asked of the organizer's
-    /// rows exactly as they are asked of a page.
+    /// The two decisions the revision and the shadow make together, asked of the
+    /// organizer's rows: one side moving a row lands it, and both sides moving it is
+    /// settled by the **newer revision** — which is what makes a conflict converge
+    /// in the round that finds it instead of being re-decided, silently and the
+    /// other way, by the next.
     #[test]
-    fn an_organizer_edit_lands_from_one_side_and_conflicts_from_both() {
+    fn an_organizer_edit_lands_and_the_newer_revision_wins_a_double_edit() {
         let mut base = snap();
         base.notes.push(note(1, "shared"));
         base.tasks.push(task(3, 0, "shared"));
         let shadow = base.clone();
 
+        // The phone moved both rows; this device did not.
         let mut remote = base.clone();
-        remote.notes[0].title = "renamed there".into();
-        remote.tasks[0].done = true;
+        remote.notes = vec![note_at(remote.notes[0].clone(), 1_700_001_000_000, "phone", |n| {
+            n.title = "renamed there".into()
+        })];
+        remote.tasks = vec![task_at(remote.tasks[0].clone(), 1_700_001_000_000, "phone", |t| {
+            t.done = true
+        })];
 
-        // the remote moved, the local did not
         let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &remote, "phone", ctx));
         assert_eq!(out.merged.notes[0].title, "renamed there");
         assert!(out.merged.tasks[0].done);
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
 
-        // both moved: this device's copy wins and the user is told
+        // Both moved and the phone's write is the later one: it stands, and the
+        // round says so — which is the only thing that can explain the edit this
+        // device made and no longer sees.
         let mut local = base.clone();
-        local.notes[0].title = "renamed here".into();
+        local.notes = vec![note_at(local.notes[0].clone(), 1_700_000_500_000, "desk", |n| {
+            n.title = "renamed here".into()
+        })];
         let out = with_ctx(0, |ctx| merge(&local, Some(&shadow), &remote, "phone", ctx));
-        assert_eq!(out.merged.notes[0].title, "renamed here");
+        assert_eq!(out.merged.notes[0].title, "renamed there", "the newer write stands");
         assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
         assert!(out.conflicts[0].contains("note"), "{:?}", out.conflicts);
 
-        // a remote delete over an unchanged local copy lands
+        // And with the clock the other way this device's write is the one that
+        // stands: the arbiter is the revision, not which end is asking.
+        let mut local = base.clone();
+        local.notes = vec![note_at(local.notes[0].clone(), 1_700_002_000_000, "desk", |n| {
+            n.title = "renamed here".into()
+        })];
+        let out = with_ctx(0, |ctx| merge(&local, Some(&shadow), &remote, "phone", ctx));
+        assert_eq!(out.merged.notes[0].title, "renamed here", "the newer write stands");
+        assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
+
+        // A **purge** is the one removal with no row to carry it, so it is the one
+        // thing the shadow still decides: an untouched local row the peer no longer
+        // has stays gone.
         let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &snap(), "phone", ctx));
         assert!(out.merged.notes.is_empty());
         assert!(out.merged.tasks.is_empty());
     }
 
-    /// 回收站 (SPEC §四十一): the tombstone is part of the row, so it merges like
-    /// any other field — which is the whole reason it is a column and not a second
-    /// table. A note binned on the phone arrives binned here; the same note binned
-    /// on **both** sides is two peers agreeing rather than a conflict; and a remote
-    /// edit of a row this device binned is a conflict, settled the way every other
-    /// one is — this device's copy stands and the user is told.
+    /// 回收站 (SPEC §四十一): a bin is a write of the row like any other — which is
+    /// exactly why the revision is a field of its own, since `edited` deliberately
+    /// does not move when a row is binned. So the bin travels, the arbiter orders it
+    /// against an edit made elsewhere, and a row binned on both sides is two peers
+    /// agreeing rather than a disagreement.
     #[test]
-    fn a_tombstone_travels_with_the_row_it_belongs_to() {
+    fn a_bin_travels_as_a_write_of_the_row_it_belongs_to() {
         let mut base = snap();
         base.notes.push(note(1, "shared"));
         let shadow = base.clone();
 
+        // Binned on the phone, untouched here: the bin lands.
         let mut binned = base.clone();
-        binned.notes[0].deleted_at = Some(1_700_001_000);
+        binned.notes = vec![note_at(binned.notes[0].clone(), 1_700_001_000_000, "phone", |n| {
+            n.deleted_at = Some(1_700_001_000)
+        })];
         let out = with_ctx(0, |ctx| merge(&base, Some(&shadow), &binned, "phone", ctx));
         assert_eq!(
             out.merged.notes[0].deleted_at,
@@ -1314,20 +1513,35 @@ mod tests {
         );
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
 
-        // Both sides binned it: the same row twice is agreement, not a conflict.
+        // Binned on both sides: the same row twice is agreement, not a conflict.
         let out = with_ctx(0, |ctx| merge(&binned, Some(&shadow), &binned, "phone", ctx));
         assert_eq!(out.merged.notes[0].deleted_at, Some(1_700_001_000));
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
 
-        // The phone edited the row while this device binned it: a conflict, and
-        // the local copy — the one the user is looking at — is what stands.
+        // Binned here, edited there, the edit the later write: the edit stands —
+        // including the un-binning, because the row the later write describes is a
+        // live one. The round says so.
         let mut edited = base.clone();
-        edited.notes[0].title = "renamed there".into();
+        edited.notes = vec![note_at(edited.notes[0].clone(), 1_700_002_000_000, "phone", |n| {
+            n.title = "renamed there".into()
+        })];
         let out = with_ctx(0, |ctx| merge(&binned, Some(&shadow), &edited, "phone", ctx));
-        assert_eq!(out.merged.notes[0].deleted_at, Some(1_700_001_000));
-        assert_eq!(out.merged.notes[0].title, "shared", "the local copy stands");
+        assert_eq!(out.merged.notes[0].deleted_at, None, "the later write un-binned it");
+        assert_eq!(out.merged.notes[0].title, "renamed there");
         assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
         assert!(out.conflicts[0].contains("note"), "{:?}", out.conflicts);
+
+        // …and the other way round the bin is the later write, so it stands.
+        let mut binned_later = base.clone();
+        binned_later.notes = vec![note_at(
+            binned_later.notes[0].clone(),
+            1_700_003_000_000,
+            "desk",
+            |n| n.deleted_at = Some(1_700_003_000),
+        )];
+        let out = with_ctx(0, |ctx| merge(&binned_later, Some(&shadow), &edited, "phone", ctx));
+        assert_eq!(out.merged.notes[0].deleted_at, Some(1_700_003_000), "the bin stands");
+        assert_eq!(out.conflicts.len(), 1, "{:?}", out.conflicts);
     }
 
     /// The one pointer in the area. Two devices that each minted list 5 keep
@@ -1377,18 +1591,21 @@ mod tests {
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
     }
 
-    /// The organizer's one *self*-reference: a note pointing at a note. When the
-    /// parent is renumbered the reply has to follow it, or the comment would end up
-    /// answering whatever this device happens to hold under the old id.
+    /// The organizer's one *self*-reference: a note pointing at a note. A comment
+    /// that arrived from the peer carries a `ref_note` naming the **remote** integer,
+    /// so it has to be walked through the `remote id → local id` map the uuid-keyed
+    /// pass built — or it would end up answering whatever this device happens to
+    /// hold under that integer, which here is an unrelated local note.
     #[test]
-    fn a_comment_follows_its_renumbered_parent() {
+    fn a_comment_follows_its_parent_to_the_integer_it_landed_under() {
+        // A local note already sits on the integer the remote parent also uses, so
+        // the parent cannot keep it and must land under a fresh one.
         let mut local = snap();
-        local.notes.push(note(5, "local parent"));
+        local.notes.push(note(5, "local note"));
 
-        // Both sides minted note 5, and neither had it before: the local one keeps
-        // the id and the remote one is renumbered.
         let mut remote = snap();
         remote.notes.push(note(5, "remote parent"));
+        remote.notes[0].uuid = "d".repeat(32);
         remote.notes.push(comment(6, "the reply", 5));
 
         let out = with_ctx(1000, |ctx| merge(&local, Some(&snap()), &remote, "phone", ctx));
@@ -1398,8 +1615,8 @@ mod tests {
             .notes
             .iter()
             .find(|n| n.title == "remote parent")
-            .expect("the colliding remote note was renumbered rather than lost");
-        assert_ne!(parent.id, 5, "the local note keeps its own id");
+            .expect("the remote parent arrived");
+        assert_ne!(parent.id, 5, "it could not take the local note's integer");
         let reply = out
             .merged
             .notes
@@ -1409,7 +1626,7 @@ mod tests {
         assert_eq!(
             reply.ref_note,
             Some(parent.id),
-            "the comment's ref moved with the parent it answers"
+            "the reply follows the parent it answers"
         );
         assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
     }
@@ -1428,7 +1645,7 @@ mod tests {
             .merged
             .notes
             .iter()
-            .find(|n| n.id == 9)
+            .find(|n| n.title == "orphan reply")
             .expect("the reply arrived");
         assert_eq!(reply.ref_note, Some(404), "a dangling ref is kept, not scrubbed");
     }

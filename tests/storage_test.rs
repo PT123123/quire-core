@@ -83,6 +83,10 @@ fn organizer_note(id: u64) -> Note {
         // stored instant have to be told apart by the load, and a column that
         // silently read back `None` would pass on a library with nothing in 回收站.
         deleted_at: (id % 2 == 0).then_some(1_700_001_000 + id as i64),
+        // A revision on every row, and distinct from the instants above: the
+        // column is what the merge arbitrates by, so a round trip that lost it
+        // would leave every row looking equally old.
+        rev: quire_core::core::organizer::rev(1_700_000_900_000 + id as i64, "desk"),
     }
 }
 
@@ -126,6 +130,8 @@ fn organizer_task(id: u64, list: ListId) -> Task {
         // A tombstone on the third ids, so both halves of the column are covered
         // here as they are on the notes above.
         deleted_at: (id % 3 == 0).then_some(1_700_001_000 + id as i64),
+        // …and the revision, for the reason the notes above carry one.
+        rev: quire_core::core::organizer::rev(1_700_000_900_000 + id as i64, "desk"),
     }
 }
 
@@ -1612,6 +1618,95 @@ fn the_v29_step_adds_the_two_tombstones_and_bins_nothing() {
         }
         // Idempotent, like every step before it.
         migrations::ensure_current(&mut conn).unwrap();
+    }
+}
+
+/// The revision step: two `rev` columns, backfilled **in place** from what the row
+/// already carries — its `edited`, or its `deleted_at` when the bin moved it later
+/// — scaled from seconds to the milliseconds `core::organizer::rev` counts in.
+///
+/// The backfill is the load-bearing half. A blank revision compares equal to every
+/// other blank one, so a merge would have nothing to arbitrate with and would fall
+/// back to its content tie-break on every legacy row at once.
+#[test]
+fn the_v30_step_adds_and_backfills_the_organizer_revisions() {
+    let dir = tempfile();
+    let path = dir.join("organizer-rev.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrations::ensure_current(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE notes DROP COLUMN rev;
+             ALTER TABLE tasks DROP COLUMN rev;
+             PRAGMA user_version = 29;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (id, title, body, pinned, tags, created, edited, deleted_at)
+             VALUES (1, 'Live', '', 0, '', 1, 2, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (id, title, body, pinned, tags, created, edited, deleted_at)
+             VALUES (2, 'Binned', '', 0, '', 1, 2, 90)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, list, title, notes, priority, repeat, done, tags, subtasks,
+                                created, edited, ord)
+             VALUES (1, 0, 'Old task', '', 'none', 'none', 0, '', '', 1, 2, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        for table in ["notes", "tasks"] {
+            let present: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM pragma_table_info('{table}') WHERE name = 'rev'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "the rolled-back schema has no revision on {table}");
+        }
+
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(
+            migrations::user_version(&conn).unwrap(),
+            migrations::CURRENT_VERSION
+        );
+        // The live row is stamped from its `edited`; the binned one from the later
+        // instant the bin stamped, because that is the write that moved it last.
+        let column = |conn: &rusqlite::Connection, table: &str, id: i64| -> String {
+            conn.query_row(
+                &format!("SELECT rev FROM {table} WHERE id = {id}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let live = column(&conn, "notes", 1);
+        assert_eq!(live, format!("{:013}-", 2_000));
+        assert_eq!(column(&conn, "notes", 2), format!("{:013}-", 90_000));
+        assert_eq!(column(&conn, "tasks", 1), format!("{:013}-", 2_000));
+        for table in ["notes", "tasks"] {
+            let blank: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table} WHERE rev = ''"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(blank, 0, "{table} kept a blank revision");
+        }
+        // Idempotent, like every step before it — and a replay must not restamp a
+        // row, which would walk every legacy row's birthday forward on every launch.
+        migrations::ensure_current(&mut conn).unwrap();
+        assert_eq!(column(&conn, "notes", 1), live, "a replay restamped the row");
     }
 }
 

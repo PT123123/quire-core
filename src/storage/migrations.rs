@@ -44,7 +44,13 @@ use crate::core::StorageError;
 /// the same late-column shape once more, on the two tables that hold rows a user
 /// deletes by hand. Nullable with no default, because `NULL` is the live row and
 /// the instant is what the bin sorts by — see `Note::deleted_at`.
-pub const CURRENT_VERSION: i32 = 29;
+///
+/// Step 30 is the organizer's **revision** (`notes.rev` / `tasks.rev`): the
+/// `"{millis:013}-{device}"` string SPEC §四十一's sync compares two copies of one
+/// row by (`core::organizer::rev`). Backfilled in place from `edited`, so no row
+/// that predates it reaches a merge without a stamp — see
+/// `add_organizer_rev_columns`.
+pub const CURRENT_VERSION: i32 = 30;
 
 /// A single forward-only schema step: `sql` runs when the database sits at
 /// `version - 1` and bumps `user_version` to `version`. `backfill`, when
@@ -663,6 +669,21 @@ CREATE INDEX IF NOT EXISTS idx_tasks_due      ON tasks(due);
     // special-case forever.
     sql: "",
     backfill: Some(add_organizer_deleted_at_columns),
+}, Migration {
+    version: 30,
+    label: "organizer rev",
+    // SPEC §四十一's sync revision — the `(instant, device)` pair a merge settles
+    // two copies of one row by (`core::organizer::rev`, and the model the
+    // reference app's `aw-sync-rust` uses). `edited` cannot serve: a bin and the
+    // restore that undoes it deliberately do not move it, so the two would carry
+    // the same stamp and no merge could order them.
+    //
+    // `NOT NULL DEFAULT ''` like the uuid columns, and for the same reason: one
+    // shape for the store to write. The empty string is only ever visible to a
+    // row the backfill below has not reached — running in the same transaction,
+    // it never survives migration.
+    sql: "",
+    backfill: Some(add_organizer_rev_columns),
 }];
 
 /// Add each named column to `pages`, only when that column is missing. Every
@@ -779,6 +800,43 @@ fn add_organizer_deleted_at_columns(conn: &mut Connection) -> Result<(), Storage
         conn,
         &[("deleted_at", "ALTER TABLE tasks ADD COLUMN deleted_at INTEGER")],
     )
+}
+
+/// Migration 30 body: the two `rev` columns, and the backfill that stamps every
+/// row that predates them.
+///
+/// The backfill derives the revision from what the row already carries — its
+/// `edited` instant, or its `deleted_at` when the bin moved it later — scaled
+/// from seconds to the milliseconds `core::organizer::rev` counts in, with an
+/// empty device half. That is enough to order a legacy row against a row the new
+/// build writes (whose instant is *now*, and therefore later), and enough for two
+/// legacy rows to tie only when they were genuinely written the same second —
+/// which the merge then settles by the row's own content rather than by dropping
+/// one.
+///
+/// Both columns go through the guarded `ALTER` helpers, so a library that already
+/// carries one converges instead of failing on a duplicate name.
+fn add_organizer_rev_columns(conn: &mut Connection) -> Result<(), StorageError> {
+    add_note_columns(
+        conn,
+        &[("rev", "ALTER TABLE notes ADD COLUMN rev TEXT NOT NULL DEFAULT ''")],
+    )?;
+    add_task_columns(
+        conn,
+        &[("rev", "ALTER TABLE tasks ADD COLUMN rev TEXT NOT NULL DEFAULT ''")],
+    )?;
+    for table in ["notes", "tasks"] {
+        conn.execute(
+            &format!(
+                "UPDATE {table}
+                    SET rev = printf('%013d-', MAX(edited, COALESCE(deleted_at, 0)) * 1000)
+                  WHERE rev = ''"
+            ),
+            [],
+        )
+        .map_err(|e| StorageError::Sql(format!("backfill {table}.rev: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Migration 11 body.

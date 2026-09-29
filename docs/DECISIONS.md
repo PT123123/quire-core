@@ -9,6 +9,43 @@ rather than the product's. `README.md` says where the chain used to live: the
 desktop repository, because it described the product. A decision about the shared
 model — one the shells consume rather than make — belongs here.
 
+## ADR-0006 · `user_version` records that a step ran, not that its objects exist — so every open repairs and then verifies
+
+Decision: `ensure_current` ends with a repair pass and then `check_schema`, and
+therefore runs on **every** open, not only when a step is pending. A step is
+replayed only if it is listed in `REPLAYABLE`, which names the objects it owns;
+the repair then runs that step's own backfill, and whatever is still missing
+makes the open **fail**.
+
+Context: `PRAGMA user_version` is the only record of whether a migration ran.
+Nothing in it says the tables that migration was supposed to create are there,
+and a step whose DDL was refused — a SQLite built without FTS5, a failed open —
+still advanced the version on any build that did not stop it. The file then
+claims to be current and is missing half its schema.
+
+The consequence is not a degraded feature, it is a dead library. `apply`
+maintains the FTS mirror inside the *same transaction* as the rows it indexes
+(ADR-0014), so one missing `search_pages` fails **every** write and rolls back
+the whole batch. This was found on a real desktop library: nine hours and ten
+sessions produced no persisted change of any kind — no notes, no window size,
+no `sync.device-id`, which re-minted itself on every launch and filled the
+phone's peer table with dead entries for one machine. The file opened normally,
+passed `integrity_check`, and reported the current schema version throughout.
+
+`check_schema` already existed for precisely this and already listed
+`search_pages` / `search_blocks`, with a comment saying a file reaching the
+current version without them is one whose upgrade did not run. It was called
+from its own tests and from nowhere else, so the guard was real and inert.
+
+Consequences: a repaired library indexes the rows it already held rather than
+starting empty. Only `CREATE ... IF NOT EXISTS` steps are replayable, and they
+must be named — an `ALTER TABLE ADD COLUMN` is not idempotent, and replaying one
+against a library that already has the column is the single way this could make
+things worse, so silence stays the safe default. A library that cannot be
+repaired is refused at open, which a shell already handles visibly (memory-only
+session plus a notice) — the point is that neither outcome may be a file which
+opens and then quietly refuses everything.
+
 ## ADR-0005 · A connection waits for the writer ahead of it instead of failing
 
 Decision: `Database::configure` sets `busy_timeout` to 5 seconds. It is the one

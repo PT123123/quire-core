@@ -1105,9 +1105,78 @@ pub fn user_version(conn: &Connection) -> Result<i32, StorageError> {
         .map_err(|e| StorageError::Open(e.to_string()))
 }
 
+/// Steps whose `sql` is **idempotent** — `CREATE ... IF NOT EXISTS` and nothing
+/// else — so a library that is missing what the step was supposed to create can
+/// be repaired by replaying it, and each entry names the objects the step owns.
+///
+/// `PRAGMA user_version` only records that a step *ran*. It cannot record that
+/// the objects it was supposed to leave behind are there, and a step whose
+/// `CREATE VIRTUAL TABLE` was refused (a SQLite built without FTS5, a failed
+/// open) still advanced the version on the builds that swallowed the error.
+/// The result is a file that claims to be current and is missing half its
+/// schema — and because `apply` maintains the search index inside the same
+/// transaction as the rows it mirrors, every later write fails on the missing
+/// table and rolls the whole batch back. A shell that does not read the write
+/// error then looks perfectly healthy while saving nothing, ever.
+///
+/// Only steps listed here may be replayed: an `ALTER TABLE ADD COLUMN` is not
+/// idempotent, and re-running it against a library that already has the column
+/// is the one way this could make things worse.
+const REPLAYABLE: &[(i32, &[&str])] = &[(2, &["search_pages", "search_blocks"])];
+
+/// Are all of `objects` present in `conn`?
+fn objects_present(conn: &Connection, objects: &[&str]) -> Result<bool, StorageError> {
+    for object in objects {
+        let found: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE name = ?1",
+                [object],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| StorageError::Sql(e.to_string()))?;
+        if found.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Re-apply the replayable steps whose objects are missing, then verify the
+/// schema and **fail loudly** if it is still short of anything.
+///
+/// This is the step that turns "the file is quietly wrong" into either a
+/// repaired file or a refused open. Both are honest; a library that opens and
+/// then refuses every write is neither.
+fn repair_and_verify(conn: &mut Connection) -> Result<(), StorageError> {
+    for (version, objects) in REPLAYABLE {
+        if objects_present(conn, objects)? {
+            continue;
+        }
+        let Some(migration) = MIGRATIONS.iter().find(|m| m.version == *version) else {
+            return Err(StorageError::Corrupt(format!(
+                "replayable step {version} is not in the migration list"
+            )));
+        };
+        // No transaction: the step's own DDL is `IF NOT EXISTS`, and its
+        // backfill needs its own transaction anyway (same as the forward path).
+        conn.execute_batch(migration.sql)
+            .map_err(|e| StorageError::Sql(format!("repair {}: {e}", migration.label)))?;
+        if let Some(backfill) = migration.backfill {
+            backfill(conn)
+                .map_err(|e| StorageError::Sql(format!("repair {} backfill: {e}", migration.label)))?;
+        }
+    }
+    check_schema(conn)
+}
+
 /// Bring `conn` to `CURRENT_VERSION`. A fresh (version 0) database gets the
 /// whole chain; an already-current one is a no-op. A version above ours
 /// means the binary is older than the data — refuse rather than downgrade.
+///
+/// Every open ends here, so this is also where a file that reached the current
+/// version without the objects that version implies gets repaired, and one
+/// that cannot be repaired is refused rather than handed out broken.
 pub fn ensure_current(conn: &mut Connection) -> Result<(), StorageError> {
     let from = user_version(conn)?;
     if from > CURRENT_VERSION {
@@ -1135,7 +1204,9 @@ pub fn ensure_current(conn: &mut Connection) -> Result<(), StorageError> {
                 .map_err(|e| StorageError::Sql(format!("migration {} backfill: {e}", migration.label)))?;
         }
     }
-    Ok(())
+    // Reached by every open, whether or not a step ran: a file that was already
+    // at the current version still has to have the objects that version implies.
+    repair_and_verify(conn)
 }
 
 /// True when every table the current schema needs is present.
@@ -1216,5 +1287,54 @@ mod tests {
             check_schema(&conn),
             Err(StorageError::Corrupt(_))
         ));
+    }
+
+    /// The failure this exists for: a library that sits at `CURRENT_VERSION`
+    /// while missing what that version is supposed to have left behind.
+    ///
+    /// `user_version` is the only record of whether a step ran, so a step whose
+    /// DDL was refused still leaves the file looking current. `ensure_current`
+    /// used to stop at the version check and hand such a file out, and from
+    /// then on every `apply` failed on the missing FTS table and rolled the
+    /// whole batch back — so a shell that does not read the write error saves
+    /// nothing, silently, forever.
+    #[test]
+    fn a_current_file_missing_the_search_index_is_repaired_on_open() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_current(&mut conn).unwrap();
+        // a page for the replayed backfill to find. `full_width` / `small_text`
+        // are not columns: §三十八 packs both into `layout`.
+        conn.execute(
+            "INSERT INTO pages (id, title, parent, ord, favorite, expanded) \
+             VALUES (1, '索引测试', NULL, 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        // exactly what a refused `CREATE VIRTUAL TABLE` leaves behind
+        conn.execute_batch(
+            "DROP TABLE search_pages; DROP TABLE search_blocks;",
+        )
+        .unwrap();
+        assert!(!objects_present(&conn, &["search_pages"]).unwrap());
+
+        ensure_current(&mut conn).unwrap();
+
+        assert!(
+            objects_present(&conn, &["search_pages", "search_blocks"]).unwrap(),
+            "the replayed step must leave the index tables in place"
+        );
+        // The index stores a *segmented* copy of CJK (search_index.rs: `unicode61`
+        // never splits a Han run, so every character is indexed on its own), so
+        // the row is matched per character rather than as the whole title.
+        let indexed: String = conn
+            .query_row("SELECT title FROM search_pages WHERE rowid = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            ["索", "引", "测", "试"].iter().all(|c| indexed.contains(c)),
+            "and the backfill must index the rows the file already held, not start empty: {indexed:?}"
+        );
+        check_schema(&conn).unwrap();
     }
 }

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### `user_version` is not a receipt: a file that claims to be current and is not gets repaired or refused (ADR-0004)
+
+- `ensure_current` now ends with a **repair + verify** pass, so it runs on every
+  open rather than only when a step is pending. A library sitting at
+  `CURRENT_VERSION` while missing what that version implies is replayed through
+  the idempotent steps that own the missing objects, and then checked against
+  `check_schema` — which **was already written for exactly this** (it lists
+  `search_pages` / `search_blocks` and says a file reaching the current version
+  without them is one whose upgrade did not run) but was **never called from
+  production code**, only from its own tests.
+- The observable failure this fixes, found on a real desktop library:
+  `apply` maintains the FTS mirror **inside the same transaction** as the rows it
+  indexes (ADR-0014), so a missing `search_pages` made every single write fail
+  with `no such table: search_pages` and roll the whole batch back. A library
+  with no search index therefore saved **nothing at all** — not notes, not
+  window size, not `sync.device-id` — while opening normally, passing
+  `integrity_check`, and reporting a healthy schema version.
+- Only steps whose SQL is `CREATE ... IF NOT EXISTS` and nothing else are
+  replayable, and they are listed explicitly in `REPLAYABLE` with the objects
+  they own. An `ALTER TABLE ADD COLUMN` is not idempotent, and re-running it
+  against a library that already has the column is the one way this could make
+  things worse — so a step has to be named before it can be replayed.
+- The repair runs the step's own backfill, so a repaired library **indexes the
+  rows it already held** rather than starting with an empty index.
+- What cannot be repaired is now **refused at open** rather than handed out
+  broken. Both outcomes are honest; a file that opens and then refuses every
+  write is neither.
+
 ### A delete is reversible: 回收站 as a tombstone (ADR-0003)
 
 - `org::Note` and `org::Task` each gain `deleted_at: Option<i64>` — the instant the

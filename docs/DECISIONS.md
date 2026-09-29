@@ -9,6 +9,46 @@ rather than the product's. `README.md` says where the chain used to live: the
 desktop repository, because it described the product. A decision about the shared
 model — one the shells consume rather than make — belongs here.
 
+## ADR-0005 · A connection waits for the writer ahead of it instead of failing
+
+Decision: `Database::configure` sets `busy_timeout` to 5 seconds. It is the one
+pragma this crate never set, and its absence was a field failure rather than a
+missing feature: a transaction that met another connection's write returned
+`SQLITE_BUSY` *immediately* — the default is 0, not a short wait.
+
+Context: `Mutex<Connection>` serialises writers inside one process and does
+nothing across two, and two writers is this app's normal case rather than an edge.
+The persistence service queues writes and flushes them on a timer; the sync engine
+flushes on its own beat; `apply_now` (the Compose shell's settings writes) goes
+straight past the queue; and the desktop's tray design (its ADR-0096) deliberately
+keeps an instance alive after the window closes, so a second instance can hold the
+same file open.
+
+The flush that is not allowed to fail was the one racing. An inbound push makes
+the receiving side call `sync_export` → `force_flush` from the engine's pump — on
+the same 250 ms beat as the ordinary writer — so the one snapshot whose failure
+aborts the round is the one most likely to lose the race. It lost, and the message
+reached the user blaming the *other* device: the log's device column said
+「Android」 and the sentence beside it said this side could not flush, so a phone
+was reported as the culprit when the writer that failed was the desktop reading
+it. `synchronous=FULL`, chosen for durability, widens the window on a slow disk.
+
+Consequences:
+
+- A colliding writer now waits its turn, and the round completes. The 5 s is
+  SQLite's own suggested default for a busy handler and is spent waiting, not
+  lost; a local transaction takes milliseconds, so the budget is never the thing
+  that expires.
+- A genuine lock — another process holding the file open for minutes — still
+  fails, and still should: that is a real condition and pretending otherwise
+  would trade a clear error for a hang.
+- The wording was fixed at the desktop's ADR-0128 because the fix alone would
+  leave the same trap: a message about this machine's disk is read through the
+  column naming the peer.
+- **`open_in_memory` is deliberately left alone.** Nothing shares an in-memory
+  database across connections in this codebase, so the pragma would be a line of
+  no test and no behaviour.
+
 ## ADR-0004 · Notes and tasks merge by their 唯一 ID, and the revision decides the loser
 
 Decision: `merge`'s **organizer half** stops using the id-keyed flat pass. `notes`

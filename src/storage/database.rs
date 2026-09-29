@@ -84,6 +84,27 @@ impl Database {
             .map_err(|e| map_startup_error(e, "synchronous=FULL"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| map_startup_error(e, "foreign_keys=ON"))?;
+        // **How long a writer waits for another writer instead of failing.**
+        //
+        // The default is 0: a transaction that collides with another connection's
+        // write returns SQLITE_BUSY *immediately*, rather than waiting its turn.
+        // This process is not the only writer of this file — `Mutex<Connection>`
+        // serialises writers *inside* one process and does nothing across two — and
+        // two writers is the normal case here, not an edge: the sync engine flushes
+        // on the pump's beat, `apply_now` writes settings straight through the
+        // queue, and a *second* instance of the app (the tray design keeps one
+        // alive after the window closes, ADR-0096) holds the same file open.
+        //
+        // What that cost, in the field: an inbound push makes the receiving side
+        // call `sync_export` → `force_flush` on the pump's own thread, so the one
+        // flush that must not fail is the one racing its own 250 ms writer. It lost,
+        // and the user read the consequence from the other end — a line naming the
+        // *other* device ("Android 未能把待写入的更改落盘") when the failing writer
+        // was this machine. The 5 s budget below is SQLite's own default suggestion
+        // for a busy handler and is far longer than a local transaction takes;
+        // it is spent waiting, not failed.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| map_startup_error(e, "busy_timeout"))?;
         Ok(())
     }
 

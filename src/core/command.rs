@@ -1699,6 +1699,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             let id = record.id;
             let mut apply: Vec<Change> = Vec::with_capacity(values.len() + 2);
             let mut revert: Vec<Change> = Vec::with_capacity(values.len() + 2);
+            let mut restore_values = Vec::with_capacity(values.len());
             // The forward order is ADR-0063's, and the revert is its reverse.
             // `apply` is one transaction with foreign keys on, so the two orders
             // are not interchangeable: a value row cannot outlive its record on
@@ -1715,7 +1716,7 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                     property: property,
                     value: CellValue::Empty,
                 });
-                revert.push(Change::CellSet {
+                restore_values.push(Change::CellSet {
                     record: id,
                     property: property,
                     value: value.clone(),
@@ -1727,6 +1728,9 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 revert.push(Change::PageCreated(page.clone()));
             }
             revert.push(Change::RecordCreated(record));
+            // A value row has a foreign key to its record, so restoration is
+            // the reverse of deletion: page (when present), record, then cells.
+            revert.extend(restore_values);
             Some(Entry { apply, revert })
         }
 
@@ -4760,6 +4764,61 @@ mod tests {
         let entry = plan(&mut doc, page, Command::DeleteTask { task: t.clone() }).unwrap();
         assert_eq!(entry.apply, vec![Change::TaskDeleted { id: TaskId(7) }]);
         assert_eq!(entry.revert, vec![Change::TaskAdded(t)]);
+    }
+
+    #[test]
+    fn deleting_a_database_record_restores_record_before_its_values() {
+        let (mut doc, _hist, page, ids) = setup();
+        let block = ids[0];
+        let db = DatabaseId(50);
+        let title = PropertyId(51);
+        let view = ViewId(52);
+        let make = plan(
+            &mut doc,
+            page,
+            Command::MakeDatabase {
+                id: block,
+                draft: DatabaseDraft::new(db, title, view, "test"),
+            },
+        )
+        .unwrap();
+        doc.apply(&make.apply);
+
+        let record = Record::bare(RecordId(53), db, OrderKey::FIRST);
+        let add = plan(
+            &mut doc,
+            page,
+            Command::AddDatabaseRecord {
+                block,
+                record: record.id,
+                ord: record.ord,
+            },
+        )
+        .unwrap();
+        doc.apply(&add.apply);
+
+        let entry = plan(
+            &mut doc,
+            page,
+            Command::DeleteDatabaseRecord {
+                block,
+                record: record.clone(),
+                values: vec![(title, CellValue::Text("row title".into()))],
+                page: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            entry.revert,
+            vec![
+                Change::RecordCreated(record),
+                Change::CellSet {
+                    record: RecordId(53),
+                    property: title,
+                    value: CellValue::Text("row title".into()),
+                },
+            ]
+        );
     }
 
     /// **The reason `DeleteTaskList` is one command.** Deleting a list moves its

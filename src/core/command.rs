@@ -262,6 +262,13 @@ pub enum Command {
     /// The inverse is the view alone: a view nobody has edited yet holds no
     /// document and owns no rows, so `ViewDeleted` is the whole of the undo.
     AddDatabaseView { block: BlockId, view: View },
+    /// Rename a database view without changing its layout or rule document.
+    RenameDatabaseView {
+        block: BlockId,
+        view: ViewId,
+        from: String,
+        to: String,
+    },
     /// Set (or clear) a `formula` column's expression — D6's formula editor.
     /// The strings are the column's **whole `config` document** before and
     /// after (ADR-0061's one document per column), read-edit-written by the
@@ -1825,6 +1832,22 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
             Some(Entry {
                 apply: vec![Change::ViewAdded(view.clone())],
                 revert: vec![Change::ViewDeleted { id: view.id }],
+            })
+        }
+
+        Command::RenameDatabaseView {
+            block,
+            view,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to || to.trim().is_empty() {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::ViewRenamed { id: view, name: to }],
+                revert: vec![Change::ViewRenamed { id: view, name: from }],
             })
         }
 

@@ -169,10 +169,17 @@ pub enum Command {
     /// a database made by the app has exactly one column forever, and no cell
     /// of any of D3's four inline editors could ever be reached. The command is
     /// the *storage* half only — editing a column's name, kind or options after
-    /// the fact is `PropertyRenamed` / `PropertyKindSet`, of which the kind has a
-    /// UI (`Command::SetDatabasePropertyKind`, D10) and the name and the options
-    /// still do not.
+    /// the fact is `PropertyRenamed` / `PropertyKindSet`; options still have no
+    /// UI.
     AddDatabaseProperty { block: BlockId, property: Property },
+    /// Rename one column as one reversible row edit. `from` is the catalog
+    /// name the caller read; the plan has no property table to re-read it.
+    RenameDatabaseProperty {
+        block: BlockId,
+        property: PropertyId,
+        from: String,
+        to: String,
+    },
     /// One new row at `ord` (the end of the listing, which is what the view's
     /// "new row" line means). `record` is allocated by the caller — the store's
     /// ids are its own table's, and ADR-0067 means the app never loads them all
@@ -1671,6 +1678,28 @@ pub fn plan(doc: &mut Document, page: PageId, cmd: Command) -> Option<Entry> {
                 // which is why the store's delete and this share a transaction
                 // boundary and nothing else has to be listed here.
                 revert: vec![Change::PropertyDeleted { id: property.id }],
+            })
+        }
+
+        Command::RenameDatabaseProperty {
+            block,
+            property,
+            from,
+            to,
+        } => {
+            let b = doc.block(block)?;
+            if b.db_ref.is_none() || from == to || to.trim().is_empty() {
+                return None;
+            }
+            Some(Entry {
+                apply: vec![Change::PropertyRenamed {
+                    id: property,
+                    name: to,
+                }],
+                revert: vec![Change::PropertyRenamed {
+                    id: property,
+                    name: from,
+                }],
             })
         }
 

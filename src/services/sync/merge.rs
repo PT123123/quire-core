@@ -348,8 +348,21 @@ fn decide<T: PartialEq>(l: Option<&T>, r: Option<&T>, s: Option<Option<&T>>) -> 
             Some(Some(sv)) if l == Some(sv) => Pick::Remote,
             Some(Some(sv)) if r == Some(sv) => Pick::Local,
             Some(Some(_)) => Pick::Conflict,
-            // no shadow row and only one side has the row: it was created
-            // there since the last sync
+            // **No shadow at all, and only the remote side is missing the row.**
+            //
+            // This branch used to fall through to `Pick::Remote` together with
+            // `Some(None)`, which made a first sync with a peer that had never seen
+            // this device's rows read as "the peer deleted all of them" — and a
+            // merge reads absence as a deletion, so the whole library went with it.
+            // An empty peer (a phone that has just been installed, or one whose
+            // store was reset) is the ordinary shape of that peer, not a purge:
+            // there is nothing in "no shadow" that could distinguish the two, and
+            // a wrong purge is unrecoverable while a missed purge is one round
+            // later. So the local row stays and the round continues; the gate
+            // that actually refuses an empty peer lives at the door
+            // (`sync_apply_remote`), where "this snapshot is empty" is a fact
+            // about the whole library rather than about one row.
+            None if l.is_some() => Pick::Local,
             None | Some(None) => {
                 if l.is_none() {
                     Pick::Remote
@@ -985,6 +998,102 @@ pub fn sort_blocks_parents_first(blocks: &mut [SBlock]) {
 mod tests {
     use super::*;
     use crate::services::sync::model::{SNote, SSubtask, STask};
+
+    /// **A first sync with a peer that has never seen this device keeps every
+    /// local row.**
+    ///
+    /// This is the bug that emptied a phone's library: a fresh device was
+    /// installed, the two were put on one network, and the first round between
+    /// them merged an *empty* remote snapshot against a full local one. With no
+    /// shadow — the two sides had never agreed on anything — the old `decide`
+    /// answered `Pick::Remote` for every local row, and `merge_flat` treats a
+    /// remote-absent `Pick::Remote` as a deletion. Ten pages, sixty-two notes
+    /// and nine tasks went in one round, and the empty result was stored as the
+    /// shadow, which made "empty" the two devices' new agreement.
+    ///
+    /// The asymmetry matters and is deliberate: **absence with no shadow is not
+    /// evidence of a purge.** A missed purge costs one round; a wrong one costs
+    /// the library, and the merge result is what gets written.
+    #[test]
+    fn no_shadow_never_reads_a_missing_remote_row_as_a_deletion() {
+        let local = vec![page(1, None), page(2, Some(1)), page(3, None)];
+        // A peer that has just been installed: it holds nothing at all.
+        let empty = SyncSnapshot::default();
+
+        let merged = with_ctx(100, |ctx| {
+            merge(&snap_with_pages(local.clone()), None, &empty, "新手机", ctx)
+        });
+
+        assert_eq!(
+            merged.merged.pages.len(),
+            3,
+            "a peer that holds nothing must not empty a library that does"
+        );
+        // Not in id order: the merged output is sorted so a parent comes before
+        // its children, and page 3 is a root. What is under test is that all
+        // three are still here.
+        let mut ids: Vec<u64> = merged.merged.pages.iter().map(|p| p.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3], "every local page survives");
+        assert!(
+            merged.conflicts.is_empty(),
+            "nothing was disputed — there was nothing to dispute"
+        );
+    }
+
+    /// **The same first sync, the other way round: the newcomer takes the
+    /// peer's rows.** The fix above must not turn "I am empty, they are not"
+    /// into a refusal or a silent no-op, because that is the ordinary first
+    /// sync — this device is the one that was just installed.
+    #[test]
+    fn a_first_sync_still_imports_a_peer_that_holds_the_library() {
+        let remote = SyncSnapshot {
+            pages: vec![page(10, None), page(11, Some(10))],
+            ..snap()
+        };
+
+        let merged = with_ctx(100, |ctx| merge(&snap(), None, &remote, "桌面", ctx));
+
+        assert_eq!(merged.merged.pages.len(), 2, "the peer's pages arrive");
+        let ids: Vec<u64> = merged.merged.pages.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![10, 11]);
+    }
+
+    /// **A real purge still works once the shadow has seen the row.**
+    ///
+    /// The gate is "no shadow", not "never delete". A row both sides agreed on,
+    /// which the peer no longer has, is a purge the user did — and refusing it
+    /// would resurrect every deleted note forever.
+    #[test]
+    fn a_purge_the_shadow_saw_is_still_a_purge() {
+        let local = vec![page(1, None), page(2, None)];
+        let agreed = SyncSnapshot {
+            pages: vec![page(1, None), page(2, None)],
+            ..snap()
+        };
+        // The peer kept page 1 and purged page 2.
+        let remote = SyncSnapshot {
+            pages: vec![page(1, None)],
+            ..snap()
+        };
+
+        let merged = with_ctx(100, |ctx| {
+            merge(
+                &snap_with_pages(local),
+                Some(&agreed),
+                &remote,
+                "桌面",
+                ctx,
+            )
+        });
+
+        let ids: Vec<u64> = merged.merged.pages.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1], "page 2 was purged on the peer and stays purged here");
+    }
+
+    fn snap_with_pages(pages: Vec<SPage>) -> SyncSnapshot {
+        SyncSnapshot { pages, ..snap() }
+    }
 
     fn snap() -> SyncSnapshot {
         SyncSnapshot::default()

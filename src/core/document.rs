@@ -7,7 +7,7 @@
 // ignored here (the M2 mock workspace still owns the page tree); the M3
 // merge wires them through.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::persistence::Change;
 use super::types::{Block, BlockId, OrderKey, PageId};
@@ -122,6 +122,32 @@ impl Document {
     /// Apply change lists (forward or revert) to the in-memory state.
     /// Page/meta changes are accepted and ignored for now — see module doc.
     pub fn apply(&mut self, changes: &[Change]) {
+        // Markdown import is a page-sized batch of inserts. The ordinary path
+        // checks every existing id and sorts the destination page after each
+        // block, making N inserts quadratic. Keep the same idempotency while
+        // appending the batch and sorting each touched page once.
+        if !changes.is_empty() && changes.iter().all(|c| matches!(c, Change::BlockInserted(_))) {
+            let mut ids: HashSet<BlockId> = self
+                .pages
+                .values()
+                .flat_map(|blocks| blocks.iter().map(|block| block.id))
+                .collect();
+            let mut touched = HashSet::new();
+            for change in changes {
+                if let Change::BlockInserted(block) = change {
+                    if ids.insert(block.id) {
+                        self.pages.entry(block.page).or_default().push(block.clone());
+                        touched.insert(block.page);
+                    }
+                }
+            }
+            for page in touched {
+                if let Some(blocks) = self.pages.get_mut(&page) {
+                    blocks.sort_by_key(|block| block.order);
+                }
+            }
+            return;
+        }
         for change in changes {
             match change {
                 Change::BlockInserted(block) => {

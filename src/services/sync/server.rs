@@ -8,6 +8,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_ACTIVE_CONNECTIONS: usize = 8;
+
 use super::engine::{DeviceInfo, Job, PeerRecord};
 
 pub struct SyncServer {
@@ -23,19 +27,30 @@ impl SyncServer {
     /// Serve forever on an already-bound listener (the caller spawns the
     /// thread; `services::lan_server` has the same shape).
     pub fn serve(&self, listener: TcpListener) {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let previous = active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if previous >= MAX_ACTIVE_CONNECTIONS {
+                active.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                let _ = respond_text(&stream, 503, "too many requests");
+                continue;
+            }
             let server = SyncServer {
                 self_info: self.self_info.clone(),
                 tx: self.tx.clone(),
             };
+            let active = active.clone();
             std::thread::spawn(move || {
                 let _ = server.handle(stream);
+                active.fetch_sub(1, std::sync::atomic::Ordering::Release);
             });
         }
     }
 
     fn handle(&self, stream: TcpStream) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
         let mut reader = BufReader::new(&stream);
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
@@ -56,6 +71,9 @@ impl SyncServer {
             {
                 content_length = v.trim().parse().unwrap_or(0);
             }
+        }
+        if content_length > MAX_REQUEST_BODY_BYTES {
+            return respond_text(&stream, 413, "request body too large");
         }
         let mut body = vec![0u8; content_length];
         if content_length > 0 {
@@ -175,6 +193,7 @@ fn respond_bytes(stream: &TcpStream, status: u16, body: &[u8]) -> std::io::Resul
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
         503 => "Service Unavailable",
         _ => "Error",
     };

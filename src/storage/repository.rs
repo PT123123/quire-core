@@ -879,7 +879,15 @@ fn apply_one(tx: &Transaction, change: &Change) -> Result<(), StorageError> {
                     ],
                 )
                 .map_err(sql)?;
-            require_hit(n, "BlockMovedToPage(children)", id.as_u64())
+            require_hit(n, "BlockMovedToPage(children)", id.as_u64())?;
+            let text: String = tx
+                .query_row(
+                    "SELECT text FROM blocks WHERE id = ?1",
+                    [id.as_u64() as i64],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            search_index::upsert_block(tx, *id, &text)
         }
         Change::BlockColorSet { id, color, background } => {
             let n = tx
